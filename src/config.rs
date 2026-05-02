@@ -54,6 +54,8 @@ pub struct Defaults {
     pub connect_timeout: HumanDuration,
     #[serde(default = "default_truncate")]
     pub truncate_bytes: usize,
+    #[serde(default)]
+    pub strict_host_key_checking: StrictHostKey,
 }
 
 impl Default for Defaults {
@@ -68,8 +70,21 @@ impl Default for Defaults {
             keepalive: default_keepalive(),
             connect_timeout: default_connect_timeout(),
             truncate_bytes: default_truncate(),
+            strict_host_key_checking: StrictHostKey::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum StrictHostKey {
+    /// Pin on first connect, reject on mismatch.
+    #[default]
+    Tofu,
+    /// Reject any host not already pinned.
+    Strict,
+    /// Accept anything (legacy 0.1.0 behavior).
+    Off,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -181,7 +196,7 @@ fn default_output() -> OutputFmt { OutputFmt::Toon }
 fn default_idle() -> HumanDuration { HumanDuration(Duration::from_secs(900)) }
 fn default_keepalive() -> HumanDuration { HumanDuration(Duration::from_secs(30)) }
 fn default_connect_timeout() -> HumanDuration { HumanDuration(Duration::from_secs(15)) }
-fn default_truncate() -> usize { 8192 }
+fn default_truncate() -> usize { 32 * 1024 }
 fn default_audit_path() -> PathBuf {
     config_dir().join("audit.log")
 }

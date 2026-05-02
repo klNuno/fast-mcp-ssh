@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use regex::Regex;
 
 use crate::config::{Config, Guards, NamedPattern, default_confirm_patterns, default_deny_patterns};
@@ -24,6 +27,7 @@ pub enum GuardCheck {
 }
 
 impl CompiledGuards {
+    #[allow(dead_code)] // kept for ad-hoc one-off compilation; production path uses GuardCache.
     pub fn from_config(cfg: &Config, host_name: &str) -> Result<Self> {
         let host_guards = cfg
             .hosts
@@ -76,6 +80,34 @@ impl CompiledGuards {
             }
         }
         GuardCheck::Allow
+    }
+}
+
+/// Pre-compiled guard cache keyed by host name. The `default` slot holds
+/// the global rules used for any host that does not declare its own block.
+#[derive(Debug, Clone)]
+pub struct GuardCache {
+    default: Arc<CompiledGuards>,
+    by_host: HashMap<String, Arc<CompiledGuards>>,
+}
+
+impl GuardCache {
+    pub fn build(cfg: &Config) -> Result<Self> {
+        let default = Arc::new(CompiledGuards::compile(&cfg.defaults.guards)?);
+        let mut by_host = HashMap::with_capacity(cfg.hosts.len());
+        for (name, host) in &cfg.hosts {
+            if let Some(g) = &host.guards {
+                by_host.insert(name.clone(), Arc::new(CompiledGuards::compile(g)?));
+            }
+        }
+        Ok(Self { default, by_host })
+    }
+
+    pub fn for_host(&self, host: &str) -> Arc<CompiledGuards> {
+        self.by_host
+            .get(host)
+            .cloned()
+            .unwrap_or_else(|| Arc::clone(&self.default))
     }
 }
 

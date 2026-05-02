@@ -25,7 +25,7 @@ $frames = @(
     @{ jsonrpc='2.0'; id=6; method='tools/call'; params=@{ name='sh'; arguments=@{ host=$TargetHost; cmd='cd /tmp && pwd && echo state-test'; timeout=15 } } },
     @{ jsonrpc='2.0'; id=7; method='tools/call'; params=@{ name='sh'; arguments=@{ host=$TargetHost; cmd='pwd'; timeout=15 } } },
     @{ jsonrpc='2.0'; id=8; method='tools/call'; params=@{ name='ping'; arguments=@{} } },
-    @{ jsonrpc='2.0'; id=9; method='tools/call'; params=@{ name='kill'; arguments=@{ host=$TargetHost } } }
+    @{ jsonrpc='2.0'; id=9; method='tools/call'; params=@{ name='disconnect'; arguments=@{ host=$TargetHost } } }
 )
 
 $payload = ($frames | ForEach-Object { ConvertTo-Json -InputObject $_ -Compress -Depth 10 }) -join "`n"

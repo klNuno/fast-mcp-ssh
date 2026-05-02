@@ -34,16 +34,19 @@ Optional `--config <path>`. Default is `$FAST_MCP_SSH_HOME/hosts.toml`, falling 
 
 | Tool    | Args                                 | Notes |
 |---------|--------------------------------------|-------|
-| `hosts` | none                                 | List configured hosts and their session state. |
-| `ping`  | `host?`                              | Health check. With no arg, probes all hosts in parallel. |
-| `exec`  | `host`, `cmd`, `timeout?`, `password?`, `confirm?` | One-shot command on a fresh exec channel. Stateless, parallel-safe. |
-| `sh`    | same as `exec`                       | Same args, runs in a persistent PTY shell. `cd` and `export` survive between calls. |
-| `kill`  | `host`                               | Close the persistent session. Reopens automatically next call. |
-| `up`    | `host`, `local`, `remote`            | SFTP upload. |
-| `dn`    | `host`, `remote`, `local?`           | SFTP download. With no `local`, returns content inline (text under 256 KB). |
-| `ls`    | `host`, `path`                       | SFTP directory listing. |
-| `wr`    | `host`, `remote`, `content`, `mode?` | Write a file inline. Optional octal mode applied at create time. |
-| `tail`  | `host`, `path`, `lines?`, `follow?`, `seconds?` | `tail -n` (default) or streamed `tail -F`. |
+| `hosts`     | none                                                  | List configured hosts and their session state. |
+| `ping`      | `host?`                                               | Health check. With no arg, probes all hosts in parallel. |
+| `exec`      | `host`, `cmd`, `timeout?`, `password?`, `confirm?`     | One-shot command on a fresh exec channel. Stateless, parallel-safe. |
+| `sh`        | `host`, `cmd`, `timeout?`, `password?`, `confirm?`, `cols?`, `rows?` | Persistent PTY shell. `cd` / `export` survive between calls. PTY size is configurable on first call per host. |
+| `disconnect`| `host`                                                | Close the persistent session. Reopens automatically on next call. |
+| `interrupt` | `host`                                                | Send Ctrl-C to the foreground command on the persistent PTY without dropping the session. |
+| `up`        | `host`, `local`, `remote`                              | SFTP upload (streamed, 32 KB chunks). |
+| `dn`        | `host`, `remote`, `local?`                             | SFTP download. With no `local`, returns content inline (text under 256 KB; binary returned base64-encoded). |
+| `ls`        | `host`, `path`                                         | SFTP directory listing. |
+| `wr`        | `host`, `remote`, `content`, `mode?`                   | Write a file inline. Optional octal mode applied at create time. |
+| `tail`      | `host`, `path`, `lines?`, `follow?`, `seconds?`         | `tail -n` (default) or streamed `tail -F`. |
+
+All tools carry MCP tool annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) so MCP-aware clients can gate destructive calls automatically.
 
 Tool names are short because the MCP client prefixes them with the server name; an additional `ssh_` prefix is dead weight in every tool description.
 
@@ -80,7 +83,9 @@ Three checks run per call before any SSH packet leaves the box.
 2. `confirm_patterns`. Match triggers an MCP elicitation request: the user gets a yes/no prompt in the host UI. Reply must be literally `yes` to proceed. If the client doesn't support elicitation the call is denied. Defaults match `shutdown`, `reboot`, `DROP TABLE`, `systemctl stop`, `docker rm`.
 3. `read_only = true` on a host blocks anything that looks like a write (`>`, `rm`, `mv`, `chmod`, `systemctl restart`, `docker run`, package installs).
 
-Audit log at `~/.fast-mcp-ssh/audit.log`. Append-only NDJSON, one record per call, with timestamp, host, tool, command, exit code, duration, byte counts, blocking reason.
+Audit log at `~/.fast-mcp-ssh/audit.log`. Append-only NDJSON, one record per call, with timestamp, host, tool, command, exit code, duration, byte counts, blocking reason. Writes are batched on a dedicated tokio task so they never block tool calls.
+
+Server fingerprints are pinned via TOFU by default. The first time fast-mcp-ssh connects to a host, the SHA-256 fingerprint of its public key is recorded in `~/.fast-mcp-ssh/known_hosts.toml`. On every subsequent connection the fingerprint must match — a mismatch aborts the handshake with `fingerprint_mismatch`. Override globally via `[defaults] strict_host_key_checking = "tofu" | "strict" | "off"`, or pin a specific value per host with `known_host_fingerprint = "..."`.
 
 ## Tests
 

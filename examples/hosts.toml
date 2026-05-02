@@ -15,10 +15,17 @@ session_idle_timeout = "15m"
 audit_log = true
 
 # Sanity caps on output bytes returned per call. Anything over this is truncated with a hint.
-truncate_bytes = 8192
+truncate_bytes = 32768
 
 connect_timeout = "15s"
 keepalive = "30s"
+
+# Server fingerprint policy.
+#  tofu   — pin on first connect, reject on later mismatch (default, recommended)
+#  strict — reject any host that has not been pinned yet
+#  off    — accept any server key (legacy 0.1.0 behavior)
+# Pinned fingerprints live at ~/.fast-mcp-ssh/known_hosts.toml.
+strict_host_key_checking = "tofu"
 
 # Default guard rules apply to all hosts unless a host has its own [host.<name>.guards] block.
 [defaults.guards]

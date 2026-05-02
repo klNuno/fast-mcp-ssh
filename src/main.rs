@@ -2,6 +2,7 @@ mod audit;
 mod config;
 mod errors;
 mod guards;
+mod known_hosts;
 mod output;
 mod server;
 mod session;
@@ -18,6 +19,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use crate::audit::AuditLog;
 use crate::config::{Config, default_config_path};
+use crate::guards::GuardCache;
 use crate::server::SshServer;
 use crate::session::SessionPool;
 
@@ -58,6 +60,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let audit = Arc::new(AuditLog::new(audit_path)?);
     let pool = SessionPool::new(cfg.clone());
+    let guards = Arc::new(GuardCache::build(&cfg)?);
 
     let pool_for_evict = pool.clone();
     tokio::spawn(async move {
@@ -73,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
         "fast-mcp-ssh starting"
     );
 
-    let server = SshServer::new(cfg.clone(), pool, audit);
+    let server = SshServer::new(cfg.clone(), pool, audit, guards);
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())

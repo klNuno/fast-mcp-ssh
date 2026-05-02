@@ -74,7 +74,7 @@ pub async fn exec(session: &Session, cmd: &str, deadline: Duration) -> Result<Ex
     let stdout_bytes = stdout.len();
     let stderr_bytes = stderr.len();
     let duration_ms = start.elapsed().as_millis();
-    session.touch().await;
+    session.touch();
 
     Ok(ExecResult {
         stdout: String::from_utf8_lossy(&stdout).into_owned(),

@@ -4,14 +4,17 @@ use std::time::Duration;
 use russh::client::{self, Handle};
 use russh::keys::{PrivateKeyWithHashAlg, load_secret_key};
 
-use crate::config::{AuthMethod, Host};
+use crate::config::{AuthMethod, Config, Host, StrictHostKey};
 use crate::errors::{Result, SshError};
+use crate::known_hosts::{KnownHostMatch, KnownHostsStore};
 
 pub type SshHandle = Handle<ClientHandler>;
 
-#[derive(Clone)]
 pub struct ClientHandler {
+    pub host_name: String,
     pub expected_fingerprint: Option<String>,
+    pub strict: StrictHostKey,
+    pub store: Option<Arc<KnownHostsStore>>,
 }
 
 impl client::Handler for ClientHandler {
@@ -21,33 +24,76 @@ impl client::Handler for ClientHandler {
         &mut self,
         server_public_key: &russh::keys::ssh_key::PublicKey,
     ) -> std::result::Result<bool, Self::Error> {
+        let actual = server_public_key
+            .fingerprint(russh::keys::HashAlg::Sha256)
+            .to_string();
+
         if let Some(expected) = &self.expected_fingerprint {
-            let actual = server_public_key
-                .fingerprint(russh::keys::HashAlg::Sha256)
-                .to_string();
             if actual != *expected {
-                tracing::warn!(%expected, %actual, "server fingerprint mismatch");
+                tracing::warn!(host = %self.host_name, %expected, %actual, "server fingerprint mismatch (config)");
                 return Ok(false);
             }
+            return Ok(true);
         }
-        Ok(true)
+
+        match self.strict {
+            StrictHostKey::Off => Ok(true),
+            StrictHostKey::Strict | StrictHostKey::Tofu => {
+                let Some(store) = self.store.as_ref() else {
+                    return Ok(matches!(self.strict, StrictHostKey::Off));
+                };
+                match store.check(&self.host_name, &actual) {
+                    KnownHostMatch::Ok => Ok(true),
+                    KnownHostMatch::Mismatch { expected } => {
+                        tracing::warn!(host = %self.host_name, %expected, %actual, "known_hosts fingerprint mismatch");
+                        Ok(false)
+                    }
+                    KnownHostMatch::Unknown => {
+                        if matches!(self.strict, StrictHostKey::Tofu) {
+                            if let Err(e) = store.add(&self.host_name, &actual) {
+                                tracing::error!(?e, "TOFU write known_hosts failed");
+                                return Ok(false);
+                            }
+                            tracing::info!(host = %self.host_name, %actual, "TOFU: pinned new fingerprint");
+                            Ok(true)
+                        } else {
+                            tracing::warn!(host = %self.host_name, "strict host key checking: host unknown");
+                            Ok(false)
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
-pub async fn open(host: &Host, password: Option<&str>) -> Result<SshHandle> {
-    let cfg = client::Config {
+pub async fn open(
+    cfg: &Config,
+    host_name: &str,
+    host: &Host,
+    password: Option<&str>,
+) -> Result<SshHandle> {
+    let ssh_cfg = client::Config {
         inactivity_timeout: Some(Duration::from_secs(300)),
-        keepalive_interval: Some(Duration::from_secs(30)),
+        keepalive_interval: Some(cfg.defaults.keepalive.0),
         keepalive_max: 3,
         ..Default::default()
     };
-    let cfg = Arc::new(cfg);
+    let ssh_cfg = Arc::new(ssh_cfg);
+    let store = if matches!(cfg.defaults.strict_host_key_checking, StrictHostKey::Off) {
+        None
+    } else {
+        Some(KnownHostsStore::open_or_create()?)
+    };
     let handler = ClientHandler {
+        host_name: host_name.to_string(),
         expected_fingerprint: host.known_host_fingerprint.clone(),
+        strict: cfg.defaults.strict_host_key_checking,
+        store,
     };
     let addr = (host.addr.as_str(), host.port);
 
-    let mut session = client::connect(cfg, addr, handler)
+    let mut session = client::connect(ssh_cfg, addr, handler)
         .await
         .map_err(SshError::from)?;
 
