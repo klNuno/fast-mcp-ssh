@@ -1,0 +1,73 @@
+# fast-mcp-ssh sample configuration
+# Place at ~/.fast-mcp-ssh/hosts.toml (or override with --config)
+
+[defaults]
+# Read aliases from ~/.ssh/config in addition to the explicit hosts below.
+import_ssh_config = false
+
+# toon | json | text. TOON cuts ~40% of tokens vs JSON for tabular output.
+output = "toon"
+
+# Idle session timeout. Connection is closed (and reopened on next call) after this.
+session_idle_timeout = "15m"
+
+# Append-only NDJSON record of every tool call. See ~/.fast-mcp-ssh/audit.log.
+audit_log = true
+
+# Sanity caps on output bytes returned per call. Anything over this is truncated with a hint.
+truncate_bytes = 8192
+
+connect_timeout = "15s"
+keepalive = "30s"
+
+# Default guard rules apply to all hosts unless a host has its own [host.<name>.guards] block.
+[defaults.guards]
+use_default_deny = true        # rm -rf /, dd of=/dev/sd*, mkfs, fork bombs, etc.
+use_default_confirm = true     # shutdown, reboot, DROP TABLE, systemctl stop, docker rm…
+read_only = false              # Set true to refuse heuristically write-ish commands.
+
+# Add your own deny/confirm patterns (regex). They are merged with defaults.
+deny = [
+    # { name = "no-prod-db", pattern = "(?i)\\bDROP\\s+DATABASE\\s+prod" },
+]
+confirm = [
+    # { name = "git-push-main", pattern = "git\\s+push.*\\bmain\\b" },
+]
+
+
+# === Hosts ===
+
+[host.box1]
+addr = "10.0.0.1"
+user = "root"
+port = 22
+auth = "key"
+key = "~/.fast-mcp-ssh/keys/box1"
+
+[host.bastion]
+addr = "203.0.113.5"
+user = "ops"
+port = 22
+auth = "agent"          # use ssh-agent (Windows OpenSSH agent or *nix SSH_AUTH_SOCK)
+
+[host.legacy-nas]
+addr = "10.0.0.50"
+user = "nas"
+port = 35
+auth = "password"       # password is supplied per-call by the AI (cached in memory only)
+
+[host.prod-db]
+addr = "db.internal"
+user = "deploy"
+port = 22
+auth = "key"
+key = "~/.fast-mcp-ssh/keys/prod-db"
+
+# Per-host guard override: prod-db is read-only by default.
+[host.prod-db.guards]
+use_default_deny = true
+use_default_confirm = true
+read_only = true
+confirm = [
+    { name = "psql-write", pattern = "(?i)\\bINSERT\\s+INTO|\\bUPDATE\\s+\\w+\\s+SET|\\bDELETE\\s+FROM" },
+]
