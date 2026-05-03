@@ -2,12 +2,12 @@ use std::path::Path;
 use std::time::Instant;
 
 use russh_sftp::protocol::{FileAttributes, OpenFlags};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::errors::{Result, SshError};
 use crate::session::Session;
 
-const UPLOAD_CHUNK: usize = 32 * 1024;
+const TRANSFER_CHUNK: usize = 256 * 1024;
 
 pub struct SftpResult {
     pub bytes: usize,
@@ -33,10 +33,9 @@ pub async fn upload(session: &Session, local: &Path, remote: &str) -> Result<Sft
         )
         .await
         .map_err(SshError::from)?;
-    let mut buf = vec![0u8; UPLOAD_CHUNK];
+    let mut buf = vec![0u8; TRANSFER_CHUNK];
     let mut total = 0usize;
     loop {
-        use tokio::io::AsyncReadExt;
         let n = local_file.read(&mut buf).await?;
         if n == 0 {
             break;
@@ -50,21 +49,53 @@ pub async fn upload(session: &Session, local: &Path, remote: &str) -> Result<Sft
     Ok(SftpResult { bytes: total, duration_ms: start.elapsed().as_millis() })
 }
 
-pub async fn download(session: &Session, remote: &str, local: Option<&Path>) -> Result<(SftpResult, Option<Vec<u8>>)> {
+pub async fn download(
+    session: &Session,
+    remote: &str,
+    local: Option<&Path>,
+) -> Result<(SftpResult, Option<Vec<u8>>)> {
     let start = Instant::now();
     let sftp = session.sftp().await?;
-    let content = sftp.read(remote).await.map_err(SshError::from)?;
-    let total = content.len();
+    let mut remote_file = sftp
+        .open_with_flags(remote, OpenFlags::READ)
+        .await
+        .map_err(SshError::from)?;
     session.touch();
+
     if let Some(path) = local {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 tokio::fs::create_dir_all(parent).await?;
             }
         }
-        tokio::fs::write(path, &content).await?;
-        return Ok((SftpResult { bytes: total, duration_ms: start.elapsed().as_millis() }, None));
+        let mut local_file = tokio::fs::File::create(path).await?;
+        let mut buf = vec![0u8; TRANSFER_CHUNK];
+        let mut total = 0usize;
+        loop {
+            let n = remote_file.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            local_file.write_all(&buf[..n]).await?;
+            total += n;
+        }
+        local_file.shutdown().await?;
+        return Ok((
+            SftpResult { bytes: total, duration_ms: start.elapsed().as_millis() },
+            None,
+        ));
     }
+
+    let mut content = Vec::with_capacity(TRANSFER_CHUNK);
+    let mut buf = vec![0u8; TRANSFER_CHUNK];
+    loop {
+        let n = remote_file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        content.extend_from_slice(&buf[..n]);
+    }
+    let total = content.len();
     Ok((
         SftpResult { bytes: total, duration_ms: start.elapsed().as_millis() },
         Some(content),

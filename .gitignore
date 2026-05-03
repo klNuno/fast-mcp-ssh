@@ -16,5 +16,12 @@ hosts.toml
 !examples/hosts.toml
 audit.log
 
+# Benchmark local config (key paths, server IPs)
+benchmark/.env
+# Bench output written to results/ root is the unsanitized run; sanitized
+# copies live in results/v<version>/.
+benchmark/results/runs.csv
+benchmark/results/summary.md
+
 Thumbs.db
 .DS_Store

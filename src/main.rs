@@ -59,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
         None
     };
     let audit = Arc::new(AuditLog::new(audit_path)?);
-    let pool = SessionPool::new(cfg.clone());
+    let pool = SessionPool::new(cfg.clone())?;
     let guards = Arc::new(GuardCache::build(&cfg)?);
 
     let pool_for_evict = pool.clone();

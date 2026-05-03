@@ -10,13 +10,14 @@ pub struct TailChunk {
 }
 
 /// Read the last `lines` lines of `path`. If `follow=false` we just `tail -n`.
-/// If `follow=true` we use `tail -F -n <lines>` capped at `max_wait` so the call returns.
+/// If `follow=true` we use `tail -F -n <lines>` capped at `max_wait`.
 pub async fn tail(
     session: &Session,
     path: &str,
     lines: u32,
     follow: bool,
     max_wait: Duration,
+    max_capture: usize,
 ) -> Result<TailChunk> {
     let path_q = shell_escape(path);
     let cmd = if follow {
@@ -31,6 +32,7 @@ pub async fn tail(
         session,
         &cmd,
         max_wait + Duration::from_secs(if follow { 5 } else { 10 }),
+        max_capture,
     )
     .await?;
     Ok(TailChunk {

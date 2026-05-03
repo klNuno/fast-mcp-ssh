@@ -1,6 +1,5 @@
-/// Truncate a long output keeping a head + a hint about how much was cut.
-/// Returns the trimmed text. Caller is expected to also expose `truncated_chars` in metadata.
-/// Uses byte length for the total — `chars().count()` was O(n) and only matters as a rough hint.
+/// Truncate long output keeping a head + a short hint about how much was cut.
+/// Returns trimmed text. Caller may also expose `truncated_bytes` in metadata.
 pub fn truncate_with_hint(text: &str, max_bytes: usize) -> (String, Option<usize>) {
     if text.len() <= max_bytes {
         return (text.to_string(), None);
@@ -10,11 +9,9 @@ pub fn truncate_with_hint(text: &str, max_bytes: usize) -> (String, Option<usize
         cut -= 1;
     }
     let total = text.len();
-    let mut out = String::with_capacity(cut + 96);
+    let mut out = String::with_capacity(cut + 32);
     out.push_str(&text[..cut]);
-    out.push_str(&format!(
-        "\n…[truncated, {total} bytes total — re-run piping through 'tail' or 'grep' to narrow]"
-    ));
+    out.push_str(&format!("\n…[+{}B truncated]", total - cut));
     (out, Some(total))
 }
 

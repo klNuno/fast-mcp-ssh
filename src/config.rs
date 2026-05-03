@@ -54,8 +54,15 @@ pub struct Defaults {
     pub connect_timeout: HumanDuration,
     #[serde(default = "default_truncate")]
     pub truncate_bytes: usize,
+    #[serde(default = "default_max_capture")]
+    pub max_capture_bytes: usize,
+    #[serde(default = "default_max_channels")]
+    pub max_channels_per_host: usize,
     #[serde(default)]
     pub strict_host_key_checking: StrictHostKey,
+    /// Optional default host alias used when a tool call omits `host`.
+    #[serde(default)]
+    pub default_host: Option<String>,
 }
 
 impl Default for Defaults {
@@ -70,7 +77,10 @@ impl Default for Defaults {
             keepalive: default_keepalive(),
             connect_timeout: default_connect_timeout(),
             truncate_bytes: default_truncate(),
+            max_capture_bytes: default_max_capture(),
+            max_channels_per_host: default_max_channels(),
             strict_host_key_checking: StrictHostKey::default(),
+            default_host: None,
         }
     }
 }
@@ -197,6 +207,8 @@ fn default_idle() -> HumanDuration { HumanDuration(Duration::from_secs(900)) }
 fn default_keepalive() -> HumanDuration { HumanDuration(Duration::from_secs(30)) }
 fn default_connect_timeout() -> HumanDuration { HumanDuration(Duration::from_secs(15)) }
 fn default_truncate() -> usize { 32 * 1024 }
+fn default_max_capture() -> usize { 256 * 1024 }
+fn default_max_channels() -> usize { 8 }
 fn default_audit_path() -> PathBuf {
     config_dir().join("audit.log")
 }

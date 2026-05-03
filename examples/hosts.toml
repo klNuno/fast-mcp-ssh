@@ -17,6 +17,16 @@ audit_log = true
 # Sanity caps on output bytes returned per call. Anything over this is truncated with a hint.
 truncate_bytes = 32768
 
+# Hard cap on bytes captured during exec/sh/tail before further data is dropped.
+# Prevents OOM if a command spews gigabytes. Should be >= truncate_bytes.
+max_capture_bytes = 262144
+
+# Per-host concurrent SSH channel limit (matches sshd MaxSessions, default 10).
+max_channels_per_host = 8
+
+# Optional: tools accept omitted `host=` and fall back to this alias.
+# default_host = "box1"
+
 connect_timeout = "15s"
 keepalive = "30s"
 

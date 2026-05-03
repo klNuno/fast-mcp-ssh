@@ -1,8 +1,11 @@
-# Benchmark — fast-mcp-ssh vs mcp-ssh-manager
+# Benchmark — fast-mcp-ssh vs mcp-ssh-manager (v0.1.0)
 
+- fast-mcp-ssh: **0.1.0** (initial release)
+- mcp-ssh-manager: 3.x (npm)
 - iterations per scenario: **50**
 - target host alias: target
-- bench host: bench-host
+- bench host: bench-host (Linux x86_64, gigabit LAN to target)
+- timing: `time.monotonic()` (low-res on some platforms — see v0.1.2 for `perf_counter`)
 
 ## Cold start (process spawn → first response)
 

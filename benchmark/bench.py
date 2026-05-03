@@ -194,10 +194,10 @@ def invoke_scenario(spec: ServerSpec, target: str, key: str, iteration: int) -> 
 def cold_start(spec: ServerSpec) -> dict:
     samples = []
     for _ in range(3):
-        t0 = time.monotonic()
+        t0 = time.perf_counter()
         mcp = McpStdio(spec.cmd, env=spec.env)
         mcp.initialize(client_name="bench-cold")
-        elapsed = (time.monotonic() - t0) * 1000.0
+        elapsed = (time.perf_counter() - t0) * 1000.0
         samples.append(elapsed)
         mcp.close()
     return {
@@ -387,9 +387,9 @@ def main():
             spec._mcp.initialize(client_name="bench")  # type: ignore[attr-defined]
             for sc in SCENARIOS:
                 key = sc[0]
-                t0 = time.monotonic()
+                t0 = time.perf_counter()
                 stats = run_scenario_against(spec, target, key, args.iterations)
-                elapsed = time.monotonic() - t0
+                elapsed = time.perf_counter() - t0
                 all_runs.extend(stats.runs)
                 stats_by_pair[(spec.name, key)] = stats
                 s = stats.stats()

@@ -1,17 +1,19 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use chrono::Utc;
 use serde::Serialize;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::mpsc::{self, Sender};
 
 use crate::errors::Result;
 
 #[derive(Debug, Clone, Serialize)]
 struct AuditEntryOwned {
     ts: String,
-    host: String,
-    tool: String,
+    host: Arc<str>,
+    tool: &'static str,
     cmd: Option<String>,
     exit_code: Option<i32>,
     duration_ms: Option<u128>,
@@ -21,11 +23,15 @@ struct AuditEntryOwned {
     error: Option<String>,
 }
 
-/// Append-only NDJSON audit log writer. Backed by a tokio mpsc channel +
+const AUDIT_QUEUE_CAP: usize = 1024;
+const AUDIT_BATCH: usize = 32;
+
+/// Append-only NDJSON audit log writer. Backed by a bounded mpsc channel +
 /// a dedicated task that writes batches, so callers never block the runtime
-/// on disk I/O.
+/// on disk I/O. A full queue drops the entry and emits a tracing warning;
+/// audit records are not flow-critical.
 pub struct AuditLog {
-    tx: Option<UnboundedSender<AuditEntryOwned>>,
+    tx: Option<Sender<AuditEntryOwned>>,
 }
 
 impl AuditLog {
@@ -36,7 +42,7 @@ impl AuditLog {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let (tx, mut rx) = mpsc::unbounded_channel::<AuditEntryOwned>();
+        let (tx, mut rx) = mpsc::channel::<AuditEntryOwned>(AUDIT_QUEUE_CAP);
         tokio::spawn(async move {
             let mut file = match tokio::fs::OpenOptions::new()
                 .create(true)
@@ -51,11 +57,11 @@ impl AuditLog {
                 }
             };
             let mut buf = String::with_capacity(8192);
-            let mut batch: Vec<AuditEntryOwned> = Vec::with_capacity(32);
+            let mut batch: Vec<AuditEntryOwned> = Vec::with_capacity(AUDIT_BATCH);
             loop {
                 batch.clear();
                 buf.clear();
-                let count = rx.recv_many(&mut batch, 32).await;
+                let count = rx.recv_many(&mut batch, AUDIT_BATCH).await;
                 if count == 0 {
                     break;
                 }
@@ -83,7 +89,7 @@ impl AuditLog {
     pub fn write(
         &self,
         host: &str,
-        tool: &str,
+        tool: &'static str,
         cmd: Option<&str>,
         exit_code: Option<i32>,
         duration_ms: Option<u128>,
@@ -93,10 +99,13 @@ impl AuditLog {
         error: Option<String>,
     ) {
         let Some(tx) = &self.tx else { return };
+        let ts = OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .unwrap_or_else(|_| String::new());
         let entry = AuditEntryOwned {
-            ts: Utc::now().to_rfc3339(),
-            host: host.to_string(),
-            tool: tool.to_string(),
+            ts,
+            host: Arc::from(host),
+            tool,
             cmd: cmd.map(|s| s.to_string()),
             exit_code,
             duration_ms,
@@ -105,8 +114,15 @@ impl AuditLog {
             blocked: blocked.map(|s| s.to_string()),
             error,
         };
-        if let Err(e) = tx.send(entry) {
-            tracing::error!(?e, "audit channel closed");
+        if let Err(e) = tx.try_send(entry) {
+            match e {
+                mpsc::error::TrySendError::Full(_) => {
+                    tracing::warn!("audit queue full, dropping entry");
+                }
+                mpsc::error::TrySendError::Closed(_) => {
+                    tracing::error!("audit channel closed");
+                }
+            }
         }
     }
 }

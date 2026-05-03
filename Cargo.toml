@@ -1,6 +1,6 @@
 [package]
 name = "fast-mcp-ssh"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.85"
 description = "Fast MCP SSH server with persistent PTY sessions, SFTP, and AI-first tool surface"
@@ -15,8 +15,7 @@ rmcp = { version = "1.6", features = ["server", "macros", "transport-io", "elici
 russh = { version = "0.60", default-features = false, features = ["ring", "rsa"] }
 russh-sftp = "2.1"
 ssh2-config-rs = "0.7"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "fs", "time", "sync", "process", "signal"] }
-tokio-util = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "fs", "time", "sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = "1"
@@ -28,16 +27,14 @@ thiserror = "2"
 regex = "1"
 dashmap = "6"
 dirs = "6"
-bytes = "1"
 futures = "0.3"
-chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 shellexpand = "3"
-async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 zeroize = { version = "1", features = ["derive"] }
 memchr = "2"
 getrandom = "0.2"
 base64 = "0.22"
+time = { version = "0.3", default-features = false, features = ["std", "formatting", "macros"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -15,12 +15,24 @@ pub struct ExecResult {
     pub stdout_bytes: usize,
     pub stderr_bytes: usize,
     pub timed_out: bool,
+    /// True if capture stopped at `max_capture` before EOF.
+    pub capture_capped: bool,
 }
 
 /// Run `cmd` over a fresh exec channel on the persistent SSH handle. `cmd` is passed verbatim
 /// to the remote login shell (russh handles bash -c invocation server-side).
-pub async fn exec(session: &Session, cmd: &str, deadline: Duration) -> Result<ExecResult> {
+///
+/// `max_capture` bounds the in-memory stdout/stderr buffer. Once exceeded, further data is
+/// dropped (channel kept open until exit so the remote process isn't SIGPIPE-killed prematurely
+/// on small overruns).
+pub async fn exec(
+    session: &Session,
+    cmd: &str,
+    deadline: Duration,
+    max_capture: usize,
+) -> Result<ExecResult> {
     let start = Instant::now();
+    let _permit = session.acquire_channel().await?;
     let mut channel = session
         .handle
         .channel_open_session()
@@ -32,6 +44,7 @@ pub async fn exec(session: &Session, cmd: &str, deadline: Duration) -> Result<Ex
     let mut stderr = Vec::with_capacity(1024);
     let mut exit_code: Option<i32> = None;
     let mut timed_out = false;
+    let mut capture_capped = false;
 
     loop {
         let res = timeout(
@@ -49,12 +62,12 @@ pub async fn exec(session: &Session, cmd: &str, deadline: Duration) -> Result<Ex
             }
         };
         match msg {
-            ChannelMsg::Data { ref data } => stdout.extend_from_slice(data),
+            ChannelMsg::Data { ref data } => append_capped(&mut stdout, data, max_capture, &mut capture_capped),
             ChannelMsg::ExtendedData { ref data, ext } => {
                 if ext == 1 {
-                    stderr.extend_from_slice(data);
+                    append_capped(&mut stderr, data, max_capture, &mut capture_capped);
                 } else {
-                    stdout.extend_from_slice(data);
+                    append_capped(&mut stdout, data, max_capture, &mut capture_capped);
                 }
             }
             ChannelMsg::ExitStatus { exit_status } => {
@@ -62,7 +75,6 @@ pub async fn exec(session: &Session, cmd: &str, deadline: Duration) -> Result<Ex
             }
             ChannelMsg::Close => break,
             ChannelMsg::Eof => {
-                // Eof can arrive before ExitStatus on some servers — keep draining.
                 if exit_code.is_some() {
                     break;
                 }
@@ -77,12 +89,35 @@ pub async fn exec(session: &Session, cmd: &str, deadline: Duration) -> Result<Ex
     session.touch();
 
     Ok(ExecResult {
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        stdout: into_string_fast(stdout),
+        stderr: into_string_fast(stderr),
         exit_code: exit_code.unwrap_or(if timed_out { 124 } else { -1 }),
         duration_ms,
         stdout_bytes,
         stderr_bytes,
         timed_out,
+        capture_capped,
     })
+}
+
+fn append_capped(buf: &mut Vec<u8>, data: &[u8], max: usize, capped: &mut bool) {
+    if buf.len() >= max {
+        *capped = true;
+        return;
+    }
+    let room = max - buf.len();
+    if data.len() <= room {
+        buf.extend_from_slice(data);
+    } else {
+        buf.extend_from_slice(&data[..room]);
+        *capped = true;
+    }
+}
+
+/// Avoid an extra alloc when bytes are already valid UTF-8 (the common case).
+fn into_string_fast(bytes: Vec<u8>) -> String {
+    match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    }
 }

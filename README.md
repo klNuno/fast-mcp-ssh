@@ -36,15 +36,18 @@ Optional `--config <path>`. Default is `$FAST_MCP_SSH_HOME/hosts.toml`, falling 
 |---------|--------------------------------------|-------|
 | `hosts`     | none                                                  | List configured hosts and their session state. |
 | `ping`      | `host?`                                               | Health check. With no arg, probes all hosts in parallel. |
-| `exec`      | `host`, `cmd`, `timeout?`, `password?`, `confirm?`     | One-shot command on a fresh exec channel. Stateless, parallel-safe. |
-| `sh`        | `host`, `cmd`, `timeout?`, `password?`, `confirm?`, `cols?`, `rows?` | Persistent PTY shell. `cd` / `export` survive between calls. PTY size is configurable on first call per host. |
-| `disconnect`| `host`                                                | Close the persistent session. Reopens automatically on next call. |
-| `interrupt` | `host`                                                | Send Ctrl-C to the foreground command on the persistent PTY without dropping the session. |
-| `up`        | `host`, `local`, `remote`                              | SFTP upload (streamed, 32 KB chunks). |
-| `dn`        | `host`, `remote`, `local?`                             | SFTP download. With no `local`, returns content inline (text under 256 KB; binary returned base64-encoded). |
-| `ls`        | `host`, `path`                                         | SFTP directory listing. |
-| `wr`        | `host`, `remote`, `content`, `mode?`                   | Write a file inline. Optional octal mode applied at create time. |
-| `tail`      | `host`, `path`, `lines?`, `follow?`, `seconds?`         | `tail -n` (default) or streamed `tail -F`. |
+| `exec`      | `host?`, `cmd`, `timeout?`, `password?`, `confirm?`     | One-shot command on a fresh exec channel. Stateless, parallel-safe. |
+| `exec_batch`| `host?`, `cmds[]`, `timeout?`, `password?`, `confirm?` | Run N commands in parallel on one host in one round-trip. |
+| `sh`        | `host?`, `cmd`, `timeout?`, `password?`, `confirm?`, `cols?`, `rows?` | Persistent PTY shell. `cd` / `export` survive between calls. PTY size is configurable on first call per host. |
+| `disconnect`| `host?`                                                | Close the persistent session. Reopens automatically on next call. |
+| `interrupt` | `host?`                                                | Send Ctrl-C to the foreground command on the persistent PTY. Independent of in-flight `sh` (split read/write). |
+| `up`        | `host?`, `local`, `remote`                              | SFTP upload (streamed, 256 KB chunks). |
+| `dn`        | `host?`, `remote`, `local?`                             | SFTP download (streamed). With no `local`, returns content inline (text under 256 KB; binary returned base64-encoded). |
+| `ls`        | `host?`, `path`                                         | SFTP directory listing. |
+| `wr`        | `host?`, `remote`, `content`, `mode?`                   | Write a file inline. Optional octal mode applied at create time. |
+| `tail`      | `host?`, `path`, `lines?`, `follow?`, `seconds?`         | `tail -n` (default) or streamed `tail -F`. |
+
+`host` is optional on every tool when `[defaults] default_host = "<alias>"` is set in `hosts.toml`.
 
 All tools carry MCP tool annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) so MCP-aware clients can gate destructive calls automatically.
 
@@ -90,49 +93,48 @@ Server fingerprints are pinned via TOFU by default. The first time fast-mcp-ssh 
 ## Tests
 
 ```bash
-cargo test                    # 22 unit tests
+cargo test                    # 27 unit tests
 ./scripts/test-sh.ps1         # end-to-end smoke against real hosts (Windows)
 ```
 
 ## Benchmark vs `mcp-ssh-manager`
 
-50 iterations per scenario. Bench host: 16-core x86_64 box on Ubuntu 24.04. Target: an x86_64 Linux host reachable over gigabit LAN. Identical SSH key for both servers, identical target. Full data in [`benchmark/results/`](benchmark/results/), reproducible via [`benchmark/`](benchmark/).
+50 iterations per scenario. Identical SSH key for both servers, identical target. Per-version
+runs live under [`benchmark/results/v<version>/`](benchmark/results/) (one folder each).
+The numbers below are from the **v0.1.2** run: bench client on a Windows workstation,
+target an x86_64 Linux host on the same gigabit LAN. Reproducible via [`benchmark/`](benchmark/).
 
-### Summary
+### Summary (v0.1.2, median)
 
-| Metric (median) | `fast-mcp-ssh` | `mcp-ssh-manager` | Ratio |
+| Metric | `fast-mcp-ssh` | `mcp-ssh-manager` | Ratio |
 |---|---:|---:|---:|
-| Cold start | 2 ms | 309 ms | 154× faster |
-| Warm `exec` (typical) | 46 ms | 97 ms | 2.1× faster |
-| Write 1 KB file | 4.5 ms | 98 ms | 22× faster |
-| Read 1 KB file | 50 ms | 96 ms | 1.9× faster |
-| Tokens, small command response | 35 | 49 | −29% |
-| Tokens, write-status response | 31 | 202 | −85% |
-| Tokens, large raw stdout | roughly equal (raw output dominates) | | |
+| Cold start | 26 ms | 217 ms | 8× faster |
+| Warm `exec` `echo ok` | 2.5 ms | 90 ms | 36× |
+| Warm `exec` `seq 1 5000` (~12 KB) | 9 ms | 90 ms | 10× |
+| Write 1 KB file | 2.4 ms | 90 ms | 38× |
+| Read 1 KB file | 2.8 ms | 90 ms | 32× |
+| Tokens, small command response (v0.1.1) | 35 | 49 | −29% |
+| Tokens, write-status response (v0.1.1) | 31 | 202 | −85% |
 
-### Cold start (process spawn to first response)
-
-| Server | Median |
-|---|---:|
-| `fast-mcp-ssh` | 2 ms |
-| `mcp-ssh-manager` (Node.js) | 309 ms |
+The exec gap widened a lot in 0.1.2 — `nodelay = true` (TCP_NODELAY) on the russh client
+config alone shaved ~40 ms off every small-command round-trip on LAN.
 
 ### Warm latency, median ms (lower is better)
 
 | Scenario | `fast-mcp-ssh` | `mcp-ssh-manager` | Ratio |
 |----------|---:|---:|---:|
-| `exec` `echo ok`                  |  46 |  97 | 2.1× |
-| `exec` `uname -a; whoami; pwd`     |  48 |  98 | 2.0× |
-| `exec` `seq 1 5000` (~12 KB)      |  46 |  98 | 2.1× |
-| `exec` `ls -la /etc \| head -100` |  47 | 100 | 2.1× |
-| `exec` `ls /nonexistent` (stderr) |  48 |  97 | 2.0× |
-| `exec` `cat /etc/passwd \| wc -l` |  47 |  97 | 2.1× |
-| Write 1 KB file                   | 4.5 |  98 | 22× |
-| Read 1 KB file                    |  50 |  96 | 1.9× |
+| `exec` `echo ok`                  | 2.5 |  90 | 36× |
+| `exec` `uname -a; whoami; pwd`     | 4.0 |  91 | 23× |
+| `exec` `seq 1 5000` (~12 KB)      | 9.0 |  90 | 10× |
+| `exec` `ls -la /etc \| head -100` | 7.1 |  91 | 13× |
+| `exec` `ls /nonexistent` (stderr) | 3.7 |  90 | 24× |
+| `exec` `cat /etc/passwd \| wc -l` | 4.4 |  91 | 21× |
+| Write 1 KB file                   | 2.4 |  90 | 38× |
+| Read 1 KB file                    | 2.8 |  90 | 32× |
 
 The write gap is structural. `fast-mcp-ssh` writes via SFTP. `mcp-ssh-manager` has no inline write tool, so the bench uses `ssh_execute "cat > path <<EOF…"`, which costs a full shell exec round-trip.
 
-### Token cost, counted via OpenRouter (`deepseek/deepseek-chat`)
+### Token cost (from v0.1.1, OpenRouter `deepseek/deepseek-chat`)
 
 | Scenario | `fast-mcp-ssh` | `mcp-ssh-manager` | fast / mgr |
 |----------|---:|---:|---:|
@@ -146,6 +148,8 @@ The write gap is structural. `fast-mcp-ssh` writes via SFTP. `mcp-ssh-manager` h
 | Read 1 KB inline                |  167 |  186 | −10% |
 
 `fast-mcp-ssh` is cheaper on small structured responses. On large raw stdout the savings disappear because the actual command output dominates the payload and TOON's per-call metadata costs a few percent.
+
+In 0.1.2 the per-`tools/list` token cost dropped further — every tool's description was rewritten to 8-12 words and the global `instructions` blob is now a single line.
 
 ### Reproducing
 

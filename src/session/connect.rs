@@ -10,6 +10,10 @@ use crate::known_hosts::{KnownHostMatch, KnownHostsStore};
 
 pub type SshHandle = Handle<ClientHandler>;
 
+// russh enforces maximum_packet_size <= 65535 (RFC 4253 §6.1).
+const DEFAULT_MAX_PACKET: u32 = 65_535;
+const DEFAULT_WINDOW: u32 = 8 * 1024 * 1024;
+
 pub struct ClientHandler {
     pub host_name: String,
     pub expected_fingerprint: Option<String>,
@@ -67,28 +71,34 @@ impl client::Handler for ClientHandler {
     }
 }
 
+/// Build a russh client config once. Cached on the SessionPool so we don't
+/// rebuild it per connect.
+pub fn build_client_config(cfg: &Config) -> Arc<client::Config> {
+    Arc::new(client::Config {
+        inactivity_timeout: Some(Duration::from_secs(300)),
+        keepalive_interval: Some(cfg.defaults.keepalive.0),
+        keepalive_max: 3,
+        maximum_packet_size: DEFAULT_MAX_PACKET,
+        window_size: DEFAULT_WINDOW,
+        nodelay: true,
+        ..Default::default()
+    })
+}
+
 pub async fn open(
     cfg: &Config,
     host_name: &str,
     host: &Host,
     password: Option<&str>,
+    ssh_cfg: Arc<client::Config>,
+    store: Option<Arc<KnownHostsStore>>,
 ) -> Result<SshHandle> {
-    let ssh_cfg = client::Config {
-        inactivity_timeout: Some(Duration::from_secs(300)),
-        keepalive_interval: Some(cfg.defaults.keepalive.0),
-        keepalive_max: 3,
-        ..Default::default()
-    };
-    let ssh_cfg = Arc::new(ssh_cfg);
-    let store = if matches!(cfg.defaults.strict_host_key_checking, StrictHostKey::Off) {
-        None
-    } else {
-        Some(KnownHostsStore::open_or_create()?)
-    };
+    let strict = cfg.defaults.strict_host_key_checking;
+    let store = if matches!(strict, StrictHostKey::Off) { None } else { store };
     let handler = ClientHandler {
         host_name: host_name.to_string(),
         expected_fingerprint: host.known_host_fingerprint.clone(),
-        strict: cfg.defaults.strict_host_key_checking,
+        strict,
         store,
     };
     let addr = (host.addr.as_str(), host.port);

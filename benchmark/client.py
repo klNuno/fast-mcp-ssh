@@ -85,8 +85,8 @@ class McpStdio:
         return rid
 
     def recv(self, target_id: int, timeout_s: float = 60.0) -> dict[str, Any]:
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
+        deadline = time.perf_counter() + timeout_s
+        while time.perf_counter() < deadline:
             try:
                 msg = self._queue.get(timeout=0.5)
             except Empty:
@@ -109,10 +109,10 @@ class McpStdio:
         self.send("notifications/initialized", notify=True)
 
     def call(self, name: str, args: dict[str, Any], timeout_s: float = 60.0) -> CallResult:
-        t0 = time.monotonic()
+        t0 = time.perf_counter()
         rid = self.send("tools/call", {"name": name, "arguments": args})
         msg = self.recv(rid, timeout_s=timeout_s)
-        elapsed = (time.monotonic() - t0) * 1000.0
+        elapsed = (time.perf_counter() - t0) * 1000.0
         text = ""
         contents = msg.get("result", {}).get("content", [])
         for c in contents:

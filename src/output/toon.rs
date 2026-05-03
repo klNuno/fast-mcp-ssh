@@ -45,13 +45,6 @@ impl Toon {
         self
     }
 
-    pub fn raw_line(&mut self, s: &str) -> &mut Self {
-        self.pad();
-        self.buf.push_str(s);
-        self.buf.push('\n');
-        self
-    }
-
     /// One-off table that takes pre-formatted rows.
     pub fn table_strs(&mut self, key: &str, cols: &[&str], rows: &[Vec<String>]) -> &mut Self {
         self.pad();
@@ -75,6 +68,35 @@ impl Toon {
             self.buf.push('\n');
         }
         self.indent -= 1;
+        self
+    }
+
+    /// Emit a `key: |` block followed by `content` indented by 2 spaces per
+    /// line. Avoids the per-line `format!("  {line}")` allocation that the
+    /// raw_line loop would do.
+    pub fn block(&mut self, key: &str, content: &str) -> &mut Self {
+        self.pad();
+        self.buf.push_str(key);
+        self.buf.push_str(": |\n");
+        if content.is_empty() {
+            return self;
+        }
+        let indent_pad = "  ".repeat(self.indent + 1);
+        let mut start = 0usize;
+        let bytes = content.as_bytes();
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == b'\n' {
+                self.buf.push_str(&indent_pad);
+                self.buf.push_str(&content[start..i]);
+                self.buf.push('\n');
+                start = i + 1;
+            }
+        }
+        if start < content.len() {
+            self.buf.push_str(&indent_pad);
+            self.buf.push_str(&content[start..]);
+            self.buf.push('\n');
+        }
         self
     }
 
@@ -171,6 +193,24 @@ mod tests {
         let rows: Vec<Vec<String>> = vec![];
         t.table_strs("hosts", &["name"], &rows);
         assert_eq!(t.into_string(), "hosts(0): empty\n");
+    }
+
+    #[test]
+    fn block_indents_each_line() {
+        let mut t = Toon::new();
+        t.block("stdout", "line1\nline2\nline3");
+        let out = t.into_string();
+        assert!(out.starts_with("stdout: |\n"));
+        assert!(out.contains("  line1\n"));
+        assert!(out.contains("  line2\n"));
+        assert!(out.contains("  line3\n"));
+    }
+
+    #[test]
+    fn block_handles_empty() {
+        let mut t = Toon::new();
+        t.block("stdout", "");
+        assert_eq!(t.into_string(), "stdout: |\n");
     }
 
     #[test]
