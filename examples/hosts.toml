@@ -60,6 +60,8 @@ user = "root"
 port = 22
 auth = "key"
 key = "~/.fast-mcp-ssh/keys/box1"
+# Optional fallback keys tried after `key`. Useful when migrating ed25519/rsa.
+# keys = ["~/.ssh/id_ed25519", "~/.ssh/id_rsa"]
 
 [host.bastion]
 addr = "203.0.113.5"

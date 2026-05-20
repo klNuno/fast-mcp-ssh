@@ -62,29 +62,54 @@ impl KnownHostsStore {
         }))
     }
 
-    pub fn check(&self, host: &str, fingerprint: &str) -> KnownHostMatch {
+    /// Key fingerprint storage by `addr:port` (transport identity) plus a
+    /// secondary lookup by alias for back-compat with pre-0.2.0 files that
+    /// pinned by alias only.
+    fn endpoint_key(addr: &str, port: u16) -> String {
+        format!("{addr}:{port}")
+    }
+
+    pub fn check(&self, host: &str, addr: &str, port: u16, fingerprint: &str) -> KnownHostMatch {
         let guard = match self.inner.read() {
             Ok(g) => g,
             Err(_) => return KnownHostMatch::Unknown,
         };
-        match guard.host.get(host) {
-            Some(e) if e.fingerprint == fingerprint => KnownHostMatch::Ok,
-            Some(e) => KnownHostMatch::Mismatch {
-                expected: e.fingerprint.clone(),
-            },
-            None => KnownHostMatch::Unknown,
+        let endpoint = Self::endpoint_key(addr, port);
+        if let Some(e) = guard.host.get(&endpoint) {
+            return if e.fingerprint == fingerprint {
+                KnownHostMatch::Ok
+            } else {
+                KnownHostMatch::Mismatch {
+                    expected: e.fingerprint.clone(),
+                }
+            };
         }
+        // Fallback to alias-keyed legacy entries.
+        if let Some(e) = guard.host.get(host) {
+            return if e.fingerprint == fingerprint {
+                KnownHostMatch::Ok
+            } else {
+                KnownHostMatch::Mismatch {
+                    expected: e.fingerprint.clone(),
+                }
+            };
+        }
+        KnownHostMatch::Unknown
     }
 
-    pub fn add(&self, host: &str, fingerprint: &str) -> Result<()> {
+    pub fn add(&self, host: &str, addr: &str, port: u16, fingerprint: &str) -> Result<()> {
         {
             let mut guard = self.inner.write().map_err(|_| SshError::Other("known_hosts lock poisoned".into()))?;
+            let endpoint = Self::endpoint_key(addr, port);
             guard.host.insert(
-                host.to_string(),
+                endpoint,
                 Entry {
                     fingerprint: fingerprint.to_string(),
                 },
             );
+            // Drop any stale alias-keyed entry so future TOFU checks rely on
+            // the addr:port form only.
+            guard.host.remove(host);
         }
         self.flush()
     }

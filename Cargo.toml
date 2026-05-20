@@ -1,6 +1,6 @@
 [package]
 name = "fast-mcp-ssh"
-version = "0.1.5"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Fast MCP SSH server with persistent PTY sessions, SFTP, and AI-first tool surface"

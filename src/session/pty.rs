@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use memchr::memmem;
 use russh::client::Msg;
 use russh::{ChannelMsg, ChannelReadHalf, ChannelWriteHalf};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 use tokio::time::timeout;
 
 use crate::errors::{Result, SshError};
@@ -61,9 +61,11 @@ impl PtyState {
         chan.request_shell(true).await.map_err(SshError::from)?;
 
         let session_id = random_token("rdy");
+        // `bind 'set enable-bracketed-paste off'` was a bashism that errored
+        // under zsh/dash/fish. The portable `printf '\e[?2004l'` reset below
+        // covers the same case across shells.
         let init = format!(
             "stty -echo -onlcr 2>/dev/null\n\
-             bind 'set enable-bracketed-paste off' 2>/dev/null\n\
              printf '\\e[?2004l'\n\
              export PS1='' PS2='' PROMPT_COMMAND=''\n\
              echo __INIT_{session_id}__\n"
@@ -146,6 +148,13 @@ impl PtyState {
 
     /// Write `cmd` to the shell, append a sentinel echo of `$?`, read until sentinel observed.
     /// Returns `(output, exit_code)`.
+    ///
+    /// Locks the read half **before** issuing the write so two concurrent
+    /// `run()` calls cannot interleave: payload A then payload B, then both
+    /// race for `read.lock()` and the first lock-winner reads B's sentinel.
+    /// The fresh per-call nonce in `token` also makes the sentinel
+    /// unforgeable: a user command cannot pre-print the exact suffix because
+    /// it doesn't know the random bytes.
     pub async fn run(
         &self,
         cmd: &str,
@@ -153,10 +162,14 @@ impl PtyState {
         max_capture: usize,
     ) -> Result<(String, i32)> {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
-        let token = format!("__DONE_{}_{}__", self.session_id, seq);
+        let nonce = random_nonce();
+        let token = format!("__DONE_{}_{}_{}__", self.session_id, seq, nonce);
         let payload = format!("{cmd}\nprintf '\\n%s:%s\\n' {token} \"$?\"\n");
+        let read = self.read.lock().await;
         self.write.data(payload.as_bytes()).await.map_err(SshError::from)?;
-        let raw = self.drain_until_terminated(&token, deadline, max_capture).await?;
+        let raw = self
+            .drain_until_terminated(&token, deadline, max_capture, read)
+            .await?;
         let (output, code) = parse_sentinel(&raw, &token);
         Ok((output, code))
     }
@@ -168,6 +181,7 @@ impl PtyState {
         token: &str,
         deadline: Duration,
         max_capture: usize,
+        mut read: MutexGuard<'_, ChannelReadHalf>,
     ) -> Result<String> {
         let pattern = format!("\n{token}:");
         let pattern_bytes = pattern.as_bytes();
@@ -176,7 +190,6 @@ impl PtyState {
         let mut buf = Vec::with_capacity(4096);
         let mut scan_from = 0usize;
         let mut last_match: Option<usize> = None;
-        let mut read = self.read.lock().await;
         loop {
             let remaining = deadline.saturating_sub(start.elapsed());
             if remaining.is_zero() {
@@ -262,17 +275,24 @@ fn strip_trailing_newlines(s: &str) -> &str {
     s.trim_end_matches(['\n', '\r'])
 }
 
-/// Random hex token. 64 bits of entropy is enough to make collision with user output unrealistic.
+/// Random hex token. 64 bits of entropy is enough to make collision with user
+/// output unrealistic. Panics on `getrandom` failure — falling back to nanos
+/// here would make the sentinel predictable, which the spoof-resistance
+/// guarantee in `PtyState::run` relies on.
 fn random_token(prefix: &str) -> String {
     let mut bytes = [0u8; 8];
-    if getrandom::getrandom(&mut bytes).is_err() {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-        bytes = nanos.to_le_bytes();
-    }
+    getrandom::getrandom(&mut bytes)
+        .expect("getrandom must succeed for unforgeable PTY sentinels");
     format!("{prefix}{:016x}", u64::from_le_bytes(bytes))
+}
+
+/// Per-call nonce appended to the `__DONE_*` sentinel. Same hard-fail policy
+/// as `random_token`: an attacker who learns nonces can spoof exit codes.
+fn random_nonce() -> String {
+    let mut bytes = [0u8; 8];
+    getrandom::getrandom(&mut bytes)
+        .expect("getrandom must succeed for unforgeable PTY sentinels");
+    format!("{:016x}", u64::from_le_bytes(bytes))
 }
 
 #[cfg(test)]
@@ -324,6 +344,11 @@ mod tests {
         let b = random_token("x");
         assert_ne!(a, b);
         assert!(a.starts_with("x"));
+    }
+
+    #[test]
+    fn random_nonce_differs_per_call() {
+        assert_ne!(random_nonce(), random_nonce());
     }
 
     #[test]

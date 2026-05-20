@@ -1,3 +1,8 @@
+// Anything written to stdout outside of the rmcp transport corrupts the MCP
+// JSON-RPC framing — the client silently disconnects. These deny lints make
+// the build fail before that happens.
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+
 mod audit;
 mod config;
 mod errors;
@@ -9,10 +14,11 @@ mod session;
 mod sftp;
 mod tail;
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use mimalloc::MiMalloc;
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
@@ -31,8 +37,18 @@ static GLOBAL: MiMalloc = MiMalloc;
 #[command(name = "fast-mcp-ssh", version, about = "Fast MCP SSH server")]
 struct Cli {
     /// Path to hosts.toml. Defaults to $FAST_MCP_SSH_HOME or ~/.fast-mcp-ssh/hosts.toml.
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     config: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Parse and validate the config without starting the server. Exits non-zero
+    /// on any validation failure.
+    Check,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -43,13 +59,14 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn async_main() -> anyhow::Result<()> {
+    let ansi = std::io::stderr().is_terminal();
     fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| EnvFilter::new("info,fast_mcp_ssh=debug,russh=warn")),
         )
         .with_writer(std::io::stderr)
-        .with_ansi(false)
+        .with_ansi(ansi)
         .init();
 
     let cli = Cli::parse();
@@ -62,6 +79,15 @@ async fn async_main() -> anyhow::Result<()> {
         }
     };
     let cfg = Arc::new(cfg);
+
+    if matches!(cli.command, Some(Command::Check)) {
+        tracing::info!(
+            hosts = cfg.hosts.len(),
+            config = %cfg_path.display(),
+            "config OK"
+        );
+        return Ok(());
+    }
 
     let audit_path = if cfg.defaults.audit_log {
         Some(cfg.defaults.audit_log_path.clone())
@@ -76,10 +102,20 @@ async fn async_main() -> anyhow::Result<()> {
 
     let pool_for_evict = pool.clone();
     let mut evict_rx = shutdown_rx.clone();
+    // Tick at most once per minute, and at least twice per idle window so
+    // sessions don't linger past `session_idle_timeout` by up to a minute on
+    // short timeouts.
+    let evict_interval = std::cmp::max(
+        std::time::Duration::from_secs(5),
+        std::cmp::min(
+            std::time::Duration::from_secs(60),
+            cfg.defaults.session_idle_timeout.0 / 2,
+        ),
+    );
     let evict_handle = tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                _ = tokio::time::sleep(evict_interval) => {
                     pool_for_evict.evict_idle().await;
                 }
                 res = evict_rx.changed() => {

@@ -124,12 +124,36 @@ pub struct Host {
     pub port: u16,
     #[serde(default)]
     pub auth: AuthMethod,
+    /// Primary private key path (back-compat with single-key configs).
     #[serde(default)]
     pub key: Option<PathBuf>,
+    /// Optional list of additional candidate keys, tried in order after `key`.
+    /// Useful when migrating between ed25519/rsa or when a host accepts
+    /// multiple identities.
+    #[serde(default)]
+    pub keys: Option<Vec<PathBuf>>,
     #[serde(default)]
     pub guards: Option<Guards>,
     #[serde(default)]
     pub known_host_fingerprint: Option<String>,
+}
+
+impl Host {
+    /// Iterates over every configured key path in priority order.
+    pub fn all_keys(&self) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        if let Some(k) = &self.key {
+            out.push(k.clone());
+        }
+        if let Some(extra) = &self.keys {
+            for k in extra {
+                if !out.iter().any(|p| p == k) {
+                    out.push(k.clone());
+                }
+            }
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq, Eq)]
@@ -252,7 +276,38 @@ impl Config {
         // from `~/.ssh/config` (where `IdentityFile ~/.ssh/id_rsa` keeps the
         // literal `~`) get normalized too.
         cfg.expand_paths();
+        cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Catches the common misconfigurations at startup so the first tool
+    /// call doesn't have to discover them. Refuses:
+    /// * `default_host` pointing at an undeclared alias
+    /// * `auth = "key"` with no `key` and no `keys[]`
+    /// * `auth = "password"` is fine — password is supplied per-call
+    /// * `auth = "agent"` is fine — no key path needed
+    pub fn validate(&self) -> Result<()> {
+        if let Some(dh) = &self.defaults.default_host {
+            if !self.hosts.contains_key(dh) {
+                return Err(SshError::Config(format!(
+                    "default_host '{dh}' is not declared in [host.*]"
+                )));
+            }
+        }
+        for (name, h) in &self.hosts {
+            if matches!(h.auth, AuthMethod::Key) && h.all_keys().is_empty() {
+                return Err(SshError::Config(format!(
+                    "host '{name}': auth = \"key\" but no `key` or `keys[]` set"
+                )));
+            }
+            if h.addr.trim().is_empty() {
+                return Err(SshError::Config(format!("host '{name}': addr is empty")));
+            }
+            if h.user.trim().is_empty() {
+                return Err(SshError::Config(format!("host '{name}': user is empty")));
+            }
+        }
+        Ok(())
     }
 
     pub fn host(&self, name: &str) -> Result<&Host> {
@@ -273,6 +328,15 @@ impl Config {
                 if let Some(s) = k.to_str() {
                     if let Ok(expanded) = shellexpand::full(s) {
                         h.key = Some(PathBuf::from(expanded.into_owned()));
+                    }
+                }
+            }
+            if let Some(extra) = h.keys.as_mut() {
+                for k in extra.iter_mut() {
+                    if let Some(s) = k.to_str() {
+                        if let Ok(expanded) = shellexpand::full(s) {
+                            *k = PathBuf::from(expanded.into_owned());
+                        }
                     }
                 }
             }
@@ -336,6 +400,7 @@ impl Config {
                         port,
                         auth: if key.is_some() { AuthMethod::Key } else { AuthMethod::Agent },
                         key,
+                        keys: None,
                         guards: None,
                         known_host_fingerprint: None,
                     },
@@ -385,6 +450,49 @@ mod tests {
         assert_eq!(h.port, 22);
         assert_eq!(h.user, "root");
         assert!(matches!(h.auth, AuthMethod::Key));
+    }
+
+    #[test]
+    fn validate_rejects_unknown_default_host() {
+        let raw = r#"
+            [defaults]
+            default_host = "nope"
+
+            [host.real]
+            addr = "1.2.3.4"
+            user = "root"
+        "#;
+        let c: Config = toml::from_str(raw).unwrap();
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("default_host"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_auth_key_without_key() {
+        let raw = r#"
+            [host.k]
+            addr = "1.2.3.4"
+            user = "root"
+            auth = "key"
+        "#;
+        let c: Config = toml::from_str(raw).unwrap();
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("auth"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_accepts_multi_keys() {
+        let raw = r#"
+            [host.k]
+            addr = "1.2.3.4"
+            user = "root"
+            auth = "key"
+            keys = ["~/a", "~/b"]
+        "#;
+        let c: Config = toml::from_str(raw).unwrap();
+        c.validate().expect("ok");
+        let h = &c.hosts["k"];
+        assert_eq!(h.all_keys().len(), 2);
     }
 
     #[test]

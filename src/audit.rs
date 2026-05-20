@@ -192,8 +192,8 @@ impl AuditLog {
     }
 }
 
-async fn open_audit_file(path: &PathBuf) -> std::io::Result<tokio::fs::File> {
-    let path = path.clone();
+async fn open_audit_file(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
+    let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let mut opts = std::fs::OpenOptions::new();
         opts.create(true).append(true);

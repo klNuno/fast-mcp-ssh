@@ -181,12 +181,14 @@ impl SessionPool {
         })
     }
 
-    pub fn cached_password(&self, host: &str) -> Option<String> {
-        self.passwords.get(host).map(|v| v.as_str().to_string())
+    pub fn cached_password(&self, host: &str) -> Option<Zeroizing<String>> {
+        self.passwords
+            .get(host)
+            .map(|v| Zeroizing::new(v.as_str().to_string()))
     }
 
-    pub fn cache_password(&self, host: &str, pw: String) {
-        self.passwords.insert(host.to_string(), Zeroizing::new(pw));
+    pub fn cache_password(&self, host: &str, pw: Zeroizing<String>) {
+        self.passwords.insert(host.to_string(), pw);
     }
 
     pub fn forget_password(&self, host: &str) {
@@ -214,7 +216,7 @@ impl SessionPool {
     pub async fn get_or_connect(
         &self,
         host_name: &str,
-        password_override: Option<String>,
+        password_override: Option<Zeroizing<String>>,
     ) -> Result<Arc<Session>> {
         // Fast path: cached and alive.
         if let Some(s) = self.fresh_session(host_name).await {
@@ -248,7 +250,7 @@ impl SessionPool {
             &self.config,
             host_name,
             &host,
-            password.as_deref(),
+            password.as_deref().map(|s| s.as_str()),
             Arc::clone(&self.ssh_cfg),
             self.known_hosts.clone(),
         )

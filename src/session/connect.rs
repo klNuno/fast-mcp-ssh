@@ -16,6 +16,8 @@ const DEFAULT_WINDOW: u32 = 8 * 1024 * 1024;
 
 pub struct ClientHandler {
     pub host_name: String,
+    pub addr: String,
+    pub port: u16,
     pub expected_fingerprint: Option<String>,
     pub strict: StrictHostKey,
     pub store: Option<Arc<KnownHostsStore>>,
@@ -46,7 +48,7 @@ impl client::Handler for ClientHandler {
                 let Some(store) = self.store.as_ref() else {
                     return Ok(matches!(self.strict, StrictHostKey::Off));
                 };
-                match store.check(&self.host_name, &actual) {
+                match store.check(&self.host_name, &self.addr, self.port, &actual) {
                     KnownHostMatch::Ok => Ok(true),
                     KnownHostMatch::Mismatch { expected } => {
                         tracing::warn!(host = %self.host_name, %expected, %actual, "known_hosts fingerprint mismatch");
@@ -54,7 +56,7 @@ impl client::Handler for ClientHandler {
                     }
                     KnownHostMatch::Unknown => {
                         if matches!(self.strict, StrictHostKey::Tofu) {
-                            if let Err(e) = store.add(&self.host_name, &actual) {
+                            if let Err(e) = store.add(&self.host_name, &self.addr, self.port, &actual) {
                                 tracing::error!(?e, "TOFU write known_hosts failed");
                                 return Ok(false);
                             }
@@ -105,6 +107,8 @@ pub async fn open(
     let store = if matches!(strict, StrictHostKey::Off) { None } else { store };
     let handler = ClientHandler {
         host_name: host_name.to_string(),
+        addr: host.addr.clone(),
+        port: host.port,
         expected_fingerprint: host.known_host_fingerprint.clone(),
         strict,
         store,
@@ -141,21 +145,43 @@ pub async fn open(
 }
 
 async fn authenticate_key(session: &mut SshHandle, host: &Host) -> Result<()> {
-    let key_path = host
-        .key
-        .as_ref()
-        .ok_or_else(|| SshError::Config(format!("auth=key but no key path for {}", host.addr)))?;
-    let key = load_secret_key(key_path, None)
-        .map_err(|e| SshError::Config(format!("load key {}: {e}", key_path.display())))?;
-    let hash = session.best_supported_rsa_hash().await.map_err(SshError::from)?.flatten();
-    let res = session
-        .authenticate_publickey(&host.user, PrivateKeyWithHashAlg::new(Arc::new(key), hash))
-        .await
-        .map_err(SshError::from)?;
-    if !res.success() {
-        return Err(SshError::AuthFailed { user: host.user.clone(), host: host.addr.clone() });
+    let key_paths = host.all_keys();
+    if key_paths.is_empty() {
+        return Err(SshError::Config(format!(
+            "auth=key but no key path for {}",
+            host.addr
+        )));
     }
-    Ok(())
+    let hash = session.best_supported_rsa_hash().await.map_err(SshError::from)?.flatten();
+    let mut last_err: Option<SshError> = None;
+    for key_path in &key_paths {
+        let key = match load_secret_key(key_path, None) {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::warn!(path = %key_path.display(), error = ?e, "load key failed; trying next");
+                last_err = Some(SshError::Config(format!("load key {}: {e}", key_path.display())));
+                continue;
+            }
+        };
+        let res = session
+            .authenticate_publickey(
+                &host.user,
+                PrivateKeyWithHashAlg::new(Arc::new(key), hash),
+            )
+            .await
+            .map_err(SshError::from)?;
+        if res.success() {
+            return Ok(());
+        }
+        last_err = Some(SshError::AuthFailed {
+            user: host.user.clone(),
+            host: host.addr.clone(),
+        });
+    }
+    Err(last_err.unwrap_or_else(|| SshError::AuthFailed {
+        user: host.user.clone(),
+        host: host.addr.clone(),
+    }))
 }
 
 async fn authenticate_agent(session: &mut SshHandle, user: &str) -> Result<()> {
