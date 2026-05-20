@@ -9,21 +9,32 @@ use serde::{Deserialize, Serialize};
 use crate::errors::{Result, SshError};
 
 const DEFAULT_DENY: &[(&str, &str)] = &[
-    ("rm-rf-root", r"(?m)\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r)\s+/[a-zA-Z]*(\s|$)"),
-    ("dd-disk", r"(?m)\bdd\s+.*of=/dev/(sd|nvme|hd|vd)"),
-    ("mkfs", r"(?m)\bmkfs(\.[a-z0-9]+)?\s+/dev/"),
+    // Matches: rm -rf /, rm -rf '/', rm -rf "/", rm -rf //, rm -rf /*,
+    // rm -rf -- /, rm --recursive --force /, rm -rf /etc, RM -rf /, etc.
+    // Won't match relative paths (./tmp, ../foo).
+    (
+        "rm-rf-root",
+        r#"(?im)\brm\b(?:\s+(?:-{1,2}[a-zA-Z\-]+|--))*\s+['"]?/+\*?[a-zA-Z]*['"]?(\s|$|/)"#,
+    ),
+    ("dd-disk", r#"(?im)\bdd\b.*\bof\s*=\s*['"]?/dev/(sd|nvme|hd|vd)"#),
+    ("mkfs", r#"(?im)\bmkfs(\.[a-z0-9]+)?\s+['"]?/dev/"#),
     ("forkbomb", r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:"),
-    ("redirect-disk", r">\s*/dev/(sd|nvme|hd|vd)"),
-    ("chmod-root", r"(?m)\bchmod\s+(-R\s+)?[0-7]{3,4}\s+/(\s|$)"),
+    ("redirect-disk", r#">\s*['"]?/dev/(sd|nvme|hd|vd)"#),
+    // chmod root: only literal `/` (filesystem root) is denied. `/etc` is allowed
+    // by design — escalate via per-host guards if you want broader coverage.
+    (
+        "chmod-root",
+        r#"(?im)\bchmod\b(?:\s+(?:-{1,2}[a-zA-Z\-]+|--))*\s+[0-7]{3,4}\s+['"]?/+['"]?(\s|$)"#,
+    ),
 ];
 
 const DEFAULT_CONFIRM: &[(&str, &str)] = &[
-    ("shutdown", r"(?m)\b(shutdown|halt|poweroff)\b"),
-    ("reboot", r"(?m)\breboot\b"),
+    ("shutdown", r"(?im)\b(shutdown|halt|poweroff)\b"),
+    ("reboot", r"(?im)\breboot\b"),
     ("sql-drop", r"(?i)\bDROP\s+(TABLE|DATABASE|SCHEMA)\b"),
     ("sql-truncate", r"(?i)\bTRUNCATE\s+TABLE\b"),
-    ("systemctl-stop", r"(?m)\bsystemctl\s+(stop|disable|mask)\b"),
-    ("docker-rm", r"(?m)\bdocker\s+(rm|rmi|volume\s+rm|system\s+prune)\b"),
+    ("systemctl-stop", r"(?im)\bsystemctl\s+(stop|disable|mask)\b"),
+    ("docker-rm", r"(?im)\bdocker\s+(rm|rmi|volume\s+rm|system\s+prune)\b"),
 ];
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -234,10 +245,13 @@ impl Config {
         }
         let raw = std::fs::read_to_string(path)?;
         let mut cfg: Config = toml::from_str(&raw)?;
-        cfg.expand_paths();
         if cfg.defaults.import_ssh_config {
             cfg.merge_ssh_config();
         }
+        // Expand `~` after the ssh_config import so identity files imported
+        // from `~/.ssh/config` (where `IdentityFile ~/.ssh/id_rsa` keeps the
+        // literal `~`) get normalized too.
+        cfg.expand_paths();
         Ok(cfg)
     }
 

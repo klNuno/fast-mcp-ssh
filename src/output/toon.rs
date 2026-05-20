@@ -55,7 +55,12 @@ impl Toon {
         let _ = writeln!(self.buf, "{key}({}):", rows.len());
         self.indent += 1;
         self.pad();
-        self.buf.push_str(&cols.join(" "));
+        for (i, c) in cols.iter().enumerate() {
+            if i > 0 {
+                self.buf.push(' ');
+            }
+            escape_cell(c, &mut self.buf);
+        }
         self.buf.push('\n');
         for r in rows {
             self.pad();
@@ -136,22 +141,31 @@ impl ToonValue for bool { fn write_to(&self, buf: &mut String) { buf.push_str(if
 impl ToonValue for f64 { fn write_to(&self, buf: &mut String) { let _ = write!(buf, "{self}"); } }
 
 fn escape_scalar(s: &str, buf: &mut String) {
-    if needs_quote(s) {
-        buf.push('"');
-        for c in s.chars() {
-            match c {
-                '"' => buf.push_str("\\\""),
-                '\\' => buf.push_str("\\\\"),
-                '\n' => buf.push_str("\\n"),
-                '\r' => buf.push_str("\\r"),
-                '\t' => buf.push_str("\\t"),
-                _ => buf.push(c),
-            }
-        }
-        buf.push('"');
-    } else {
+    if !needs_quote(s) {
         buf.push_str(s);
+        return;
     }
+    buf.reserve(s.len() + 2);
+    buf.push('"');
+    // All escape targets (`"`, `\`, `\n`, `\r`, `\t`) are single-byte ASCII,
+    // so bulk-copying the bytes between them never splits a UTF-8 codepoint.
+    let bytes = s.as_bytes();
+    let mut chunk_start = 0usize;
+    for (i, &b) in bytes.iter().enumerate() {
+        let esc: &str = match b {
+            b'"' => "\\\"",
+            b'\\' => "\\\\",
+            b'\n' => "\\n",
+            b'\r' => "\\r",
+            b'\t' => "\\t",
+            _ => continue,
+        };
+        buf.push_str(&s[chunk_start..i]);
+        buf.push_str(esc);
+        chunk_start = i + 1;
+    }
+    buf.push_str(&s[chunk_start..]);
+    buf.push('"');
 }
 
 fn escape_cell(s: &str, buf: &mut String) {
@@ -163,10 +177,19 @@ fn escape_cell(s: &str, buf: &mut String) {
 }
 
 fn needs_quote(s: &str) -> bool {
-    if s.is_empty() { return true; }
-    s.chars().any(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '"' | '\\' | ':' | '#'))
-        || s.starts_with('-')
-        || s == "true" || s == "false" || s == "null"
+    if s.is_empty() {
+        return true;
+    }
+    let bytes = s.as_bytes();
+    if bytes[0] == b'-' {
+        return true;
+    }
+    for &b in bytes {
+        if matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\\' | b':' | b'#') {
+            return true;
+        }
+    }
+    matches!(s, "true" | "false" | "null")
 }
 
 #[cfg(test)]

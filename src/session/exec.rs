@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use russh::ChannelMsg;
-use tokio::time::timeout;
+use tokio::time::{Instant as TokioInstant, sleep_until};
 
 use crate::errors::{Result, SshError};
 use crate::session::Session;
@@ -17,6 +17,10 @@ pub struct ExecResult {
     pub timed_out: bool,
     /// True if capture stopped at `max_capture` before EOF.
     pub capture_capped: bool,
+    /// True if the channel closed without delivering an `ExitStatus`. Caller
+    /// should not conflate the resulting `exit_code = -1` with a process that
+    /// genuinely exited with -1. Common cause: server-side abrupt hangup.
+    pub connection_lost: bool,
 }
 
 /// Run `cmd` over a fresh exec channel on the persistent SSH handle. `cmd` is passed verbatim
@@ -32,56 +36,69 @@ pub async fn exec(
     max_capture: usize,
 ) -> Result<ExecResult> {
     let start = Instant::now();
-    let _permit = session.acquire_channel().await?;
-    let mut channel = session
-        .handle
-        .channel_open_session()
-        .await
-        .map_err(SshError::from)?;
-    channel.exec(true, cmd).await.map_err(SshError::from)?;
+    // Grab a pre-opened channel from the per-session pool when one is
+    // ready. Otherwise open a fresh session channel. Either way we hold
+    // the matching semaphore permit until exec completes.
+    let (mut channel, _permit) = session.take_or_open_channel().await?;
+    // want_reply=false: do not wait for the SSH SUCCESS reply before
+    // reading. Saves ~1 RTT per warm exec call. If the exec request fails
+    // server-side we'll see Eof/Close immediately and the existing
+    // `connection_lost` path takes over.
+    channel.exec(false, cmd).await.map_err(SshError::from)?;
 
-    let mut stdout = Vec::with_capacity(4096);
-    let mut stderr = Vec::with_capacity(1024);
+    // Bumping initial capacity from 4 KiB cuts 1-2 reallocs on typical
+    // multi-KB exec output (e.g. `ls -laR`). 16 KiB is bounded by `max_capture`.
+    let stdout_cap = max_capture.min(16 * 1024);
+    let stderr_cap = max_capture.min(2 * 1024);
+    let mut stdout = Vec::with_capacity(stdout_cap);
+    let mut stderr = Vec::with_capacity(stderr_cap);
     let mut exit_code: Option<i32> = None;
     let mut timed_out = false;
     let mut capture_capped = false;
 
+    // Single Sleep registered for the whole exec; reused via Pin across
+    // iterations to avoid the per-message timer-registration overhead of
+    // wrapping `channel.wait()` in `tokio::time::timeout`.
+    let sleep = sleep_until(TokioInstant::now() + deadline);
+    tokio::pin!(sleep);
+
+    let mut close_seen = false;
     loop {
-        let res = timeout(
-            deadline.saturating_sub(start.elapsed()).max(Duration::from_millis(1)),
-            channel.wait(),
-        )
-        .await;
-        let msg = match res {
-            Ok(Some(m)) => m,
-            Ok(None) => break,
-            Err(_) => {
+        tokio::select! {
+            biased;
+            _ = &mut sleep => {
                 timed_out = true;
                 let _ = channel.close().await;
                 break;
             }
-        };
-        match msg {
-            ChannelMsg::Data { ref data } => append_capped(&mut stdout, data, max_capture, &mut capture_capped),
-            ChannelMsg::ExtendedData { ref data, ext } => {
-                if ext == 1 {
-                    append_capped(&mut stderr, data, max_capture, &mut capture_capped);
-                } else {
-                    append_capped(&mut stdout, data, max_capture, &mut capture_capped);
+            msg = channel.wait() => {
+                match msg {
+                    None => break,
+                    Some(ChannelMsg::Data { ref data }) => append_capped(&mut stdout, data, max_capture, &mut capture_capped),
+                    Some(ChannelMsg::ExtendedData { ref data, ext }) => {
+                        if ext == 1 {
+                            append_capped(&mut stderr, data, max_capture, &mut capture_capped);
+                        } else {
+                            append_capped(&mut stdout, data, max_capture, &mut capture_capped);
+                        }
+                    }
+                    Some(ChannelMsg::ExitStatus { exit_status }) => {
+                        exit_code = Some(exit_status as i32);
+                        if close_seen { break; }
+                    }
+                    Some(ChannelMsg::Close) => {
+                        close_seen = true;
+                        if exit_code.is_some() { break; }
+                    }
+                    Some(ChannelMsg::Eof) => {
+                        if exit_code.is_some() { break; }
+                    }
+                    Some(_) => {}
                 }
             }
-            ChannelMsg::ExitStatus { exit_status } => {
-                exit_code = Some(exit_status as i32);
-            }
-            ChannelMsg::Close => break,
-            ChannelMsg::Eof => {
-                if exit_code.is_some() {
-                    break;
-                }
-            }
-            _ => {}
         }
     }
+    let connection_lost = close_seen && exit_code.is_none();
 
     let stdout_bytes = stdout.len();
     let stderr_bytes = stderr.len();
@@ -97,6 +114,7 @@ pub async fn exec(
         stderr_bytes,
         timed_out,
         capture_capped,
+        connection_lost,
     })
 }
 

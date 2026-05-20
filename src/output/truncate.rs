@@ -1,8 +1,13 @@
+use std::borrow::Cow;
+use std::fmt::Write;
+
 /// Truncate long output keeping a head + a short hint about how much was cut.
-/// Returns trimmed text. Caller may also expose `truncated_bytes` in metadata.
-pub fn truncate_with_hint(text: &str, max_bytes: usize) -> (String, Option<usize>) {
+/// On the common no-truncate path this borrows the input — no copy. When
+/// truncated, returns the truncated `String` plus the original total length so
+/// the caller can expose it in metadata.
+pub fn truncate_with_hint(text: &str, max_bytes: usize) -> (Cow<'_, str>, Option<usize>) {
     if text.len() <= max_bytes {
-        return (text.to_string(), None);
+        return (Cow::Borrowed(text), None);
     }
     let mut cut = max_bytes;
     while cut > 0 && !text.is_char_boundary(cut) {
@@ -11,8 +16,8 @@ pub fn truncate_with_hint(text: &str, max_bytes: usize) -> (String, Option<usize
     let total = text.len();
     let mut out = String::with_capacity(cut + 32);
     out.push_str(&text[..cut]);
-    out.push_str(&format!("\n…[+{}B truncated]", total - cut));
-    (out, Some(total))
+    let _ = write!(out, "\n…[+{}B truncated]", total - cut);
+    (Cow::Owned(out), Some(total))
 }
 
 #[cfg(test)]
@@ -24,6 +29,7 @@ mod tests {
         let (out, n) = truncate_with_hint("short", 100);
         assert_eq!(out, "short");
         assert_eq!(n, None);
+        assert!(matches!(out, Cow::Borrowed(_)));
     }
 
     #[test]

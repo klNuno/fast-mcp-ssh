@@ -35,9 +35,9 @@ Optional `--config <path>`. Default is `$FAST_MCP_SSH_HOME/hosts.toml`, falling 
 | Tool    | Args                                 | Notes |
 |---------|--------------------------------------|-------|
 | `hosts`     | none                                                  | List configured hosts and their session state. |
-| `ping`      | `host?`                                               | Health check. With no arg, probes all hosts in parallel. |
+| `ping`      | `host?`, `password?`                                  | Health check. With no arg, probes all hosts in parallel (password ignored in that case). |
 | `exec`      | `host?`, `cmd`, `timeout?`, `password?`, `confirm?`     | One-shot command on a fresh exec channel. Stateless, parallel-safe. |
-| `exec_batch`| `host?`, `cmds[]`, `timeout?`, `password?`, `confirm?` | Run N commands in parallel on one host in one round-trip. |
+| `exec_batch`| `host?`, `cmds[]`, `timeout?`, `password?`, `confirm?`, `verbose?` | Run N commands in parallel on one host in one round-trip. `verbose=true` widens success preview to 200 chars; failures always show 200. |
 | `sh`        | `host?`, `cmd`, `timeout?`, `password?`, `confirm?`, `cols?`, `rows?` | Persistent PTY shell. `cd` / `export` survive between calls. PTY size is configurable on first call per host. |
 | `disconnect`| `host?`                                                | Close the persistent session. Reopens automatically on next call. |
 | `interrupt` | `host?`                                                | Send Ctrl-C to the foreground command on the persistent PTY. Independent of in-flight `sh` (split read/write). |

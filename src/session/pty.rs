@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use memchr::memmem;
@@ -24,6 +25,9 @@ pub struct PtyState {
     read: Mutex<ChannelReadHalf>,
     write: ChannelWriteHalf<Msg>,
     pub session_id: String,
+    /// Per-call sequence counter. Each `run()` rotates the sentinel token so
+    /// a prior command output cannot forge an exit code for a subsequent call.
+    seq: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -71,6 +75,7 @@ impl PtyState {
             read: Mutex::new(read),
             write,
             session_id: session_id.clone(),
+            seq: AtomicU64::new(0),
         };
         let init_marker = format!("__INIT_{session_id}__");
         let _ = pty
@@ -147,7 +152,8 @@ impl PtyState {
         deadline: Duration,
         max_capture: usize,
     ) -> Result<(String, i32)> {
-        let token = format!("__DONE_{}__", self.session_id);
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        let token = format!("__DONE_{}_{}__", self.session_id, seq);
         let payload = format!("{cmd}\nprintf '\\n%s:%s\\n' {token} \"$?\"\n");
         self.write.data(payload.as_bytes()).await.map_err(SshError::from)?;
         let raw = self.drain_until_terminated(&token, deadline, max_capture).await?;

@@ -58,7 +58,15 @@ impl client::Handler for ClientHandler {
                                 tracing::error!(?e, "TOFU write known_hosts failed");
                                 return Ok(false);
                             }
-                            tracing::info!(host = %self.host_name, %actual, "TOFU: pinned new fingerprint");
+                            // warn, not info: the first connect to a new host
+                            // is the TOFU window — if it was MITM'd, future
+                            // connects pin the attacker. Caller should verify
+                            // out-of-band on first use.
+                            tracing::warn!(
+                                host = %self.host_name,
+                                fingerprint = %actual,
+                                "TOFU: pinned new server fingerprint on first connect; verify out-of-band"
+                            );
                             Ok(true)
                         } else {
                             tracing::warn!(host = %self.host_name, "strict host key checking: host unknown");
@@ -103,9 +111,16 @@ pub async fn open(
     };
     let addr = (host.addr.as_str(), host.port);
 
-    let mut session = client::connect(ssh_cfg, addr, handler)
-        .await
-        .map_err(SshError::from)?;
+    let connect_timeout = cfg.defaults.connect_timeout.0;
+    let mut session = match tokio::time::timeout(
+        connect_timeout,
+        client::connect(ssh_cfg, addr, handler),
+    )
+    .await
+    {
+        Ok(r) => r.map_err(SshError::from)?,
+        Err(_) => return Err(SshError::Timeout(connect_timeout.as_millis() as u64)),
+    };
 
     let user = host.user.clone();
     match host.auth {

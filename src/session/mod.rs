@@ -11,7 +11,7 @@ use std::{
 use dashmap::DashMap;
 use russh::client;
 use russh_sftp::client::SftpSession;
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use zeroize::Zeroizing;
 
 use crate::config::{Config, StrictHostKey};
@@ -19,6 +19,19 @@ use crate::errors::{Result, SshError};
 use crate::known_hosts::KnownHostsStore;
 
 pub use connect::SshHandle;
+
+/// Default number of pre-opened spare channels held per session.
+/// Each spare costs one slot against sshd `MaxSessions`. Two is a safe
+/// default with the standard `MaxSessions=10`.
+const DEFAULT_POOL_TARGET: usize = 2;
+
+/// A pre-opened SSH session channel held in the pool. Owns the semaphore
+/// permit so concurrency accounting stays correct when the channel is
+/// consumed by `exec`.
+pub struct ParkedChannel {
+    pub channel: russh::Channel<russh::client::Msg>,
+    pub permit: OwnedSemaphorePermit,
+}
 
 /// One persistent SSH connection per host.
 /// `handle` is the russh client handle (TCP+SSH session). Channels are spawned per-call (`exec`)
@@ -30,6 +43,13 @@ pub struct Session {
     /// Caps concurrent open channels for this host so we don't exceed sshd
     /// `MaxSessions` (default 10).
     channel_limit: Arc<Semaphore>,
+    /// Pool of pre-opened session channels. Each entry has already paid the
+    /// `CHANNEL_OPEN`/`CHANNEL_OPEN_CONFIRMATION` round-trip, so an exec call
+    /// can grab one and immediately send the exec request (-1 RTT).
+    channel_pool: Mutex<Vec<ParkedChannel>>,
+    pool_target: usize,
+    /// Notified whenever the pool is drained or a refill should be considered.
+    refill_notify: Arc<Notify>,
     last_used_ms: AtomicU64,
     started: Instant,
 }
@@ -41,6 +61,9 @@ impl Session {
             pty: Mutex::new(None),
             sftp: Mutex::new(None),
             channel_limit: Arc::new(Semaphore::new(max_channels.max(1))),
+            channel_pool: Mutex::new(Vec::with_capacity(DEFAULT_POOL_TARGET)),
+            pool_target: DEFAULT_POOL_TARGET.min(max_channels.saturating_sub(1).max(0)),
+            refill_notify: Arc::new(Notify::new()),
             last_used_ms: AtomicU64::new(0),
             started: Instant::now(),
         }
@@ -65,6 +88,26 @@ impl Session {
             .map_err(|_| SshError::Other("channel semaphore closed".into()))
     }
 
+    /// Take a pre-opened channel + its permit from the pool, or open a fresh
+    /// one. Always notifies the refill task so the pool topples back up.
+    pub async fn take_or_open_channel(
+        &self,
+    ) -> Result<(russh::Channel<russh::client::Msg>, OwnedSemaphorePermit)> {
+        let parked = self.channel_pool.lock().await.pop();
+        if let Some(p) = parked {
+            self.refill_notify.notify_one();
+            return Ok((p.channel, p.permit));
+        }
+        let permit = self.acquire_channel().await?;
+        let channel = self
+            .handle
+            .channel_open_session()
+            .await
+            .map_err(SshError::from)?;
+        self.refill_notify.notify_one();
+        Ok((channel, permit))
+    }
+
     /// Lazily open and cache an SFTP subsystem on this session. Subsequent calls
     /// return the cached `Arc<SftpSession>`. Saves a channel-open + subsystem
     /// round-trip per SFTP operation.
@@ -78,8 +121,11 @@ impl Session {
             .channel_open_session()
             .await
             .map_err(SshError::from)?;
+        // want_reply=false saves the SUCCESS round-trip; russh-sftp issues
+        // its own INIT on the stream and surfaces a hard error if the
+        // subsystem isn't actually live.
         channel
-            .request_subsystem(true, "sftp")
+            .request_subsystem(false, "sftp")
             .await
             .map_err(SshError::from)?;
         let sftp = SftpSession::new(channel.into_stream())
@@ -153,8 +199,10 @@ impl SessionPool {
         v
     }
 
-    pub fn drop_session(&self, host: &str) {
-        self.sessions.remove(host);
+    /// Remove the cached session and return it so the caller can run an
+    /// explicit shutdown (e.g. send SSH `disconnect`) before the `Arc` drops.
+    pub fn take_session(&self, host: &str) -> Option<Arc<Session>> {
+        self.sessions.remove(host).map(|(_, v)| v)
     }
 
     pub fn get(&self, host: &str) -> Option<Arc<Session>> {
@@ -173,12 +221,20 @@ impl SessionPool {
             return Ok(s);
         }
 
-        // Slow path: serialize concurrent opens for this host.
-        let lock = self
-            .connect_locks
-            .entry(host_name.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone();
+        // Slow path: serialize concurrent opens for this host. Validate the
+        // host name before allocating a lock — otherwise a spammed-with-bogus
+        // input would leak entries into `connect_locks`.
+        let _ = self.config.host(host_name)?;
+        let lock = if let Some(existing) = self.connect_locks.get(host_name) {
+            Arc::clone(existing.value())
+        } else {
+            Arc::clone(
+                self.connect_locks
+                    .entry(host_name.to_string())
+                    .or_insert_with(|| Arc::new(Mutex::new(())))
+                    .value(),
+            )
+        };
         let _guard = lock.lock().await;
 
         // Re-check inside the critical section in case a sibling already opened.
@@ -188,7 +244,7 @@ impl SessionPool {
 
         let host = self.config.host(host_name)?.clone();
         let password = password_override.or_else(|| self.cached_password(host_name));
-        let handle = connect::open(
+        let handle = match connect::open(
             &self.config,
             host_name,
             &host,
@@ -196,10 +252,24 @@ impl SessionPool {
             Arc::clone(&self.ssh_cfg),
             self.known_hosts.clone(),
         )
-        .await?;
+        .await
+        {
+            Ok(h) => h,
+            Err(e @ SshError::AuthFailed { .. }) => {
+                // Cached password is wrong; drop it so the next call can
+                // retry with a fresh `password=` argument instead of looping
+                // on the bad cache.
+                self.passwords.remove(host_name);
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
         let session = Arc::new(Session::new(handle, self.max_channels));
         session.touch();
         self.sessions.insert(host_name.to_string(), session.clone());
+        if session.pool_target > 0 {
+            spawn_pool_refill(Arc::downgrade(&session));
+        }
         Ok(session)
     }
 
@@ -234,4 +304,55 @@ impl SessionPool {
             self.sessions.remove(&k);
         }
     }
+}
+
+/// Background task that keeps a session's `channel_pool` topped up to
+/// `pool_target`. Holds only a weak reference so the session can drop
+/// (and the task self-exits) when the pool evicts the session.
+fn spawn_pool_refill(weak: std::sync::Weak<Session>) {
+    tokio::spawn(async move {
+        loop {
+            let Some(session) = weak.upgrade() else { return };
+            // SSH connection died; stop refilling.
+            if session.handle.is_closed() {
+                return;
+            }
+            let pool_len = session.channel_pool.lock().await.len();
+            if pool_len >= session.pool_target {
+                let notify = Arc::clone(&session.refill_notify);
+                drop(session);
+                notify.notified().await;
+                continue;
+            }
+            // Try to reserve a channel slot without blocking exec calls.
+            // If everything is in use, back off briefly and re-check.
+            let permit = match Arc::clone(&session.channel_limit).try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    drop(session);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+            match session.handle.channel_open_session().await {
+                Ok(channel) => {
+                    session
+                        .channel_pool
+                        .lock()
+                        .await
+                        .push(ParkedChannel { channel, permit });
+                }
+                Err(e) => {
+                    drop(permit);
+                    if session.handle.is_closed() {
+                        tracing::debug!(?e, "pool refill: handle closed, stopping");
+                        return;
+                    }
+                    tracing::debug!(?e, "pool refill: open failed, retrying");
+                    drop(session);
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+        }
+    });
 }
