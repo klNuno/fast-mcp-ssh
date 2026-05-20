@@ -1,8 +1,9 @@
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use russh_sftp::protocol::{FileAttributes, OpenFlags};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::timeout;
 
 use crate::errors::{Result, SshError};
 use crate::session::Session;
@@ -20,6 +21,27 @@ pub struct ListEntry {
     pub size: u64,
     pub mode: u32,
     pub mtime: u64,
+}
+
+pub struct StatEntry {
+    pub kind: &'static str,
+    pub size: u64,
+    pub mode: u32,
+    pub mtime: u64,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+async fn with_timeout<T, F>(label: &'static str, secs: u64, fut: F) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    match timeout(Duration::from_secs(secs), fut).await {
+        Ok(r) => r,
+        Err(_) => Err(SshError::Other(format!(
+            "sftp {label} timed out after {secs}s"
+        ))),
+    }
 }
 
 pub async fn upload(session: &Session, local: &Path, remote: &str) -> Result<SftpResult> {
@@ -141,6 +163,145 @@ pub async fn write_inline(
     drop(file);
     session.touch();
     Ok(SftpResult { bytes: content.len(), duration_ms: start.elapsed().as_millis() })
+}
+
+pub async fn mkdir(session: &Session, path: &str, parents: bool) -> Result<()> {
+    let sftp = session.sftp().await?;
+    if parents {
+        let mut acc = String::new();
+        let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        let absolute = path.starts_with('/');
+        for (i, seg) in segments.iter().enumerate() {
+            if absolute || i > 0 {
+                acc.push('/');
+            }
+            acc.push_str(seg);
+            if sftp.metadata(acc.clone()).await.is_ok() {
+                continue;
+            }
+            with_timeout("mkdir", 30, async {
+                sftp.create_dir(acc.clone())
+                    .await
+                    .map_err(SshError::from)
+            })
+            .await?;
+        }
+    } else {
+        with_timeout("mkdir", 30, async {
+            sftp.create_dir(path.to_string())
+                .await
+                .map_err(SshError::from)
+        })
+        .await?;
+    }
+    session.touch();
+    Ok(())
+}
+
+pub async fn remove(session: &Session, path: &str, recursive: bool) -> Result<u64> {
+    let sftp = session.sftp().await?;
+    let meta = with_timeout("stat", 30, async {
+        sftp.metadata(path.to_string())
+            .await
+            .map_err(SshError::from)
+    })
+    .await?;
+    if meta.is_dir() {
+        if !recursive {
+            return Err(SshError::Other(format!(
+                "{path} is a directory; pass recursive=true"
+            )));
+        }
+        let removed = remove_dir_recursive(session, path).await?;
+        session.touch();
+        Ok(removed)
+    } else {
+        with_timeout("rm", 30, async {
+            sftp.remove_file(path.to_string())
+                .await
+                .map_err(SshError::from)
+        })
+        .await?;
+        session.touch();
+        Ok(1)
+    }
+}
+
+async fn remove_dir_recursive(session: &Session, path: &str) -> Result<u64> {
+    let sftp = session.sftp().await?;
+    let mut count = 0u64;
+    // Iterative DFS to keep the recursion budget bounded.
+    let mut stack = vec![(path.to_string(), false)];
+    while let Some((dir, visited)) = stack.pop() {
+        if visited {
+            with_timeout("rmdir", 30, async {
+                sftp.remove_dir(dir.clone())
+                    .await
+                    .map_err(SshError::from)
+            })
+            .await?;
+            count += 1;
+            continue;
+        }
+        stack.push((dir.clone(), true));
+        let entries = with_timeout("readdir", 30, async {
+            sftp.read_dir(dir.clone())
+                .await
+                .map_err(SshError::from)
+        })
+        .await?;
+        for entry in entries {
+            let name = entry.file_name();
+            if name == "." || name == ".." {
+                continue;
+            }
+            let child = if dir.ends_with('/') {
+                format!("{dir}{name}")
+            } else {
+                format!("{dir}/{name}")
+            };
+            if entry.metadata().is_dir() {
+                stack.push((child, false));
+            } else {
+                with_timeout("rm", 30, async {
+                    sftp.remove_file(child)
+                        .await
+                        .map_err(SshError::from)
+                })
+                .await?;
+                count += 1;
+            }
+        }
+    }
+    Ok(count)
+}
+
+pub async fn stat(session: &Session, path: &str) -> Result<StatEntry> {
+    let sftp = session.sftp().await?;
+    let attrs = with_timeout("stat", 30, async {
+        sftp.metadata(path.to_string())
+            .await
+            .map_err(SshError::from)
+    })
+    .await?;
+    let kind = if attrs.is_dir() {
+        "dir"
+    } else if attrs.is_symlink() {
+        "link"
+    } else if attrs.is_regular() {
+        "file"
+    } else {
+        "other"
+    };
+    session.touch();
+    Ok(StatEntry {
+        kind,
+        size: attrs.size.unwrap_or(0),
+        mode: attrs.permissions.unwrap_or(0),
+        mtime: u64::from(attrs.mtime.unwrap_or(0)),
+        uid: attrs.uid.unwrap_or(0),
+        gid: attrs.gid.unwrap_or(0),
+    })
 }
 
 pub async fn list_dir(session: &Session, path: &str) -> Result<Vec<ListEntry>> {

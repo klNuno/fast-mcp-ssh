@@ -141,6 +141,60 @@ impl CompiledGuards {
         }
         Ok(())
     }
+
+    /// Guard for SFTP read paths (`dn` / `ls` / `stat`). Blocks reads of
+    /// private keys, shadow files, sudoers, and cloud-credential files
+    /// regardless of `read_only`. Read-only hosts still allow safe reads.
+    pub fn check_sftp_read(&self, remote_path: &str) -> Result<()> {
+        if sensitive_read_path_re().is_match(remote_path) {
+            return Err(SshError::BlockedByGuard {
+                name: "sensitive-read".into(),
+                pattern: "read of sensitive system path blocked".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn sensitive_read_path_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?ix)
+            (?:^|/)
+            (?:
+                shadow | gshadow
+              | sudoers
+              | id_(?:rsa|ed25519|ecdsa|dsa|sk)
+              | identity
+            )
+            $
+            |
+            (?:^|/)\.ssh/id_[a-z0-9_]+$
+            |
+            (?:^|/)\.aws/credentials$
+            |
+            (?:^|/)\.kube/config$
+            |
+            (?:^|/)\.docker/config\.json$
+            |
+            (?:^|/)\.config/gcloud/(?:application_default_credentials|credentials)\.json$
+            |
+            (?:^|/)\.netrc$
+            |
+            (?:^|/)\.pgpass$
+            |
+            (?:^|/)etc/(?:shadow|gshadow|sudoers)$
+            |
+            (?:^|/)etc/sudoers\.d/.+$
+            |
+            (?:^|/)etc/ssh/ssh_host_[a-z0-9_]+_key$
+            |
+            (?:^|/)proc/[0-9]+/(?:mem|environ)$
+            "#,
+        )
+        .expect("sensitive_read_path_re valid")
+    })
 }
 
 fn sensitive_write_path_re() -> &'static Regex {
@@ -485,5 +539,41 @@ mod tests {
     fn allow_simple_ls() {
         let g = CompiledGuards::compile(&Guards::default()).unwrap();
         assert_eq!(g.check("ls -la /etc"), GuardCheck::Allow);
+    }
+
+    #[test]
+    fn sftp_read_blocks_sensitive_paths() {
+        let g = CompiledGuards::compile(&Guards::default()).unwrap();
+        for path in [
+            "/etc/shadow",
+            "/etc/sudoers",
+            "/etc/sudoers.d/01_users",
+            "/root/.ssh/id_rsa",
+            "/home/alice/.ssh/id_ed25519",
+            "/home/alice/.aws/credentials",
+            "/home/alice/.kube/config",
+            "/home/alice/.docker/config.json",
+            "/home/alice/.config/gcloud/credentials.json",
+            "/home/alice/.netrc",
+            "/home/alice/.pgpass",
+            "/etc/ssh/ssh_host_rsa_key",
+            "/proc/123/environ",
+        ] {
+            assert!(g.check_sftp_read(path).is_err(), "should block: {path}");
+        }
+    }
+
+    #[test]
+    fn sftp_read_allows_safe_paths() {
+        let g = CompiledGuards::compile(&Guards::default()).unwrap();
+        for path in [
+            "/etc/hostname",
+            "/var/log/syslog",
+            "/home/alice/.ssh/authorized_keys",
+            "/home/alice/.ssh/id_rsa.pub",
+            "/home/alice/notes.txt",
+        ] {
+            assert!(g.check_sftp_read(path).is_ok(), "should allow: {path}");
+        }
     }
 }

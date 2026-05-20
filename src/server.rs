@@ -29,9 +29,32 @@ const DEFAULT_TIMEOUT: u64 = 60;
 const MAX_TIMEOUT_SECS: u64 = 600;
 const MAX_FOLLOW_SECS: u64 = 600;
 const INLINE_MAX_BYTES: usize = 256 * 1024;
+/// Hard cap on a single command string. Refuses oversize inputs before they
+/// reach the SSH channel.
+const MAX_CMD_BYTES: usize = 64 * 1024;
+/// Hard cap on `exec_batch` fan-out. Past this an AI is almost certainly
+/// looping when it should be using a script.
+const MAX_BATCH_CMDS: usize = 64;
+/// Hard cap on inline `wr` content. Larger files should go through `up`.
+const MAX_WRITE_INLINE_BYTES: usize = 8 * 1024 * 1024;
+/// Cap on a single SFTP listing returned in one call. Pagination via
+/// `offset` lets the AI walk past it.
+const MAX_LS_ENTRIES: usize = 1000;
 
 fn clamp_timeout(t: Option<u64>) -> Duration {
     Duration::from_secs(t.unwrap_or(DEFAULT_TIMEOUT).clamp(1, MAX_TIMEOUT_SECS))
+}
+
+fn validate_cmd(cmd: &str) -> Result<(), McpError> {
+    if cmd.len() > MAX_CMD_BYTES {
+        return Err(SshError::Config(format!(
+            "cmd too large: {} bytes (max {})",
+            cmd.len(),
+            MAX_CMD_BYTES
+        ))
+        .into_mcp());
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -156,6 +179,12 @@ pub struct LsArgs {
     pub host: Option<String>,
     /// Remote directory path. `~` not expanded server-side; use absolute paths.
     pub path: String,
+    /// Max entries returned. Default 1000 (also the hard cap).
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// Skip the first N entries (alphabetical). Use with `limit` to paginate.
+    #[serde(default)]
+    pub offset: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -170,6 +199,39 @@ pub struct WriteArgs {
     /// Octal mode at create time (e.g. 420 = 0o644). Default 0o644.
     #[serde(default)]
     pub mode: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MkdirArgs {
+    /// Host alias. Omit if a default_host is configured.
+    #[serde(default)]
+    pub host: Option<String>,
+    /// Remote directory path.
+    pub path: String,
+    /// If true, create intermediate parents (`mkdir -p`). Default false.
+    #[serde(default)]
+    pub parents: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RmArgs {
+    /// Host alias. Omit if a default_host is configured.
+    #[serde(default)]
+    pub host: Option<String>,
+    /// Remote path (file or directory).
+    pub path: String,
+    /// If true, recursively delete a directory and its contents. Default false.
+    #[serde(default)]
+    pub recursive: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct StatArgs {
+    /// Host alias. Omit if a default_host is configured.
+    #[serde(default)]
+    pub host: Option<String>,
+    /// Remote path.
+    pub path: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -272,8 +334,10 @@ impl SshServer {
         Parameters(args): Parameters<ExecArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        validate_cmd(&args.cmd)?;
         let timeout = clamp_timeout(args.timeout);
         let host_name = self.resolve_host(args.host)?;
+        let password = args.password.map(zeroize::Zeroizing::new);
 
         if let Err(e) = self.run_guards(&host_name, &args.cmd, args.confirm.unwrap_or(false), &ctx).await {
             let err_msg = e.to_string();
@@ -282,10 +346,10 @@ impl SshServer {
         }
         let session = self
             .pool
-            .get_or_connect(&host_name, args.password.clone())
+            .get_or_connect(&host_name, password.clone())
             .await
             .map_err(|e| { self.audit.write(&host_name, "exec", Some(&args.cmd), None, None, None, None, None, Some(e.to_string())); e.into_mcp() })?;
-        if let Some(pw) = args.password {
+        if let Some(pw) = password {
             self.pool.cache_password(&host_name, pw);
         }
 
@@ -317,10 +381,25 @@ impl SshServer {
         Parameters(args): Parameters<ExecBatchArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        if args.cmds.is_empty() {
+            return Err(SshError::Config("cmds must contain at least one command".into()).into_mcp());
+        }
+        if args.cmds.len() > MAX_BATCH_CMDS {
+            return Err(SshError::Config(format!(
+                "too many commands: {} (max {})",
+                args.cmds.len(),
+                MAX_BATCH_CMDS
+            ))
+            .into_mcp());
+        }
+        for cmd in &args.cmds {
+            validate_cmd(cmd)?;
+        }
         let timeout = clamp_timeout(args.timeout);
         let host_name = self.resolve_host(args.host)?;
         let bypass = args.confirm.unwrap_or(false);
         let verbose = args.verbose.unwrap_or(false);
+        let password = args.password.map(zeroize::Zeroizing::new);
 
         for cmd in &args.cmds {
             if let Err(e) = self.run_guards(&host_name, cmd, bypass, &ctx).await {
@@ -332,31 +411,37 @@ impl SshServer {
 
         let session = self
             .pool
-            .get_or_connect(&host_name, args.password.clone())
+            .get_or_connect(&host_name, password.clone())
             .await
             .map_err(|e| e.into_mcp())?;
-        if let Some(pw) = args.password {
+        if let Some(pw) = password {
             self.pool.cache_password(&host_name, pw);
         }
 
         let max_capture = self.cfg.defaults.max_capture_bytes;
         // JoinSet aborts in-flight tasks when dropped, so a request cancelled
         // by the client doesn't leave commands running on the remote host.
+        // Track cmd-by-task-id so a panicked task still gets audited against
+        // the right command.
         let mut set = tokio::task::JoinSet::new();
+        let mut by_id: std::collections::HashMap<tokio::task::Id, String> =
+            std::collections::HashMap::with_capacity(args.cmds.len());
         for cmd in args.cmds.into_iter() {
             let s = Arc::clone(&session);
-            set.spawn(async move {
-                let r = exec::exec(&s, &cmd, timeout, max_capture).await;
-                (cmd, r)
+            let cmd_for_task = cmd.clone();
+            let abort = set.spawn(async move {
+                exec::exec(&s, &cmd_for_task, timeout, max_capture).await
             });
+            by_id.insert(abort.id(), cmd);
         }
 
         let mut t = Toon::new();
         t.field("host", &host_name);
         let mut rows: Vec<Vec<String>> = Vec::new();
-        while let Some(joined) = set.join_next().await {
+        while let Some(joined) = set.join_next_with_id().await {
             match joined {
-                Ok((cmd, Ok(r))) => {
+                Ok((id, Ok(r))) => {
+                    let cmd = by_id.remove(&id).unwrap_or_default();
                     let preview = batch_preview(&r, verbose);
                     self.audit.write(&host_name, "exec_batch", Some(&cmd), Some(r.exit_code), Some(r.duration_ms), None, Some(r.stdout_bytes), None, None);
                     rows.push(vec![
@@ -367,15 +452,18 @@ impl SshServer {
                         preview,
                     ]);
                 }
-                Ok((cmd, Err(e))) => {
+                Ok((id, Err(e))) => {
+                    let cmd = by_id.remove(&id).unwrap_or_default();
                     let err_msg = e.to_string();
                     self.audit.write(&host_name, "exec_batch", Some(&cmd), None, None, None, None, None, Some(err_msg.clone()));
                     rows.push(vec![cmd, "-1".into(), "0".into(), "0".into(), err_msg]);
                 }
                 Err(e) => {
+                    let id = e.id();
+                    let cmd = by_id.remove(&id).unwrap_or_else(|| "-".into());
                     let err_msg = e.to_string();
-                    self.audit.write(&host_name, "exec_batch", None, None, None, None, None, None, Some(err_msg.clone()));
-                    rows.push(vec!["-".into(), "-1".into(), "0".into(), "0".into(), err_msg]);
+                    self.audit.write(&host_name, "exec_batch", Some(&cmd), None, None, None, None, None, Some(err_msg.clone()));
+                    rows.push(vec![cmd, "-1".into(), "0".into(), "0".into(), err_msg]);
                 }
             }
         }
@@ -392,8 +480,10 @@ impl SshServer {
         Parameters(args): Parameters<ShArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        validate_cmd(&args.cmd)?;
         let timeout = clamp_timeout(args.timeout);
         let host_name = self.resolve_host(args.host)?;
+        let password = args.password.map(zeroize::Zeroizing::new);
 
         if let Err(e) = self.run_guards(&host_name, &args.cmd, args.confirm.unwrap_or(false), &ctx).await {
             let err_msg = e.to_string();
@@ -403,10 +493,10 @@ impl SshServer {
 
         let session = self
             .pool
-            .get_or_connect(&host_name, args.password.clone())
+            .get_or_connect(&host_name, password.clone())
             .await
             .map_err(|e| e.into_mcp())?;
-        if let Some(pw) = args.password {
+        if let Some(pw) = password {
             self.pool.cache_password(&host_name, pw);
         }
 
@@ -443,8 +533,8 @@ impl SshServer {
         &self,
         Parameters(args): Parameters<OptHostArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let (targets, password): (Vec<String>, Option<String>) = match args.host {
-            Some(h) => (vec![h], args.password),
+        let (targets, password): (Vec<String>, Option<zeroize::Zeroizing<String>>) = match args.host {
+            Some(h) => (vec![h], args.password.map(zeroize::Zeroizing::new)),
             None => (self.cfg.host_names(), None),
         };
         let mut handles = Vec::new();
@@ -508,6 +598,33 @@ impl SshServer {
         self.audit.write(&host_name, "disconnect", None, None, None, None, None, None, None);
         let mut t = Toon::new();
         t.field("host", &host_name).field("status", "closed");
+        Ok(text(t.into_string()))
+    }
+
+    #[tool(
+        description = "Close all live SSH sessions. Reopens on next call. Use to free server slots or after credential changes.",
+        annotations(title = "DisconnectAll", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn disconnect_all(&self) -> Result<CallToolResult, McpError> {
+        let names = self.pool.list_active();
+        let mut closed = 0u64;
+        for name in &names {
+            if let Some(sess) = self.pool.take_session(name) {
+                let _ = sess
+                    .handle
+                    .disconnect(russh::Disconnect::ByApplication, "user requested", "")
+                    .await;
+                self.pool.forget_password(name);
+                closed += 1;
+            }
+        }
+        self.audit.write("*", "disconnect_all", None, None, None, None, None, None, None);
+        let mut t = Toon::new();
+        t.field("closed", closed);
+        if !names.is_empty() {
+            let joined = names.join(",");
+            t.field("hosts", joined);
+        }
         Ok(text(t.into_string()))
     }
 
@@ -586,6 +703,10 @@ impl SshServer {
         Parameters(args): Parameters<DownloadArgs>,
     ) -> Result<CallToolResult, McpError> {
         let host_name = self.resolve_host(args.host)?;
+        if let Err(e) = self.guards.for_host(&host_name).check_sftp_read(&args.remote) {
+            self.audit.write(&host_name, "dn", Some(&args.remote), None, None, None, None, Some(&e.to_string()), Some(e.to_string()));
+            return Err(e.into_mcp());
+        }
         let session = self
             .pool
             .get_or_connect(&host_name, None)
@@ -630,14 +751,26 @@ impl SshServer {
         Parameters(args): Parameters<LsArgs>,
     ) -> Result<CallToolResult, McpError> {
         let host_name = self.resolve_host(args.host)?;
+        if let Err(e) = self.guards.for_host(&host_name).check_sftp_read(&args.path) {
+            self.audit.write(&host_name, "ls", Some(&args.path), None, None, None, None, Some(&e.to_string()), Some(e.to_string()));
+            return Err(e.into_mcp());
+        }
         let session = self
             .pool
             .get_or_connect(&host_name, None)
             .await
             .map_err(|e| e.into_mcp())?;
-        let entries = sftp::list_dir(&session, &args.path).await.map_err(|e| e.into_mcp())?;
+        let mut entries = sftp::list_dir(&session, &args.path).await.map_err(|e| e.into_mcp())?;
+        let total = entries.len();
+        let offset = args.offset.unwrap_or(0) as usize;
+        let limit = args.limit.map(|n| n as usize).unwrap_or(MAX_LS_ENTRIES).min(MAX_LS_ENTRIES);
+        let page: Vec<sftp::ListEntry> = if offset >= entries.len() {
+            Vec::new()
+        } else {
+            entries.drain(offset..).take(limit).collect()
+        };
         self.audit.write(&host_name, "ls", Some(&args.path), None, None, None, None, None, None);
-        let rows: Vec<Vec<String>> = entries
+        let rows: Vec<Vec<String>> = page
             .iter()
             .map(|e| vec![
                 e.name.clone(),
@@ -649,6 +782,13 @@ impl SshServer {
             .collect();
         let mut t = Toon::new();
         t.field("host", &host_name).field("path", &args.path);
+        t.field("total", total).field("offset", offset).field("returned", page.len());
+        if offset + page.len() < total {
+            t.hint(&format!(
+                "more entries; re-run with offset={}",
+                offset + page.len()
+            ));
+        }
         t.table_strs("entries", &["name", "kind", "size", "mode", "mtime"], &rows);
         Ok(text(t.into_string()))
     }
@@ -662,6 +802,14 @@ impl SshServer {
         Parameters(args): Parameters<WriteArgs>,
     ) -> Result<CallToolResult, McpError> {
         let host_name = self.resolve_host(args.host)?;
+        if args.content.len() > MAX_WRITE_INLINE_BYTES {
+            return Err(SshError::Config(format!(
+                "content too large: {} bytes (max {} — use `up` for larger files)",
+                args.content.len(),
+                MAX_WRITE_INLINE_BYTES
+            ))
+            .into_mcp());
+        }
         if let Err(e) = self.guards.for_host(&host_name).check_sftp_write(&args.remote) {
             self.audit.write(&host_name, "wr", Some(&args.remote), None, None, None, None, Some(&e.to_string()), Some(e.to_string()));
             return Err(e.into_mcp());
@@ -681,6 +829,112 @@ impl SshServer {
         if let Some(m) = args.mode {
             t.field("mode", format!("{m:o}"));
         }
+        Ok(text(t.into_string()))
+    }
+
+    #[tool(
+        description = "SFTP create directory. parents=true acts like `mkdir -p`. Use instead of `exec mkdir` to save a shell round-trip.",
+        annotations(title = "Mkdir", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = true)
+    )]
+    async fn mkdir(
+        &self,
+        Parameters(args): Parameters<MkdirArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let host_name = self.resolve_host(args.host)?;
+        if let Err(e) = self.guards.for_host(&host_name).check_sftp_write(&args.path) {
+            self.audit.write(&host_name, "mkdir", Some(&args.path), None, None, None, None, Some(&e.to_string()), Some(e.to_string()));
+            return Err(e.into_mcp());
+        }
+        let session = self
+            .pool
+            .get_or_connect(&host_name, None)
+            .await
+            .map_err(|e| e.into_mcp())?;
+        sftp::mkdir(&session, &args.path, args.parents.unwrap_or(false))
+            .await
+            .map_err(|e| e.into_mcp())?;
+        self.audit.write(&host_name, "mkdir", Some(&args.path), None, None, None, None, None, None);
+        let mut t = Toon::new();
+        t.field("host", &host_name).field("path", &args.path).field("status", "created");
+        Ok(text(t.into_string()))
+    }
+
+    #[tool(
+        description = "SFTP remove file. recursive=true for directories. Refuses sensitive system paths. Not for symlink targets — use exec.",
+        annotations(title = "Rm", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true)
+    )]
+    async fn rm(
+        &self,
+        Parameters(args): Parameters<RmArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let host_name = self.resolve_host(args.host)?;
+        if let Err(e) = self.guards.for_host(&host_name).check_sftp_write(&args.path) {
+            self.audit.write(&host_name, "rm", Some(&args.path), None, None, None, None, Some(&e.to_string()), Some(e.to_string()));
+            return Err(e.into_mcp());
+        }
+        let recursive = args.recursive.unwrap_or(false);
+        if recursive {
+            // Recursive delete is one of the highest-blast-radius operations
+            // this server exposes; always elicit before proceeding.
+            let prompt = format!(
+                "fast-mcp-ssh wants to recursively delete '{}' on host '{host_name}'. Reply 'yes' to proceed.",
+                args.path
+            );
+            match elicit_confirmation(&ctx, &prompt).await {
+                Ok(true) => {}
+                Ok(false) => return Err(SshError::ConfirmationDenied.into_mcp()),
+                Err(e) => {
+                    tracing::warn!(?e, "rm recursive elicit failed; deny");
+                    return Err(SshError::ConfirmationDenied.into_mcp());
+                }
+            }
+        }
+        let session = self
+            .pool
+            .get_or_connect(&host_name, None)
+            .await
+            .map_err(|e| e.into_mcp())?;
+        let removed = sftp::remove(&session, &args.path, recursive)
+            .await
+            .map_err(|e| e.into_mcp())?;
+        self.audit.write(&host_name, "rm", Some(&args.path), None, None, None, None, None, None);
+        let mut t = Toon::new();
+        t.field("host", &host_name)
+            .field("path", &args.path)
+            .field("removed", removed);
+        Ok(text(t.into_string()))
+    }
+
+    #[tool(
+        description = "SFTP stat path. Returns kind/size/mode/mtime/uid/gid. Use to check existence + metadata. Not for content — use dn.",
+        annotations(title = "Stat", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = true)
+    )]
+    async fn stat(
+        &self,
+        Parameters(args): Parameters<StatArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let host_name = self.resolve_host(args.host)?;
+        if let Err(e) = self.guards.for_host(&host_name).check_sftp_read(&args.path) {
+            self.audit.write(&host_name, "stat", Some(&args.path), None, None, None, None, Some(&e.to_string()), Some(e.to_string()));
+            return Err(e.into_mcp());
+        }
+        let session = self
+            .pool
+            .get_or_connect(&host_name, None)
+            .await
+            .map_err(|e| e.into_mcp())?;
+        let s = sftp::stat(&session, &args.path).await.map_err(|e| e.into_mcp())?;
+        self.audit.write(&host_name, "stat", Some(&args.path), None, None, None, None, None, None);
+        let mut t = Toon::new();
+        t.field("host", &host_name)
+            .field("path", &args.path)
+            .field("kind", s.kind)
+            .field("size", s.size)
+            .field("mode", format!("{:o}", s.mode & 0o7777))
+            .field("mtime", s.mtime)
+            .field("uid", s.uid as u64)
+            .field("gid", s.gid as u64);
         Ok(text(t.into_string()))
     }
 

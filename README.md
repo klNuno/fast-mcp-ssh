@@ -41,11 +41,15 @@ Optional `--config <path>`. Default is `$FAST_MCP_SSH_HOME/hosts.toml`, falling 
 | `sh`        | `host?`, `cmd`, `timeout?`, `password?`, `confirm?`, `cols?`, `rows?` | Persistent PTY shell. `cd` / `export` survive between calls. PTY size is configurable on first call per host. |
 | `disconnect`| `host?`                                                | Close the persistent session. Reopens automatically on next call. |
 | `interrupt` | `host?`                                                | Send Ctrl-C to the foreground command on the persistent PTY. Independent of in-flight `sh` (split read/write). |
+| `disconnect_all` | none                                              | Close every live session in one shot. |
 | `up`        | `host?`, `local`, `remote`                              | SFTP upload (streamed, 256 KB chunks). |
-| `dn`        | `host?`, `remote`, `local?`                             | SFTP download (streamed). With no `local`, returns content inline (text under 256 KB; binary returned base64-encoded). |
-| `ls`        | `host?`, `path`                                         | SFTP directory listing. |
-| `wr`        | `host?`, `remote`, `content`, `mode?`                   | Write a file inline. Optional octal mode applied at create time. |
-| `tail`      | `host?`, `path`, `lines?`, `follow?`, `seconds?`         | `tail -n` (default) or streamed `tail -F`. |
+| `dn`        | `host?`, `remote`, `local?`                             | SFTP download (streamed). With no `local`, returns content inline (text under 256 KB; binary returned base64-encoded). Refuses sensitive paths (shadow, ssh privkeys, cloud creds…). |
+| `ls`        | `host?`, `path`, `limit?`, `offset?`                    | SFTP directory listing. Paginated (default 1000 per page). |
+| `wr`        | `host?`, `remote`, `content`, `mode?`                   | Write a file inline. Optional octal mode applied at create time. Hard cap 8 MB; larger files via `up`. |
+| `mkdir`     | `host?`, `path`, `parents?`                             | SFTP create directory. `parents=true` for `mkdir -p`. |
+| `rm`        | `host?`, `path`, `recursive?`                           | SFTP remove file. `recursive=true` for directories — always elicits confirmation. |
+| `stat`      | `host?`, `path`                                         | SFTP stat: kind, size, mode, mtime, uid, gid. |
+| `tail`      | `host?`, `path`, `lines?`, `follow?`, `seconds?`         | `tail -n` (default) or `timeout N tail -F` (returns at end of window). |
 
 `host` is optional on every tool when `[defaults] default_host = "<alias>"` is set in `hosts.toml`.
 
