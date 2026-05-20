@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -32,6 +32,10 @@ pub enum KnownHostMatch {
 pub struct KnownHostsStore {
     path: PathBuf,
     inner: RwLock<Stored>,
+    /// Serializes flushes so two TOFU writers can't race the
+    /// `read-snapshot → write tmp → rename` sequence and produce a
+    /// truncated file or interleaved renames.
+    flush_lock: Mutex<()>,
 }
 
 impl KnownHostsStore {
@@ -39,13 +43,22 @@ impl KnownHostsStore {
         let path = config_dir().join("known_hosts.toml");
         let stored: Stored = if path.exists() {
             let raw = std::fs::read_to_string(&path)?;
-            toml::from_str(&raw).unwrap_or_default()
+            // Refuse to start on a corrupted file rather than silently
+            // dropping pinned fingerprints — re-pinning under TOFU on the
+            // next connect would accept any MITM.
+            toml::from_str(&raw).map_err(|e| {
+                SshError::Config(format!(
+                    "{}: parse failed ({e}). Move the file aside if you intend to reset.",
+                    path.display()
+                ))
+            })?
         } else {
             Stored::default()
         };
         Ok(std::sync::Arc::new(Self {
             path,
             inner: RwLock::new(stored),
+            flush_lock: Mutex::new(()),
         }))
     }
 
@@ -77,16 +90,32 @@ impl KnownHostsStore {
     }
 
     fn flush(&self) -> Result<()> {
-        let guard = self
-            .inner
-            .read()
-            .map_err(|_| SshError::Other("known_hosts lock poisoned".into()))?;
-        let serialized = toml::to_string_pretty(&*guard)
-            .map_err(|e| SshError::Config(format!("serialize known_hosts: {e}")))?;
+        let _flush_guard = self
+            .flush_lock
+            .lock()
+            .map_err(|_| SshError::Other("known_hosts flush_lock poisoned".into()))?;
+        let serialized = {
+            let guard = self
+                .inner
+                .read()
+                .map_err(|_| SshError::Other("known_hosts lock poisoned".into()))?;
+            toml::to_string_pretty(&*guard)
+                .map_err(|e| SshError::Config(format!("serialize known_hosts: {e}")))?
+        };
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&self.path, serialized)?;
+        // Atomic write: tmp + rename. A crash mid-write leaves either the old
+        // file or the tmp file (which we ignore on next start), never a
+        // truncated TOML.
+        let tmp = self.path.with_extension("toml.tmp");
+        std::fs::write(&tmp, serialized)?;
+        std::fs::rename(&tmp, &self.path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
+        }
         Ok(())
     }
 }

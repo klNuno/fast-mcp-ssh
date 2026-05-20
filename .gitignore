@@ -1,4 +1,6 @@
 /target
+/target-bench
+/benchmark/target-bench
 **/*.rs.bk
 *.pdb
 

@@ -21,8 +21,11 @@ pub async fn tail(
 ) -> Result<TailChunk> {
     let path_q = shell_escape(path);
     let cmd = if follow {
+        // Drop the `; true` so the caller sees the real tail/timeout exit
+        // code: 0 = clean EOF, 124 = killed by timeout (expected), 1 = file
+        // not found / unreadable. `2>/dev/null` keeps stderr quiet.
         format!(
-            "timeout {sec} tail -n {lines} -F {path_q} 2>/dev/null; true",
+            "timeout {sec} tail -n {lines} -F {path_q} 2>/dev/null",
             sec = max_wait.as_secs().max(1)
         )
     } else {

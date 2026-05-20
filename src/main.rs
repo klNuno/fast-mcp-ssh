@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
+use mimalloc::MiMalloc;
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -23,6 +24,9 @@ use crate::guards::GuardCache;
 use crate::server::SshServer;
 use crate::session::SessionPool;
 
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 #[derive(clap::Parser, Debug)]
 #[command(name = "fast-mcp-ssh", version, about = "Fast MCP SSH server")]
 struct Cli {
@@ -31,8 +35,14 @@ struct Cli {
     config: Option<PathBuf>,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
@@ -62,11 +72,22 @@ async fn main() -> anyhow::Result<()> {
     let pool = SessionPool::new(cfg.clone())?;
     let guards = Arc::new(GuardCache::build(&cfg)?);
 
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+
     let pool_for_evict = pool.clone();
-    tokio::spawn(async move {
+    let mut evict_rx = shutdown_rx.clone();
+    let evict_handle = tokio::spawn(async move {
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            pool_for_evict.evict_idle().await;
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    pool_for_evict.evict_idle().await;
+                }
+                res = evict_rx.changed() => {
+                    if res.is_err() || *evict_rx.borrow() {
+                        break;
+                    }
+                }
+            }
         }
     });
 
@@ -76,8 +97,16 @@ async fn main() -> anyhow::Result<()> {
         "fast-mcp-ssh starting"
     );
 
-    let server = SshServer::new(cfg.clone(), pool, audit, guards);
+    let server = SshServer::new(cfg.clone(), pool, audit.clone(), guards);
     let service = server.serve(stdio()).await?;
-    service.waiting().await?;
+    let serve_result = service.waiting().await;
+
+    // Graceful shutdown: stop background tasks, drain audit log to disk.
+    let _ = shutdown_tx.send(true);
+    let _ = shutdown_rx.changed().await;
+    let _ = evict_handle.await;
+    audit.shutdown().await;
+
+    serve_result?;
     Ok(())
 }

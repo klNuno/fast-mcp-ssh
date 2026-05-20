@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
-use regex::Regex;
+use regex::{Regex, RegexSet};
 
 use crate::config::{Config, Guards, NamedPattern, default_confirm_patterns, default_deny_patterns};
 use crate::errors::{Result, SshError};
@@ -12,10 +13,46 @@ pub struct CompiledPattern {
     pub re: Regex,
 }
 
+/// Vector of named patterns + a `RegexSet` over the same patterns.
+/// `RegexSet::is_match` is a single DFA pass, ~O(n) instead of looping
+/// `Regex::is_match` per pattern. We only fall back to the per-pattern Regex
+/// (to identify which one fired) after the set has confirmed at least one
+/// match.
+#[derive(Debug, Clone)]
+pub struct PatternBank {
+    patterns: Vec<CompiledPattern>,
+    set: RegexSet,
+}
+
+impl PatternBank {
+    fn new(patterns: Vec<CompiledPattern>) -> Result<Self> {
+        let set = RegexSet::new(patterns.iter().map(|p| p.re.as_str())).map_err(|e| {
+            SshError::Config(format!("regex set compile failed: {e}"))
+        })?;
+        Ok(Self { patterns, set })
+    }
+
+    fn is_match(&self, cmd: &str) -> bool {
+        !self.patterns.is_empty() && self.set.is_match(cmd)
+    }
+
+    fn matched(&self, cmd: &str) -> Option<&CompiledPattern> {
+        if self.patterns.is_empty() {
+            return None;
+        }
+        let m = self.set.matches(cmd);
+        if !m.matched_any() {
+            return None;
+        }
+        let first = m.iter().next()?;
+        self.patterns.get(first)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CompiledGuards {
-    pub deny: Vec<CompiledPattern>,
-    pub confirm: Vec<CompiledPattern>,
+    pub deny: PatternBank,
+    pub confirm: PatternBank,
     pub read_only: bool,
 }
 
@@ -56,12 +93,16 @@ impl CompiledGuards {
         for p in &g.confirm {
             confirm.push(compile_one(p)?);
         }
-        Ok(Self { deny, confirm, read_only: g.read_only })
+        Ok(Self {
+            deny: PatternBank::new(deny)?,
+            confirm: PatternBank::new(confirm)?,
+            read_only: g.read_only,
+        })
     }
 
     pub fn check(&self, cmd: &str) -> GuardCheck {
-        for p in &self.deny {
-            if p.re.is_match(cmd) {
+        if self.deny.is_match(cmd) {
+            if let Some(p) = self.deny.matched(cmd) {
                 return GuardCheck::Deny {
                     pattern_name: p.name.clone(),
                     pattern: p.re.as_str().to_string(),
@@ -74,13 +115,58 @@ impl CompiledGuards {
                 pattern: "host marked read_only".into(),
             };
         }
-        for p in &self.confirm {
-            if p.re.is_match(cmd) {
+        if self.confirm.is_match(cmd) {
+            if let Some(p) = self.confirm.matched(cmd) {
                 return GuardCheck::Confirm { pattern_name: p.name.clone() };
             }
         }
         GuardCheck::Allow
     }
+
+    /// Guard for SFTP write paths (`wr` / `up`). Refuses on read_only hosts and
+    /// on a small set of sensitive paths (authorized_keys, sudoers, cron, shadow,
+    /// passwd, systemd units). Path is matched server-side as the AI sees it.
+    pub fn check_sftp_write(&self, remote_path: &str) -> Result<()> {
+        if self.read_only {
+            return Err(SshError::BlockedByGuard {
+                name: "read-only".into(),
+                pattern: "host marked read_only".into(),
+            });
+        }
+        if sensitive_write_path_re().is_match(remote_path) {
+            return Err(SshError::BlockedByGuard {
+                name: "sensitive-path".into(),
+                pattern: "write to sensitive system path blocked".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn sensitive_write_path_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?ix)
+            (?:^|/)
+            (?:
+                \.ssh/(?:authorized_keys|known_hosts|id_[a-z0-9]+)
+              | sudoers
+              | shadow | gshadow | passwd | group
+              | crontab
+            )
+            $
+            |
+            (?:^|/)
+            (?:
+                etc/(?:sudoers\.d|cron\.(?:d|hourly|daily|weekly|monthly)|init\.d|systemd/system|pam\.d|ssh)/.*
+              | etc/(?:fstab|hosts|resolv\.conf|nsswitch\.conf|environment)
+              | boot/.*
+            )
+            $"#,
+        )
+        .expect("sensitive_write_path_re valid")
+    })
 }
 
 /// Pre-compiled guard cache keyed by host name. The `default` slot holds
@@ -118,21 +204,182 @@ fn compile_one(p: &NamedPattern) -> Result<CompiledPattern> {
     Ok(CompiledPattern { name: p.name.clone(), re })
 }
 
-const WRITE_HEURISTICS: &[&str] = &[
-    " > ", " >> ", "| tee ", "rm ", "mv ", "cp ", "mkdir ", "rmdir ",
-    "chmod ", "chown ", "ln ", "touch ", "dd ", "mkfs", "shred ",
-    "systemctl restart", "systemctl stop", "systemctl start", "systemctl enable",
-    "systemctl disable", "reboot", "shutdown", "halt", "poweroff",
-    "docker run", "docker rm", "docker stop", "docker start", "docker restart",
-    "docker compose up", "docker compose down", "docker compose restart",
-    "apt install", "apt upgrade", "apt remove", "apt purge",
-    "yum install", "dnf install", "pacman -S", "pip install",
-    "npm install", "git push", "git reset", "git checkout",
+/// Commands that always write/mutate filesystem state. Matched on the first
+/// token of each pipeline segment, case-insensitive. Read-only mode blocks
+/// any segment whose first token is in this set.
+const ALWAYS_WRITE: &[&str] = &[
+    "rm", "mv", "cp", "mkdir", "rmdir", "chmod", "chown", "ln", "touch",
+    "dd", "mkfs", "shred", "fallocate", "truncate", "tee", "sponge",
+    "reboot", "shutdown", "halt", "poweroff",
 ];
 
+/// Commands whose write nature depends on the second token. Matched as
+/// `(first, second)` after lowercasing.
+const SUBCOMMAND_WRITE: &[(&str, &str)] = &[
+    ("systemctl", "restart"), ("systemctl", "stop"), ("systemctl", "start"),
+    ("systemctl", "enable"), ("systemctl", "disable"), ("systemctl", "mask"),
+    ("systemctl", "unmask"), ("systemctl", "reload"),
+    ("service", "restart"), ("service", "stop"), ("service", "start"),
+    ("docker", "run"), ("docker", "rm"), ("docker", "rmi"),
+    ("docker", "stop"), ("docker", "start"), ("docker", "restart"),
+    ("docker", "kill"), ("docker", "exec"), ("docker", "compose"),
+    ("docker", "build"), ("docker", "pull"), ("docker", "push"),
+    ("apt", "install"), ("apt", "upgrade"), ("apt", "remove"), ("apt", "purge"),
+    ("apt", "autoremove"),
+    ("apt-get", "install"), ("apt-get", "upgrade"), ("apt-get", "remove"),
+    ("apt-get", "purge"),
+    ("yum", "install"), ("yum", "remove"), ("yum", "update"),
+    ("dnf", "install"), ("dnf", "remove"), ("dnf", "update"),
+    ("pacman", "-S"), ("pacman", "-R"), ("pacman", "-U"), ("pacman", "-Syu"),
+    ("pip", "install"), ("pip", "uninstall"),
+    ("pip3", "install"), ("pip3", "uninstall"),
+    ("npm", "install"), ("npm", "i"), ("npm", "uninstall"),
+    ("yarn", "add"), ("yarn", "remove"),
+    ("pnpm", "add"), ("pnpm", "remove"),
+    ("git", "push"), ("git", "reset"), ("git", "checkout"),
+    ("git", "rebase"), ("git", "merge"), ("git", "pull"),
+    ("git", "commit"), ("git", "clean"),
+];
+
+/// Tokenized read-only check. Splits `cmd` into pipeline segments
+/// (`| && || ; \n`), respects single/double quotes, and detects:
+/// 1. any redirection operator (`>`, `>>`, `<<`, `<`) outside quotes,
+/// 2. any segment whose first token is in `ALWAYS_WRITE`,
+/// 3. any segment whose first two tokens match `SUBCOMMAND_WRITE`.
+///
+/// Replaces the previous substring scan that bypassed on `cmd>file`
+/// (no spaces) and false-positived on `echo 'rm '`.
 fn looks_writeful(cmd: &str) -> bool {
-    let lc = cmd.to_lowercase();
-    WRITE_HEURISTICS.iter().any(|h| lc.contains(h))
+    let segs = parse_segments(cmd);
+    for seg in segs {
+        if seg.has_redirect {
+            return true;
+        }
+        let Some(first) = &seg.first else { continue };
+        let lc1 = first.to_ascii_lowercase();
+        if ALWAYS_WRITE.contains(&lc1.as_str()) {
+            return true;
+        }
+        if let Some(second) = &seg.second {
+            let lc2 = second.to_ascii_lowercase();
+            if SUBCOMMAND_WRITE
+                .iter()
+                .any(|(c, sub)| *c == lc1 && *sub == lc2)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[derive(Default, Debug)]
+struct Segment {
+    first: Option<String>,
+    second: Option<String>,
+    has_redirect: bool,
+}
+
+/// Walk `cmd` once, splitting on top-level `|`, `||`, `&&`, `;`, `\n`.
+/// Tracks single/double quote state. Records the first two whitespace-separated
+/// tokens of each segment plus whether any redirect operator appears.
+fn parse_segments(cmd: &str) -> Vec<Segment> {
+    let mut out = Vec::new();
+    let mut cur = Segment::default();
+    let mut buf = String::new();
+    let mut tokens_seen = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut iter = cmd.chars().peekable();
+
+    let push_token = |buf: &mut String, cur: &mut Segment, tokens_seen: &mut usize| {
+        if buf.is_empty() {
+            return;
+        }
+        match *tokens_seen {
+            0 => cur.first = Some(std::mem::take(buf)),
+            1 => cur.second = Some(std::mem::take(buf)),
+            _ => buf.clear(),
+        }
+        *tokens_seen += 1;
+    };
+    let push_segment = |out: &mut Vec<Segment>, cur: &mut Segment, buf: &mut String, tokens_seen: &mut usize| {
+        push_token(buf, cur, tokens_seen);
+        out.push(std::mem::take(cur));
+        *tokens_seen = 0;
+    };
+
+    while let Some(c) = iter.next() {
+        if in_single {
+            if c == '\'' {
+                in_single = false;
+            } else {
+                buf.push(c);
+            }
+            continue;
+        }
+        if in_double {
+            if c == '"' {
+                in_double = false;
+            } else if c == '\\' {
+                if let Some(&next) = iter.peek() {
+                    if matches!(next, '"' | '\\' | '$' | '`' | '\n') {
+                        buf.push(iter.next().unwrap());
+                        continue;
+                    }
+                }
+                buf.push(c);
+            } else {
+                buf.push(c);
+            }
+            continue;
+        }
+
+        match c {
+            '\'' => in_single = true,
+            '"' => in_double = true,
+            '\\' => {
+                if let Some(next) = iter.next() {
+                    buf.push(next);
+                }
+            }
+            '|' => {
+                push_segment(&mut out, &mut cur, &mut buf, &mut tokens_seen);
+                if matches!(iter.peek(), Some('|')) {
+                    iter.next();
+                }
+            }
+            '&' => {
+                if matches!(iter.peek(), Some('&')) {
+                    iter.next();
+                    push_segment(&mut out, &mut cur, &mut buf, &mut tokens_seen);
+                }
+                // standalone `&` (background) — treat as segment break
+                else {
+                    push_segment(&mut out, &mut cur, &mut buf, &mut tokens_seen);
+                }
+            }
+            ';' | '\n' => {
+                push_segment(&mut out, &mut cur, &mut buf, &mut tokens_seen);
+            }
+            '>' | '<' => {
+                cur.has_redirect = true;
+                push_token(&mut buf, &mut cur, &mut tokens_seen);
+                // skip combined `>>`, `<<`, `>&`
+                if matches!(iter.peek(), Some('>') | Some('<') | Some('&')) {
+                    iter.next();
+                }
+            }
+            c if c.is_whitespace() => {
+                push_token(&mut buf, &mut cur, &mut tokens_seen);
+            }
+            _ => {
+                buf.push(c);
+            }
+        }
+    }
+    push_segment(&mut out, &mut cur, &mut buf, &mut tokens_seen);
+    out
 }
 
 #[cfg(test)]
@@ -145,6 +392,27 @@ mod tests {
         assert!(matches!(g.check("rm -rf /"), GuardCheck::Deny { .. }));
         assert!(matches!(g.check("rm -rf /usr"), GuardCheck::Deny { .. }));
         assert!(matches!(g.check("rm -rf ./tmp"), GuardCheck::Allow));
+    }
+
+    #[test]
+    fn deny_rm_rf_root_bypass_attempts() {
+        let g = CompiledGuards::compile(&Guards::default()).unwrap();
+        for cmd in [
+            "rm -rf '/'",
+            "rm -rf \"/\"",
+            "rm -rf //",
+            "rm -rf /*",
+            "rm -rf -- /",
+            "RM -rf /",
+            "rm --recursive --force /",
+            "rm -fr /",
+            "rm -Rf /",
+        ] {
+            assert!(matches!(g.check(cmd), GuardCheck::Deny { .. }), "should deny: {cmd:?}");
+        }
+        for cmd in ["rm ./tmp", "rm -rf ~/tmp", "rm foo/bar", "ls /"] {
+            assert!(!matches!(g.check(cmd), GuardCheck::Deny { .. }), "should allow: {cmd:?}");
+        }
     }
 
     #[test]
@@ -162,6 +430,43 @@ mod tests {
         let g = CompiledGuards::compile(&gc).unwrap();
         assert!(matches!(g.check("rm /tmp/foo"), GuardCheck::Deny { .. }));
         assert!(matches!(g.check("ls /tmp"), GuardCheck::Allow));
+    }
+
+    #[test]
+    fn read_only_no_substring_false_positives() {
+        // The previous `lc.contains("rm ")` substring check tripped on quoted echos.
+        // Tokenization should accept these on a read_only host.
+        let gc = Guards { read_only: true, ..Default::default() };
+        let g = CompiledGuards::compile(&gc).unwrap();
+        for cmd in [
+            "echo 'rm '",
+            "echo \"rm test\"",
+            "grep 'mv foo' /var/log/syslog",
+            "ls -la 'has > sign'",
+            "cat /tmp/firmware.bin",
+        ] {
+            assert!(!matches!(g.check(cmd), GuardCheck::Deny { .. }), "should allow: {cmd:?}");
+        }
+    }
+
+    #[test]
+    fn read_only_blocks_no_space_redirects() {
+        // `cmd>file` (no spaces) bypassed the old substring check.
+        let gc = Guards { read_only: true, ..Default::default() };
+        let g = CompiledGuards::compile(&gc).unwrap();
+        for cmd in ["echo hi>file", "echo hi >file", "echo hi> file", "tail -f log >> out"] {
+            assert!(matches!(g.check(cmd), GuardCheck::Deny { .. }), "should deny: {cmd:?}");
+        }
+    }
+
+    #[test]
+    fn read_only_pipeline_segments() {
+        let gc = Guards { read_only: true, ..Default::default() };
+        let g = CompiledGuards::compile(&gc).unwrap();
+        // Read in first segment, write in second — still writes overall.
+        assert!(matches!(g.check("ls /tmp | tee out"), GuardCheck::Deny { .. }));
+        // All-read pipeline.
+        assert!(!matches!(g.check("cat /etc/hostname | head -c 16"), GuardCheck::Deny { .. }));
     }
 
     #[test]

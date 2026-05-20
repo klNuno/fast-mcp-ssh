@@ -26,25 +26,39 @@ pub async fn upload(session: &Session, local: &Path, remote: &str) -> Result<Sft
     let start = Instant::now();
     let sftp = session.sftp().await?;
     let mut local_file = tokio::fs::File::open(local).await?;
+    // Stream into `<remote>.partial` then atomically rename on success so a
+    // network blip mid-transfer can't leave a half-written file at the final
+    // path. Caller-visible failure preserves the previous file (if any).
+    let partial = format!("{remote}.partial");
     let mut remote_file = sftp
         .open_with_flags(
-            remote,
+            &partial,
             OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE,
         )
         .await
         .map_err(SshError::from)?;
     let mut buf = vec![0u8; TRANSFER_CHUNK];
     let mut total = 0usize;
-    loop {
-        let n = local_file.read(&mut buf).await?;
-        if n == 0 {
-            break;
+    let copy_result: Result<()> = async {
+        loop {
+            let n = local_file.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            remote_file.write_all(&buf[..n]).await?;
+            total += n;
         }
-        remote_file.write_all(&buf[..n]).await?;
-        total += n;
+        remote_file.shutdown().await?;
+        Ok(())
     }
-    remote_file.shutdown().await?;
+    .await;
     drop(remote_file);
+    if let Err(e) = copy_result {
+        // Best-effort cleanup; ignore errors.
+        let _ = sftp.remove_file(&partial).await;
+        return Err(e);
+    }
+    sftp.rename(&partial, remote).await.map_err(SshError::from)?;
     session.touch();
     Ok(SftpResult { bytes: total, duration_ms: start.elapsed().as_millis() })
 }
@@ -149,7 +163,9 @@ pub async fn list_dir(session: &Session, path: &str) -> Result<Vec<ListEntry>> {
             kind,
             size: attrs.size.unwrap_or(0),
             mode: attrs.permissions.unwrap_or(0),
-            mtime: attrs.mtime.unwrap_or(0) as u64,
+            // mtime is `Option<u32>` upstream (seconds since epoch). Avoid
+            // sign-loss surprises by going through `From` rather than `as`.
+            mtime: u64::from(attrs.mtime.unwrap_or(0)),
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));

@@ -24,7 +24,15 @@ use crate::sftp;
 use crate::tail;
 
 const DEFAULT_TIMEOUT: u64 = 60;
+/// Hard cap on per-call timeouts. Prevents an AI-supplied `timeout=u64::MAX`
+/// from holding a channel slot indefinitely.
+const MAX_TIMEOUT_SECS: u64 = 600;
+const MAX_FOLLOW_SECS: u64 = 600;
 const INLINE_MAX_BYTES: usize = 256 * 1024;
+
+fn clamp_timeout(t: Option<u64>) -> Duration {
+    Duration::from_secs(t.unwrap_or(DEFAULT_TIMEOUT).clamp(1, MAX_TIMEOUT_SECS))
+}
 
 #[derive(Clone)]
 pub struct SshServer {
@@ -36,113 +44,148 @@ pub struct SshServer {
     tool_router: ToolRouter<SshServer>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+// Intentionally no `Debug` derive: the `password` field would otherwise leak
+// in clear text if anyone added `tracing::debug!(?args)` later.
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct ExecArgs {
     /// Host alias. Omit if a default_host is configured.
     #[serde(default)]
     pub host: Option<String>,
     /// Command for the remote login shell. Pipes/redirects supported.
     pub cmd: String,
+    /// Per-call timeout. Default 60s. Format: "30s", "5m", "2h", "500ms" or seconds as integer.
     #[serde(default)]
     pub timeout: Option<u64>,
+    /// Password for password-auth hosts. Cached in memory after first call.
     #[serde(default)]
     pub password: Option<String>,
-    /// Bypass confirm prompt after seeing one.
+    /// Set true to bypass a confirm-prompt guard after seeing it once.
     #[serde(default)]
     pub confirm: Option<bool>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct ExecBatchArgs {
+    /// Host alias. Omit if a default_host is configured.
     #[serde(default)]
     pub host: Option<String>,
     /// Commands run in parallel on fresh exec channels (capped by max_channels_per_host).
     pub cmds: Vec<String>,
+    /// Per-call timeout applied to each command. Default 60s.
     #[serde(default)]
     pub timeout: Option<u64>,
+    /// Password for password-auth hosts. Cached after first call.
     #[serde(default)]
     pub password: Option<String>,
+    /// Set true to bypass confirm-prompt guards.
     #[serde(default)]
     pub confirm: Option<bool>,
+    /// If true, include full preview (200 chars on errors, 40 on success). Default false: errors-only preview.
+    #[serde(default)]
+    pub verbose: Option<bool>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct ShArgs {
+    /// Host alias. Omit if a default_host is configured.
     #[serde(default)]
     pub host: Option<String>,
+    /// Command run inside the persistent PTY. cd/export/source persist across calls.
     pub cmd: String,
+    /// Per-call timeout. Default 60s.
     #[serde(default)]
     pub timeout: Option<u64>,
+    /// Password for password-auth hosts. Cached after first call.
     #[serde(default)]
     pub password: Option<String>,
+    /// Set true to bypass confirm-prompt guards.
     #[serde(default)]
     pub confirm: Option<bool>,
     /// PTY width. Default 200. Honored on first sh per host.
     #[serde(default)]
     pub cols: Option<u32>,
-    /// PTY height. Default 50.
+    /// PTY height. Default 50. Honored on first sh per host.
     #[serde(default)]
     pub rows: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct HostOnlyArgs {
+    /// Host alias. Omit if a default_host is configured.
     #[serde(default)]
     pub host: Option<String>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct OptHostArgs {
     /// Host alias. Omit to query all configured hosts.
     #[serde(default)]
     pub host: Option<String>,
+    /// Password for password-auth hosts. Cached after first successful connect. Ignored when targeting all hosts.
+    #[serde(default)]
+    pub password: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct UploadArgs {
+    /// Host alias. Omit if a default_host is configured.
     #[serde(default)]
     pub host: Option<String>,
+    /// Local source path. `~` expanded.
     pub local: String,
+    /// Remote destination path. Parent dir must exist.
     pub remote: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DownloadArgs {
+    /// Host alias. Omit if a default_host is configured.
     #[serde(default)]
     pub host: Option<String>,
+    /// Remote source path.
     pub remote: String,
-    /// Local path. Omit to receive content inline (text < 256 KB; binary base64).
+    /// Local destination path. Omit to receive content inline (text < 256 KB; binary base64).
     #[serde(default)]
     pub local: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LsArgs {
+    /// Host alias. Omit if a default_host is configured.
     #[serde(default)]
     pub host: Option<String>,
+    /// Remote directory path. `~` not expanded server-side; use absolute paths.
     pub path: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct WriteArgs {
+    /// Host alias. Omit if a default_host is configured.
     #[serde(default)]
     pub host: Option<String>,
+    /// Remote destination path. Replaces existing file.
     pub remote: String,
+    /// File content (UTF-8 text).
     pub content: String,
-    /// Octal mode (e.g. 420 = 0o644).
+    /// Octal mode at create time (e.g. 420 = 0o644). Default 0o644.
     #[serde(default)]
     pub mode: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TailArgs {
+    /// Host alias. Omit if a default_host is configured.
     #[serde(default)]
     pub host: Option<String>,
+    /// Remote file path.
     pub path: String,
+    /// Number of trailing lines to read. Default 100. Ignored when follow=true.
     #[serde(default)]
     pub lines: Option<u32>,
+    /// If true, stream new lines for `seconds`. Default false.
     #[serde(default)]
     pub follow: Option<bool>,
+    /// Stream duration in seconds when follow=true. Default 5.
     #[serde(default)]
     pub seconds: Option<u64>,
 }
@@ -174,14 +217,14 @@ impl SshServer {
 
     fn resolve_host(&self, h: Option<String>) -> Result<String, McpError> {
         h.or_else(|| self.cfg.defaults.default_host.clone())
-            .ok_or_else(|| McpError::invalid_params(
-                "host required (or set [defaults] default_host)".to_string(),
-                None,
-            ))
+            .ok_or_else(|| {
+                SshError::Config("host required (or set [defaults] default_host)".to_string())
+                    .into_mcp()
+            })
     }
 
     #[tool(
-        description = "List configured hosts with session state.",
+        description = "List configured hosts with session state. Run this first to discover targets.",
         annotations(title = "Hosts", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
     async fn hosts(&self) -> Result<CallToolResult, McpError> {
@@ -203,17 +246,17 @@ impl SshServer {
         let active = self.pool.list_active();
         let rows: Vec<Vec<String>> = names
             .iter()
-            .map(|n| {
-                let h = &self.cfg.hosts[n];
+            .filter_map(|n| {
+                let h = self.cfg.hosts.get(n)?;
                 let session = if active.contains(n) { "live" } else { "idle" };
-                vec![
+                Some(vec![
                     n.clone(),
                     h.addr.clone(),
                     h.user.clone(),
                     h.port.to_string(),
                     auth_str(h.auth).into(),
                     session.into(),
-                ]
+                ])
             })
             .collect();
         t.table_strs("hosts", &["name", "addr", "user", "port", "auth", "session"], &rows);
@@ -221,7 +264,7 @@ impl SshServer {
     }
 
     #[tool(
-        description = "Run command, stateless. Returns stdout/stderr/exit_code/duration_ms.",
+        description = "Run one-shot command, stateless. Use for independent or parallelizable commands. Not for cd/export/source — use sh.",
         annotations(title = "Exec", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true)
     )]
     async fn exec(
@@ -229,11 +272,12 @@ impl SshServer {
         Parameters(args): Parameters<ExecArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let timeout = Duration::from_secs(args.timeout.unwrap_or(DEFAULT_TIMEOUT));
+        let timeout = clamp_timeout(args.timeout);
         let host_name = self.resolve_host(args.host)?;
 
         if let Err(e) = self.run_guards(&host_name, &args.cmd, args.confirm.unwrap_or(false), &ctx).await {
-            self.audit.write(&host_name, "exec", Some(&args.cmd), None, None, None, None, Some(&format!("{e}")), Some(e.to_string()));
+            let err_msg = e.to_string();
+            self.audit.write(&host_name, "exec", Some(&args.cmd), None, None, None, None, Some(&err_msg), Some(err_msg.clone()));
             return Err(e.into_mcp());
         }
         let session = self
@@ -265,7 +309,7 @@ impl SshServer {
     }
 
     #[tool(
-        description = "Run N commands in parallel on one host. One round-trip; stateless per command.",
+        description = "Run N parallel commands on one host in one round-trip. Use for independent fan-out (probes, status checks). Not for sequential pipelines — use sh.",
         annotations(title = "ExecBatch", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true)
     )]
     async fn exec_batch(
@@ -273,13 +317,15 @@ impl SshServer {
         Parameters(args): Parameters<ExecBatchArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let timeout = Duration::from_secs(args.timeout.unwrap_or(DEFAULT_TIMEOUT));
+        let timeout = clamp_timeout(args.timeout);
         let host_name = self.resolve_host(args.host)?;
         let bypass = args.confirm.unwrap_or(false);
+        let verbose = args.verbose.unwrap_or(false);
 
         for cmd in &args.cmds {
             if let Err(e) = self.run_guards(&host_name, cmd, bypass, &ctx).await {
-                self.audit.write(&host_name, "exec_batch", Some(cmd), None, None, None, None, Some(&format!("{e}")), Some(e.to_string()));
+                let err_msg = e.to_string();
+                self.audit.write(&host_name, "exec_batch", Some(cmd), None, None, None, None, Some(&err_msg), Some(err_msg.clone()));
                 return Err(e.into_mcp());
             }
         }
@@ -294,23 +340,25 @@ impl SshServer {
         }
 
         let max_capture = self.cfg.defaults.max_capture_bytes;
-        let mut handles = Vec::with_capacity(args.cmds.len());
+        // JoinSet aborts in-flight tasks when dropped, so a request cancelled
+        // by the client doesn't leave commands running on the remote host.
+        let mut set = tokio::task::JoinSet::new();
         for cmd in args.cmds.into_iter() {
             let s = Arc::clone(&session);
-            handles.push(tokio::spawn(async move {
+            set.spawn(async move {
                 let r = exec::exec(&s, &cmd, timeout, max_capture).await;
                 (cmd, r)
-            }));
+            });
         }
 
         let mut t = Toon::new();
         t.field("host", &host_name);
         let mut rows: Vec<Vec<String>> = Vec::new();
-        for h in handles {
-            match h.await {
+        while let Some(joined) = set.join_next().await {
+            match joined {
                 Ok((cmd, Ok(r))) => {
-                    let preview_len = r.stdout.len().min(80);
-                    let preview = r.stdout[..preview_len].replace('\n', " ");
+                    let preview = batch_preview(&r, verbose);
+                    self.audit.write(&host_name, "exec_batch", Some(&cmd), Some(r.exit_code), Some(r.duration_ms), None, Some(r.stdout_bytes), None, None);
                     rows.push(vec![
                         cmd,
                         r.exit_code.to_string(),
@@ -318,13 +366,16 @@ impl SshServer {
                         r.stdout_bytes.to_string(),
                         preview,
                     ]);
-                    self.audit.write(&host_name, "exec_batch", None, Some(r.exit_code), Some(r.duration_ms), None, Some(r.stdout_bytes), None, None);
                 }
                 Ok((cmd, Err(e))) => {
-                    rows.push(vec![cmd, "-1".into(), "0".into(), "0".into(), e.to_string()]);
+                    let err_msg = e.to_string();
+                    self.audit.write(&host_name, "exec_batch", Some(&cmd), None, None, None, None, None, Some(err_msg.clone()));
+                    rows.push(vec![cmd, "-1".into(), "0".into(), "0".into(), err_msg]);
                 }
                 Err(e) => {
-                    rows.push(vec!["-".into(), "-1".into(), "0".into(), "0".into(), e.to_string()]);
+                    let err_msg = e.to_string();
+                    self.audit.write(&host_name, "exec_batch", None, None, None, None, None, None, Some(err_msg.clone()));
+                    rows.push(vec!["-".into(), "-1".into(), "0".into(), "0".into(), err_msg]);
                 }
             }
         }
@@ -333,7 +384,7 @@ impl SshServer {
     }
 
     #[tool(
-        description = "Run command in persistent PTY. cd/export persist. Slower; use for stateful sequences.",
+        description = "Stateful PTY shell. Use for cd/export/activate venv/sequential pipelines. Not for parallel work — use exec_batch.",
         annotations(title = "Sh", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true)
     )]
     async fn sh(
@@ -341,11 +392,12 @@ impl SshServer {
         Parameters(args): Parameters<ShArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let timeout = Duration::from_secs(args.timeout.unwrap_or(DEFAULT_TIMEOUT));
+        let timeout = clamp_timeout(args.timeout);
         let host_name = self.resolve_host(args.host)?;
 
         if let Err(e) = self.run_guards(&host_name, &args.cmd, args.confirm.unwrap_or(false), &ctx).await {
-            self.audit.write(&host_name, "sh", Some(&args.cmd), None, None, None, None, Some(&format!("{e}")), Some(e.to_string()));
+            let err_msg = e.to_string();
+            self.audit.write(&host_name, "sh", Some(&args.cmd), None, None, None, None, Some(&err_msg), Some(err_msg.clone()));
             return Err(e.into_mcp());
         }
 
@@ -384,26 +436,32 @@ impl SshServer {
     }
 
     #[tool(
-        description = "Health check. With host probes one; without args probes all in parallel.",
+        description = "TCP+SSH+auth liveness probe. Use to verify reachability before exec/sftp. With host probes one; without args probes all in parallel. Password arg only honored when host is specified.",
         annotations(title = "Ping", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = true)
     )]
     async fn ping(
         &self,
         Parameters(args): Parameters<OptHostArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let targets: Vec<String> = match args.host {
-            Some(h) => vec![h],
-            None => self.cfg.host_names(),
+        let (targets, password): (Vec<String>, Option<String>) = match args.host {
+            Some(h) => (vec![h], args.password),
+            None => (self.cfg.host_names(), None),
         };
         let mut handles = Vec::new();
         for name in targets {
             let pool = self.pool.clone();
+            let pw = password.clone();
             handles.push(tokio::spawn(async move {
                 let start = std::time::Instant::now();
-                let res = pool.get_or_connect(&name, None).await;
+                let res = pool.get_or_connect(&name, pw.clone()).await;
                 let elapsed = start.elapsed().as_millis() as u64;
                 match res {
-                    Ok(_) => (name, "ok".to_string(), elapsed, None),
+                    Ok(_) => {
+                        if let Some(p) = pw {
+                            pool.cache_password(&name, p);
+                        }
+                        (name, "ok".to_string(), elapsed, None)
+                    }
                     Err(e) => (name, "fail".to_string(), elapsed, Some(e.to_string())),
                 }
             }));
@@ -425,7 +483,7 @@ impl SshServer {
     }
 
     #[tool(
-        description = "Close persistent session. Reopens on next call. Use 'interrupt' for Ctrl-C.",
+        description = "Close persistent SSH session and drop cached PTY. Reopens on next call. Use to free server slot or after credential changes. Not for Ctrl-C — use interrupt.",
         annotations(title = "Disconnect", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
     async fn disconnect(
@@ -433,10 +491,19 @@ impl SshServer {
         Parameters(args): Parameters<HostOnlyArgs>,
     ) -> Result<CallToolResult, McpError> {
         let host_name = self.resolve_host(args.host)?;
-        if self.pool.list_active().iter().any(|n| n == &host_name) {
+        // Take the cached session out of the pool first so any new tool call
+        // reconnects on its own. Then send a real SSH disconnect on the handle
+        // so the server tears down channels even if another in-flight tool
+        // still holds an Arc<Session> clone — without this, the TCP+SSH stays
+        // alive for that other call.
+        let removed = self.pool.take_session(&host_name);
+        if let Some(sess) = removed {
             tracing::info!(host = %host_name, "closing session");
+            let _ = sess
+                .handle
+                .disconnect(russh::Disconnect::ByApplication, "user requested", "")
+                .await;
         }
-        self.pool.drop_session(&host_name);
         self.pool.forget_password(&host_name);
         self.audit.write(&host_name, "disconnect", None, None, None, None, None, None, None);
         let mut t = Toon::new();
@@ -445,7 +512,7 @@ impl SshServer {
     }
 
     #[tool(
-        description = "Send Ctrl-C to PTY foreground command. Keeps session.",
+        description = "Send Ctrl-C (SIGINT) to the PTY foreground command. Use to stop a runaway sh command. Keeps session and shell state. Not for full disconnect — use disconnect.",
         annotations(title = "Interrupt", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = true)
     )]
     async fn interrupt(
@@ -481,7 +548,7 @@ impl SshServer {
     }
 
     #[tool(
-        description = "SFTP upload local→remote. Streamed, 256 KB chunks.",
+        description = "SFTP upload local→remote, streamed in 256 KB chunks. Use for transferring local files to remote. Not for inline content — use wr.",
         annotations(title = "Up", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = true)
     )]
     async fn up(
@@ -489,12 +556,16 @@ impl SshServer {
         Parameters(args): Parameters<UploadArgs>,
     ) -> Result<CallToolResult, McpError> {
         let host_name = self.resolve_host(args.host)?;
+        if let Err(e) = self.guards.for_host(&host_name).check_sftp_write(&args.remote) {
+            self.audit.write(&host_name, "up", Some(&args.remote), None, None, None, None, Some(&e.to_string()), Some(e.to_string()));
+            return Err(e.into_mcp());
+        }
         let session = self
             .pool
             .get_or_connect(&host_name, None)
             .await
             .map_err(|e| e.into_mcp())?;
-        let local = PathBuf::from(shellexpand::full(&args.local).map_err(|e| McpError::invalid_params(e.to_string(), None))?.into_owned());
+        let local = PathBuf::from(shellexpand::tilde(&args.local).into_owned());
         let r = sftp::upload(&session, &local, &args.remote).await.map_err(|e| e.into_mcp())?;
         self.audit.write(&host_name, "up", Some(&format!("{} -> {}", args.local, args.remote)), None, Some(r.duration_ms), Some(r.bytes), None, None, None);
         let mut t = Toon::new();
@@ -507,7 +578,7 @@ impl SshServer {
     }
 
     #[tool(
-        description = "SFTP download. With local= writes file; without, returns inline (text<256KB or base64).",
+        description = "SFTP download remote file. With local=<path> writes to disk; without returns inline (text<256KB or base64). Use for fetching files. Not for tailing logs — use tail.",
         annotations(title = "Dn", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = true)
     )]
     async fn dn(
@@ -520,10 +591,10 @@ impl SshServer {
             .get_or_connect(&host_name, None)
             .await
             .map_err(|e| e.into_mcp())?;
-        let local_path = match &args.local {
-            Some(s) => Some(PathBuf::from(shellexpand::full(s).map_err(|e| McpError::invalid_params(e.to_string(), None))?.into_owned())),
-            None => None,
-        };
+        let local_path = args
+            .local
+            .as_deref()
+            .map(|s| PathBuf::from(shellexpand::tilde(s).into_owned()));
         let (r, content) = sftp::download(&session, &args.remote, local_path.as_deref()).await.map_err(|e| e.into_mcp())?;
         self.audit.write(&host_name, "dn", Some(&args.remote), None, Some(r.duration_ms), None, Some(r.bytes), None, None);
 
@@ -551,7 +622,7 @@ impl SshServer {
     }
 
     #[tool(
-        description = "SFTP list dir. Returns name/kind/size/mode/mtime.",
+        description = "SFTP list directory. Use for browsing remote filesystem. Returns name/kind/size/mode/mtime. Not for shell glob — use exec with `ls`.",
         annotations(title = "Ls", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = true)
     )]
     async fn ls(
@@ -583,7 +654,7 @@ impl SshServer {
     }
 
     #[tool(
-        description = "SFTP write file (replaces). Optional octal mode at create time.",
+        description = "SFTP write inline content to remote file (replaces). Use instead of `echo > file` via exec. Atomic mode set at create time.",
         annotations(title = "Wr", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = true)
     )]
     async fn wr(
@@ -591,6 +662,10 @@ impl SshServer {
         Parameters(args): Parameters<WriteArgs>,
     ) -> Result<CallToolResult, McpError> {
         let host_name = self.resolve_host(args.host)?;
+        if let Err(e) = self.guards.for_host(&host_name).check_sftp_write(&args.remote) {
+            self.audit.write(&host_name, "wr", Some(&args.remote), None, None, None, None, Some(&e.to_string()), Some(e.to_string()));
+            return Err(e.into_mcp());
+        }
         let session = self
             .pool
             .get_or_connect(&host_name, None)
@@ -610,7 +685,7 @@ impl SshServer {
     }
 
     #[tool(
-        description = "Tail file. follow=true streams new lines for `seconds` (default 5); else last `lines`.",
+        description = "Read end of file (last N lines) or stream new lines for N seconds. Use for logs and live debugging. Not for `tail -F` via sh — that blocks the PTY.",
         annotations(title = "Tail", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = true)
     )]
     async fn tail(
@@ -625,7 +700,7 @@ impl SshServer {
             .map_err(|e| e.into_mcp())?;
         let lines = args.lines.unwrap_or(100);
         let follow = args.follow.unwrap_or(false);
-        let secs = Duration::from_secs(args.seconds.unwrap_or(5));
+        let secs = Duration::from_secs(args.seconds.unwrap_or(5).clamp(1, MAX_FOLLOW_SECS));
         let max_capture = self.cfg.defaults.max_capture_bytes;
         let chunk = tail::tail(&session, &args.path, lines, follow, secs, max_capture).await.map_err(|e| e.into_mcp())?;
         self.audit.write(&host_name, "tail", Some(&args.path), Some(chunk.exit_code), None, None, Some(chunk.bytes), None, None);
@@ -651,7 +726,17 @@ impl ServerHandler for SshServer {
         )
         .with_server_info(Implementation::from_build_env())
         .with_protocol_version(ProtocolVersion::V_2024_11_05)
-        .with_instructions("SSH MCP. Run 'hosts' to list targets. exec=stateless, sh=PTY-stateful.".to_string())
+        .with_instructions(
+            "SSH MCP server.\n\
+             - Discovery: run `hosts` first to list targets and session state. `ping` checks reachability.\n\
+             - Tool selection: `exec` for stateless one-shot (parallel-safe). `sh` for stateful PTY (cd/export/source persist). `exec_batch` for fan-out parallel commands on one host.\n\
+             - Files: prefer SFTP — `ls`/`dn`/`up`/`wr` over equivalent shell tricks. Use `wr` instead of `echo > file` via exec.\n\
+             - Logs: stream via `tail` with follow=true. Never run `tail -F` via `sh` (blocks the PTY).\n\
+             - Long output: results auto-truncate at 32 KB. Pipe through `grep`/`awk`/`head` server-side to narrow.\n\
+             - Errors: guard_blocked = command matched a deny pattern; confirmation_denied = user declined elicit. `data.recovery` hints retry strategy.\n\
+             - host arg is optional when [defaults] default_host is set."
+                .to_string(),
+        )
     }
 }
 
@@ -691,11 +776,19 @@ impl SshServer {
         session: &Arc<Session>,
         opts: pty::PtyOpts,
     ) -> Result<Arc<pty::PtyState>, SshError> {
-        let mut guard = session.pty.lock().await;
-        if let Some(state) = guard.as_ref() {
+        // Fast path: cached PTY.
+        if let Some(state) = session.pty.lock().await.as_ref() {
             return Ok(Arc::clone(state));
         }
+        // Slow path: do the multi-second `PtyState::open` *outside* the
+        // option-mutex so concurrent `interrupt`/`disconnect` and other tools
+        // touching `session.pty` don't block on it. A racing sibling that
+        // also opens a PTY simply discards its channel — rare and cheap.
         let new_state = Arc::new(pty::PtyState::open(session, opts).await?);
+        let mut guard = session.pty.lock().await;
+        if let Some(existing) = guard.as_ref() {
+            return Ok(Arc::clone(existing));
+        }
         *guard = Some(Arc::clone(&new_state));
         Ok(new_state)
     }
@@ -713,25 +806,45 @@ fn text(s: String) -> CallToolResult {
     CallToolResult::success(vec![Content::text(s)])
 }
 
+fn batch_preview(r: &exec::ExecResult, verbose: bool) -> String {
+    let (src, max) = if r.exit_code != 0 {
+        let stderr_trimmed = r.stderr.trim();
+        let s: &str = if !stderr_trimmed.is_empty() { stderr_trimmed } else { r.stdout.as_str() };
+        (s, 200)
+    } else if verbose {
+        (r.stdout.as_str(), 200)
+    } else {
+        (r.stdout.as_str(), 40)
+    };
+    let mut end = max.min(src.len());
+    while end < src.len() && !src.is_char_boundary(end) {
+        end -= 1;
+    }
+    src[..end].replace('\n', " ")
+}
+
 fn format_exec(r: &exec::ExecResult, truncate: usize) -> String {
     let mut t = Toon::new();
     t.field("exit_code", r.exit_code as i64)
-        .field("duration_ms", r.duration_ms as u64)
-        .field("stdout_bytes", r.stdout_bytes)
-        .field("stderr_bytes", r.stderr_bytes);
+        .field("duration_ms", r.duration_ms as u64);
     if r.timed_out {
         t.field("timed_out", true);
     }
     if r.capture_capped {
         t.field("capture_capped", true);
     }
+    if r.connection_lost {
+        t.field("connection_lost", true);
+    }
     let (stdout_disp, stdout_full) = truncate_with_hint(&r.stdout, truncate);
     let (stderr_disp, stderr_full) = truncate_with_hint(&r.stderr, truncate.min(2048));
     if let Some(n) = stdout_full {
-        t.field("stdout_total_bytes", n);
+        t.field("stdout_bytes", r.stdout_bytes)
+            .field("stdout_total_bytes", n);
     }
     if let Some(n) = stderr_full {
-        t.field("stderr_total_bytes", n);
+        t.field("stderr_bytes", r.stderr_bytes)
+            .field("stderr_total_bytes", n);
     }
     t.block("stdout", &stdout_disp);
     if !r.stderr.is_empty() {
