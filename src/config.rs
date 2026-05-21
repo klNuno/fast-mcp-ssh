@@ -136,6 +136,13 @@ pub struct Host {
     pub guards: Option<Guards>,
     #[serde(default)]
     pub known_host_fingerprint: Option<String>,
+    /// Alias of a host to use as a bastion / jump host. The connection to
+    /// this host is opened first; a direct-tcpip channel to `addr:port` is
+    /// then opened over the bastion and used as the transport for the SSH
+    /// handshake with this host. Chains are followed recursively. Matches
+    /// the semantics of OpenSSH `ProxyJump`.
+    #[serde(default)]
+    pub proxy_jump: Option<String>,
 }
 
 impl Host {
@@ -306,6 +313,33 @@ impl Config {
             if h.user.trim().is_empty() {
                 return Err(SshError::Config(format!("host '{name}': user is empty")));
             }
+            if let Some(pj) = &h.proxy_jump {
+                if !self.hosts.contains_key(pj) {
+                    return Err(SshError::Config(format!(
+                        "host '{name}': proxy_jump = '{pj}' is not declared in [host.*]"
+                    )));
+                }
+                if pj == name {
+                    return Err(SshError::Config(format!(
+                        "host '{name}': proxy_jump cannot reference self"
+                    )));
+                }
+            }
+        }
+        // Detect proxy_jump cycles (A -> B -> A) — DFS from each host
+        // following the chain. A repeat means a cycle.
+        for name in self.hosts.keys() {
+            let mut seen = std::collections::HashSet::new();
+            let mut cur = name.as_str();
+            seen.insert(cur);
+            while let Some(next) = self.hosts.get(cur).and_then(|h| h.proxy_jump.as_deref()) {
+                if !seen.insert(next) {
+                    return Err(SshError::Config(format!(
+                        "host '{name}': proxy_jump cycle detected through '{next}'"
+                    )));
+                }
+                cur = next;
+            }
         }
         Ok(())
     }
@@ -403,6 +437,7 @@ impl Config {
                         keys: None,
                         guards: None,
                         known_host_fingerprint: None,
+                        proxy_jump: None,
                     },
                 );
             }
