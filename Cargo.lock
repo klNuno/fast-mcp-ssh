@@ -946,9 +946,10 @@ dependencies = [
 
 [[package]]
 name = "fast-mcp-ssh"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "base64",
  "clap",
  "dashmap",

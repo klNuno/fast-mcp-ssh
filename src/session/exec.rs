@@ -1,6 +1,8 @@
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use russh::ChannelMsg;
+use tokio::sync::Notify;
 use tokio::time::{Instant as TokioInstant, sleep_until};
 
 use crate::errors::{Result, SshError};
@@ -21,6 +23,8 @@ pub struct ExecResult {
     /// should not conflate the resulting `exit_code = -1` with a process that
     /// genuinely exited with -1. Common cause: server-side abrupt hangup.
     pub connection_lost: bool,
+    /// True if `interrupt` aborted this call before the remote process exited.
+    pub interrupted: bool,
 }
 
 /// Run `cmd` over a fresh exec channel on the persistent SSH handle. `cmd` is passed verbatim
@@ -55,6 +59,12 @@ pub async fn exec(
     let mut exit_code: Option<i32> = None;
     let mut timed_out = false;
     let mut capture_capped = false;
+    let mut interrupted = false;
+
+    // Register cancel notify so `interrupt` can abort this call without
+    // disconnecting the session.
+    let cancel = Arc::new(Notify::new());
+    let cancel_id = session.register_exec(Arc::clone(&cancel)).await;
 
     // Single Sleep registered for the whole exec; reused via Pin across
     // iterations to avoid the per-message timer-registration overhead of
@@ -66,6 +76,11 @@ pub async fn exec(
     loop {
         tokio::select! {
             biased;
+            _ = cancel.notified() => {
+                interrupted = true;
+                let _ = channel.close().await;
+                break;
+            }
             _ = &mut sleep => {
                 timed_out = true;
                 let _ = channel.close().await;
@@ -104,17 +119,27 @@ pub async fn exec(
     let stderr_bytes = stderr.len();
     let duration_ms = start.elapsed().as_millis();
     session.touch();
+    session.deregister_exec(cancel_id).await;
+
+    let final_exit = exit_code.unwrap_or(if interrupted {
+        130 // 128 + SIGINT
+    } else if timed_out {
+        124
+    } else {
+        -1
+    });
 
     Ok(ExecResult {
         stdout: into_string_fast(stdout),
         stderr: into_string_fast(stderr),
-        exit_code: exit_code.unwrap_or(if timed_out { 124 } else { -1 }),
+        exit_code: final_exit,
         duration_ms,
         stdout_bytes,
         stderr_bytes,
         timed_out,
         capture_capped,
         connection_lost,
+        interrupted,
     })
 }
 

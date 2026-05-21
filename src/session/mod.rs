@@ -3,11 +3,13 @@ pub mod exec;
 pub mod pty;
 
 use std::{
+    collections::HashMap,
     sync::Arc,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use russh::client;
 use russh_sftp::client::SftpSession;
@@ -38,7 +40,12 @@ pub struct ParkedChannel {
 /// or kept alive (`pty`, `sftp`).
 pub struct Session {
     pub handle: SshHandle,
+    /// Default unnamed PTY (back-compat with single-shell `sh` usage).
     pub pty: Mutex<Option<Arc<pty::PtyState>>>,
+    /// Named PTYs keyed by user-supplied shell name. Each name is an
+    /// independent persistent shell with its own working directory and
+    /// environment.
+    pub named_ptys: Mutex<HashMap<String, Arc<pty::PtyState>>>,
     pub sftp: Mutex<Option<Arc<SftpSession>>>,
     /// Caps concurrent open channels for this host so we don't exceed sshd
     /// `MaxSessions` (default 10).
@@ -52,13 +59,32 @@ pub struct Session {
     refill_notify: Arc<Notify>,
     last_used_ms: AtomicU64,
     started: Instant,
+    /// Keeps the bastion session alive for the lifetime of this session.
+    /// Without this, the parent handle drops and the direct-tcpip transport
+    /// dies under us. Underscored because it is held purely for liveness.
+    _proxy_parent: Option<Arc<Session>>,
+    /// In-flight `exec` cancellation tokens keyed by an incrementing id.
+    /// `interrupt` walks this map to abort runaway commands without
+    /// disconnecting the whole session.
+    exec_cancels: Mutex<HashMap<u64, Arc<Notify>>>,
+    next_exec_id: AtomicU64,
 }
 
 impl Session {
+    #[allow(dead_code)]
     pub fn new(handle: SshHandle, max_channels: usize) -> Self {
+        Self::new_with_parent(handle, max_channels, None)
+    }
+
+    pub fn new_with_parent(
+        handle: SshHandle,
+        max_channels: usize,
+        parent: Option<Arc<Session>>,
+    ) -> Self {
         Self {
             handle,
             pty: Mutex::new(None),
+            named_ptys: Mutex::new(HashMap::new()),
             sftp: Mutex::new(None),
             channel_limit: Arc::new(Semaphore::new(max_channels.max(1))),
             channel_pool: Mutex::new(Vec::with_capacity(DEFAULT_POOL_TARGET)),
@@ -66,7 +92,34 @@ impl Session {
             refill_notify: Arc::new(Notify::new()),
             last_used_ms: AtomicU64::new(0),
             started: Instant::now(),
+            _proxy_parent: parent,
+            exec_cancels: Mutex::new(HashMap::new()),
+            next_exec_id: AtomicU64::new(0),
         }
+    }
+
+    /// Register a cancellation token for an in-flight exec call. Returns a
+    /// guard whose `Drop` deregisters automatically — exec callers should
+    /// hold it for the full duration of the call.
+    pub async fn register_exec(&self, notify: Arc<Notify>) -> u64 {
+        let id = self.next_exec_id.fetch_add(1, Ordering::Relaxed);
+        self.exec_cancels.lock().await.insert(id, notify);
+        id
+    }
+
+    pub async fn deregister_exec(&self, id: u64) {
+        self.exec_cancels.lock().await.remove(&id);
+    }
+
+    /// Notify every in-flight exec on this session. Returns the count of
+    /// notifications fired.
+    pub async fn cancel_all_execs(&self) -> usize {
+        let map = self.exec_cancels.lock().await;
+        let n = map.len();
+        for n in map.values() {
+            n.notify_waiters();
+        }
+        n
     }
 
     pub fn touch(&self) {
@@ -147,7 +200,7 @@ type ConnectLock = Arc<Mutex<()>>;
 #[derive(Clone)]
 pub struct SessionPool {
     sessions: Arc<DashMap<String, Arc<Session>>>,
-    pub config: Arc<Config>,
+    pub config: Arc<ArcSwap<Config>>,
     /// Cached passwords from elicitation (host -> password). Memory only, never persisted.
     /// `Zeroizing` wipes the buffer when the entry is dropped.
     passwords: Arc<DashMap<String, Zeroizing<String>>>,
@@ -160,15 +213,17 @@ pub struct SessionPool {
 }
 
 impl SessionPool {
-    pub fn new(config: Arc<Config>) -> Result<Self> {
-        let idle_timeout = config.defaults.session_idle_timeout.0;
-        let max_channels = config.defaults.max_channels_per_host;
-        let ssh_cfg = connect::build_client_config(&config);
-        let known_hosts = if matches!(config.defaults.strict_host_key_checking, StrictHostKey::Off) {
+    pub fn new(config: Arc<ArcSwap<Config>>) -> Result<Self> {
+        let snapshot = config.load();
+        let idle_timeout = snapshot.defaults.session_idle_timeout.0;
+        let max_channels = snapshot.defaults.max_channels_per_host;
+        let ssh_cfg = connect::build_client_config(&snapshot);
+        let known_hosts = if matches!(snapshot.defaults.strict_host_key_checking, StrictHostKey::Off) {
             None
         } else {
             Some(KnownHostsStore::open_or_create()?)
         };
+        drop(snapshot);
         Ok(Self {
             sessions: Arc::new(DashMap::new()),
             config,
@@ -179,6 +234,41 @@ impl SessionPool {
             ssh_cfg,
             known_hosts,
         })
+    }
+
+    /// Drop cached sessions for hosts that no longer exist in the current
+    /// config, and for hosts whose connection-relevant fields changed
+    /// (addr, port, user, auth, key paths, proxy_jump). Returns the dropped
+    /// host names.
+    pub async fn prune_against(&self, old: &Config) -> Vec<String> {
+        let new = self.config.load();
+        let mut dropped = Vec::new();
+        let names: Vec<String> = self.sessions.iter().map(|e| e.key().clone()).collect();
+        for name in names {
+            let keep = match (old.hosts.get(&name), new.hosts.get(&name)) {
+                (_, None) => false,
+                (Some(o), Some(n)) => {
+                    o.addr == n.addr
+                        && o.port == n.port
+                        && o.user == n.user
+                        && o.auth == n.auth
+                        && o.all_keys() == n.all_keys()
+                        && o.proxy_jump == n.proxy_jump
+                }
+                (None, Some(_)) => true,
+            };
+            if !keep {
+                if let Some(sess) = self.take_session(&name) {
+                    let _ = sess
+                        .handle
+                        .disconnect(russh::Disconnect::ByApplication, "reload", "")
+                        .await;
+                }
+                self.forget_password(&name);
+                dropped.push(name);
+            }
+        }
+        dropped
     }
 
     pub fn cached_password(&self, host: &str) -> Option<Zeroizing<String>> {
@@ -226,7 +316,7 @@ impl SessionPool {
         // Slow path: serialize concurrent opens for this host. Validate the
         // host name before allocating a lock — otherwise a spammed-with-bogus
         // input would leak entries into `connect_locks`.
-        let _ = self.config.host(host_name)?;
+        let _ = self.config.load().host(host_name)?;
         let lock = if let Some(existing) = self.connect_locks.get(host_name) {
             Arc::clone(existing.value())
         } else {
@@ -244,15 +334,26 @@ impl SessionPool {
             return Ok(s);
         }
 
-        let host = self.config.host(host_name)?.clone();
+        let cfg = self.config.load_full();
+        let host = cfg.host(host_name)?.clone();
+
+        // Resolve the proxy_jump chain first (recursively). Validation at
+        // config load forbids cycles, so this terminates.
+        let parent = if let Some(parent_alias) = &host.proxy_jump {
+            Some(Box::pin(self.get_or_connect(parent_alias, None)).await?)
+        } else {
+            None
+        };
+
         let password = password_override.or_else(|| self.cached_password(host_name));
         let handle = match connect::open(
-            &self.config,
+            &cfg,
             host_name,
             &host,
             password.as_deref().map(|s| s.as_str()),
             Arc::clone(&self.ssh_cfg),
             self.known_hosts.clone(),
+            parent.as_deref(),
         )
         .await
         {
@@ -266,7 +367,7 @@ impl SessionPool {
             }
             Err(e) => return Err(e),
         };
-        let session = Arc::new(Session::new(handle, self.max_channels));
+        let session = Arc::new(Session::new_with_parent(handle, self.max_channels, parent));
         session.touch();
         self.sessions.insert(host_name.to_string(), session.clone());
         if session.pool_target > 0 {

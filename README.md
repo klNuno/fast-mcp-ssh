@@ -38,10 +38,14 @@ Optional `--config <path>`. Default is `$FAST_MCP_SSH_HOME/hosts.toml`, falling 
 | `ping`      | `host?`, `password?`                                  | Health check. With no arg, probes all hosts in parallel (password ignored in that case). |
 | `exec`      | `host?`, `cmd`, `timeout?`, `password?`, `confirm?`     | One-shot command on a fresh exec channel. Stateless, parallel-safe. |
 | `exec_batch`| `host?`, `cmds[]`, `timeout?`, `password?`, `confirm?`, `verbose?` | Run N commands in parallel on one host in one round-trip. `verbose=true` widens success preview to 200 chars; failures always show 200. |
-| `sh`        | `host?`, `cmd`, `timeout?`, `password?`, `confirm?`, `cols?`, `rows?` | Persistent PTY shell. `cd` / `export` survive between calls. PTY size is configurable on first call per host. |
+| `sh`        | `host?`, `cmd`, `timeout?`, `password?`, `confirm?`, `cols?`, `rows?`, `shell?` | Persistent PTY shell. `cd` / `export` survive between calls. `shell=<name>` opens an independent named PTY. |
 | `disconnect`| `host?`                                                | Close the persistent session. Reopens automatically on next call. |
-| `interrupt` | `host?`                                                | Send Ctrl-C to the foreground command on the persistent PTY. Independent of in-flight `sh` (split read/write). |
+| `interrupt` | `host?`                                                | Send Ctrl-C to every PTY on the host and abort every in-flight `exec`/`exec_batch` on it. |
 | `disconnect_all` | none                                              | Close every live session in one shot. |
+| `reload`    | none                                                   | Re-read `hosts.toml`. Validates, atomically swaps guards, drops sessions for removed/changed hosts. |
+| `forward`   | `host?`, `local_port`, `remote_host`, `remote_port`    | Local TCP forward `127.0.0.1:local_port` → `remote_host:remote_port` via SSH direct-tcpip. |
+| `unforward` | `local_port`                                           | Release a forward. |
+| `forwards`  | none                                                   | List active forwards. |
 | `up`        | `host?`, `local`, `remote`                              | SFTP upload (streamed, 256 KB chunks). |
 | `dn`        | `host?`, `remote`, `local?`                             | SFTP download (streamed). With no `local`, returns content inline (text under 256 KB; binary returned base64-encoded). Refuses sensitive paths (shadow, ssh privkeys, cloud creds…). |
 | `ls`        | `host?`, `path`, `limit?`, `offset?`                    | SFTP directory listing. Paginated (default 1000 per page). |

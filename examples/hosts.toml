@@ -69,6 +69,16 @@ user = "ops"
 port = 22
 auth = "agent"          # use ssh-agent (Windows OpenSSH agent or *nix SSH_AUTH_SOCK)
 
+# Example of a host reached through a bastion. The connection to "bastion"
+# is opened first, then a direct-tcpip channel to private-host:22 is used as
+# the transport for the SSH handshake. Chains are followed recursively.
+[host.private-host]
+addr = "10.10.0.42"
+user = "deploy"
+auth = "key"
+key = "~/.fast-mcp-ssh/keys/deploy"
+proxy_jump = "bastion"
+
 [host.legacy-nas]
 addr = "10.0.0.50"
 user = "nas"

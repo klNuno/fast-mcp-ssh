@@ -6,6 +6,7 @@
 mod audit;
 mod config;
 mod errors;
+mod forward;
 mod guards;
 mod known_hosts;
 mod output;
@@ -18,6 +19,7 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use clap::{Parser, Subcommand};
 use mimalloc::MiMalloc;
 use rmcp::ServiceExt;
@@ -78,9 +80,10 @@ async fn async_main() -> anyhow::Result<()> {
             return Err(anyhow::anyhow!("{e}"));
         }
     };
-    let cfg = Arc::new(cfg);
+    let cfg_swap = Arc::new(ArcSwap::from_pointee(cfg));
 
     if matches!(cli.command, Some(Command::Check)) {
+        let cfg = cfg_swap.load();
         tracing::info!(
             hosts = cfg.hosts.len(),
             config = %cfg_path.display(),
@@ -89,14 +92,17 @@ async fn async_main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let audit_path = if cfg.defaults.audit_log {
-        Some(cfg.defaults.audit_log_path.clone())
-    } else {
-        None
+    let audit_path = {
+        let cfg = cfg_swap.load();
+        if cfg.defaults.audit_log {
+            Some(cfg.defaults.audit_log_path.clone())
+        } else {
+            None
+        }
     };
     let audit = Arc::new(AuditLog::new(audit_path)?);
-    let pool = SessionPool::new(cfg.clone())?;
-    let guards = Arc::new(GuardCache::build(&cfg)?);
+    let pool = SessionPool::new(cfg_swap.clone())?;
+    let guards_swap = Arc::new(ArcSwap::from_pointee(GuardCache::build(&cfg_swap.load())?));
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -109,7 +115,7 @@ async fn async_main() -> anyhow::Result<()> {
         std::time::Duration::from_secs(5),
         std::cmp::min(
             std::time::Duration::from_secs(60),
-            cfg.defaults.session_idle_timeout.0 / 2,
+            cfg_swap.load().defaults.session_idle_timeout.0 / 2,
         ),
     );
     let evict_handle = tokio::spawn(async move {
@@ -128,12 +134,12 @@ async fn async_main() -> anyhow::Result<()> {
     });
 
     tracing::info!(
-        hosts = cfg.hosts.len(),
+        hosts = cfg_swap.load().hosts.len(),
         config = %cfg_path.display(),
         "fast-mcp-ssh starting"
     );
 
-    let server = SshServer::new(cfg.clone(), pool, audit.clone(), guards);
+    let server = SshServer::new(cfg_swap.clone(), pool, audit.clone(), guards_swap, cfg_path.clone());
     let service = server.serve(stdio()).await?;
     let serve_result = service.waiting().await;
 

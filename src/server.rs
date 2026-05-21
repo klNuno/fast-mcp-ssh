@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use base64::Engine;
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
@@ -17,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::audit::AuditLog;
 use crate::config::{AuthMethod, Config};
 use crate::errors::SshError;
+use crate::forward::{self, ForwardHandle};
 use crate::guards::{GuardCache, GuardCheck};
 use crate::output::{Toon, truncate_with_hint};
 use crate::session::{Session, SessionPool, exec, pty};
@@ -59,10 +61,15 @@ fn validate_cmd(cmd: &str) -> Result<(), McpError> {
 
 #[derive(Clone)]
 pub struct SshServer {
-    pub cfg: Arc<Config>,
+    pub cfg_swap: Arc<ArcSwap<Config>>,
     pub pool: SessionPool,
     pub audit: Arc<AuditLog>,
-    pub guards: Arc<GuardCache>,
+    pub guards_swap: Arc<ArcSwap<GuardCache>>,
+    /// Path used for `reload` so the tool re-reads from the same file the
+    /// server started with.
+    pub config_path: PathBuf,
+    /// Active local→remote port forwards keyed by local port.
+    pub forwards: Arc<dashmap::DashMap<u16, ForwardHandle>>,
     #[allow(dead_code)]
     tool_router: ToolRouter<SshServer>,
 }
@@ -130,6 +137,11 @@ pub struct ShArgs {
     /// PTY height. Default 50. Honored on first sh per host.
     #[serde(default)]
     pub rows: Option<u32>,
+    /// Optional shell name for an isolated persistent PTY. Each unique name
+    /// gets its own working directory and environment. Omit to use the
+    /// default shell.
+    #[serde(default)]
+    pub shell: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -252,6 +264,27 @@ pub struct TailArgs {
     pub seconds: Option<u64>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ForwardArgs {
+    /// Host alias whose SSH session is used as the tunnel transport.
+    #[serde(default)]
+    pub host: Option<String>,
+    /// Local TCP port to bind on 127.0.0.1. Must be free.
+    pub local_port: u16,
+    /// Remote host the SSH server should connect outbound to. Often
+    /// `127.0.0.1` (services bound on the remote box) or a name visible from
+    /// the remote box's network.
+    pub remote_host: String,
+    /// Remote TCP port.
+    pub remote_port: u16,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UnforwardArgs {
+    /// Local port to release.
+    pub local_port: u16,
+}
+
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ConfirmElicit {
     /// Type "yes" to proceed.
@@ -263,22 +296,35 @@ elicit_safe!(ConfirmElicit);
 #[tool_router]
 impl SshServer {
     pub fn new(
-        cfg: Arc<Config>,
+        cfg_swap: Arc<ArcSwap<Config>>,
         pool: SessionPool,
         audit: Arc<AuditLog>,
-        guards: Arc<GuardCache>,
+        guards_swap: Arc<ArcSwap<GuardCache>>,
+        config_path: PathBuf,
     ) -> Self {
         Self {
-            cfg,
+            cfg_swap,
             pool,
             audit,
-            guards,
+            guards_swap,
+            config_path,
+            forwards: Arc::new(dashmap::DashMap::new()),
             tool_router: Self::tool_router(),
         }
     }
 
+    /// Snapshot of the current config. Cheap: one atomic `Arc::clone`.
+    pub fn cfg(&self) -> Arc<Config> {
+        self.cfg_swap.load_full()
+    }
+
+    /// Snapshot of the current guard cache.
+    pub fn guards(&self) -> Arc<GuardCache> {
+        self.guards_swap.load_full()
+    }
+
     fn resolve_host(&self, h: Option<String>) -> Result<String, McpError> {
-        h.or_else(|| self.cfg.defaults.default_host.clone())
+        h.or_else(|| self.cfg().defaults.default_host.clone())
             .ok_or_else(|| {
                 SshError::Config("host required (or set [defaults] default_host)".to_string())
                     .into_mcp()
@@ -291,13 +337,13 @@ impl SshServer {
     )]
     async fn hosts(&self) -> Result<CallToolResult, McpError> {
         let mut t = Toon::new();
-        let names = self.cfg.host_names();
+        let cfg = self.cfg();
+        let names = cfg.host_names();
         if names.is_empty() {
             t.field("hosts", "none configured");
             t.hint(&format!(
                 "edit {} to add hosts",
-                self.cfg
-                    .defaults
+                cfg.defaults
                     .audit_log_path
                     .parent()
                     .map(|p| p.display().to_string())
@@ -309,7 +355,7 @@ impl SshServer {
         let rows: Vec<Vec<String>> = names
             .iter()
             .filter_map(|n| {
-                let h = self.cfg.hosts.get(n)?;
+                let h = cfg.hosts.get(n)?;
                 let session = if active.contains(n) { "live" } else { "idle" };
                 Some(vec![
                     n.clone(),
@@ -353,7 +399,7 @@ impl SshServer {
             self.pool.cache_password(&host_name, pw);
         }
 
-        let max_capture = self.cfg.defaults.max_capture_bytes;
+        let max_capture = self.cfg().defaults.max_capture_bytes;
         let result = exec::exec(&session, &args.cmd, timeout, max_capture)
             .await
             .map_err(|e| { self.audit.write(&host_name, "exec", Some(&args.cmd), None, None, None, None, None, Some(e.to_string())); e.into_mcp() })?;
@@ -369,7 +415,7 @@ impl SshServer {
             None,
             None,
         );
-        Ok(text(format_exec(&result, self.cfg.defaults.truncate_bytes)))
+        Ok(text(format_exec(&result, self.cfg().defaults.truncate_bytes)))
     }
 
     #[tool(
@@ -418,7 +464,7 @@ impl SshServer {
             self.pool.cache_password(&host_name, pw);
         }
 
-        let max_capture = self.cfg.defaults.max_capture_bytes;
+        let max_capture = self.cfg().defaults.max_capture_bytes;
         // JoinSet aborts in-flight tasks when dropped, so a request cancelled
         // by the client doesn't leave commands running on the remote host.
         // Track cmd-by-task-id so a panicked task still gets audited against
@@ -500,13 +546,16 @@ impl SshServer {
             self.pool.cache_password(&host_name, pw);
         }
 
-        let max_capture = self.cfg.defaults.max_capture_bytes;
+        let max_capture = self.cfg().defaults.max_capture_bytes;
         let opts = pty::PtyOpts {
             cols: args.cols.unwrap_or(pty::DEFAULT_PTY_COLS),
             rows: args.rows.unwrap_or(pty::DEFAULT_PTY_ROWS),
             max_capture,
         };
-        let pty_state = self.ensure_pty(&session, opts).await.map_err(|e| e.into_mcp())?;
+        let pty_state = self
+            .ensure_pty(&session, opts, args.shell.as_deref())
+            .await
+            .map_err(|e| e.into_mcp())?;
         let (output, exit_code) = pty_state.run(&args.cmd, timeout, max_capture).await.map_err(|e| e.into_mcp())?;
         session.touch();
 
@@ -515,9 +564,12 @@ impl SshServer {
 
         let mut t = Toon::new();
         t.field("host", &host_name);
+        if let Some(s) = &args.shell {
+            t.field("shell", s.as_str());
+        }
         t.field("exit_code", exit_code as i64);
         t.field("bytes", bytes);
-        let (display, _) = truncate_with_hint(&output, self.cfg.defaults.truncate_bytes);
+        let (display, _) = truncate_with_hint(&output, self.cfg().defaults.truncate_bytes);
         t.block("stdout", &display);
         if exit_code != 0 {
             t.hint("non-zero exit. cd preserved across sh calls.");
@@ -535,7 +587,7 @@ impl SshServer {
     ) -> Result<CallToolResult, McpError> {
         let (targets, password): (Vec<String>, Option<zeroize::Zeroizing<String>>) = match args.host {
             Some(h) => (vec![h], args.password.map(zeroize::Zeroizing::new)),
-            None => (self.cfg.host_names(), None),
+            None => (self.cfg().host_names(), None),
         };
         let mut handles = Vec::new();
         for name in targets {
@@ -602,6 +654,146 @@ impl SshServer {
     }
 
     #[tool(
+        description = "Open local TCP forward: 127.0.0.1:<local_port> -> remote_host:remote_port via SSH. Returns once the listener is bound; tunnel lives in background until unforward.",
+        annotations(title = "Forward", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true)
+    )]
+    async fn forward(
+        &self,
+        Parameters(args): Parameters<ForwardArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let host_name = self.resolve_host(args.host)?;
+        if self.forwards.contains_key(&args.local_port) {
+            return Err(SshError::Config(format!(
+                "local port {} already forwarded; unforward first",
+                args.local_port
+            ))
+            .into_mcp());
+        }
+        let session = self
+            .pool
+            .get_or_connect(&host_name, None)
+            .await
+            .map_err(|e| e.into_mcp())?;
+        let handle = forward::start(
+            session,
+            host_name.clone(),
+            args.local_port,
+            args.remote_host.clone(),
+            args.remote_port,
+        )
+        .await
+        .map_err(|e| e.into_mcp())?;
+        let bound = handle.bound_addr;
+        self.forwards.insert(args.local_port, handle);
+        self.audit.write(
+            &host_name,
+            "forward",
+            Some(&format!(
+                "127.0.0.1:{} -> {}:{}",
+                args.local_port, args.remote_host, args.remote_port
+            )),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let mut t = Toon::new();
+        t.field("host", &host_name)
+            .field("local", bound.to_string())
+            .field("remote", format!("{}:{}", args.remote_host, args.remote_port))
+            .field("status", "listening");
+        Ok(text(t.into_string()))
+    }
+
+    #[tool(
+        description = "Stop a local forward by local port. Existing in-flight connections drain naturally.",
+        annotations(title = "Unforward", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn unforward(
+        &self,
+        Parameters(args): Parameters<UnforwardArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut t = Toon::new();
+        t.field("local_port", args.local_port as u64);
+        match self.forwards.remove(&args.local_port) {
+            Some((_, handle)) => {
+                let host = handle.host_alias.clone();
+                handle.stop();
+                self.audit.write(&host, "unforward", Some(&format!("port={}", args.local_port)), None, None, None, None, None, None);
+                t.field("status", "stopped");
+            }
+            None => {
+                t.field("status", "no such forward");
+            }
+        }
+        Ok(text(t.into_string()))
+    }
+
+    #[tool(
+        description = "List active local→remote forwards.",
+        annotations(title = "Forwards", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn forwards(&self) -> Result<CallToolResult, McpError> {
+        let rows: Vec<Vec<String>> = self
+            .forwards
+            .iter()
+            .map(|e| {
+                let h = e.value();
+                vec![
+                    h.host_alias.clone(),
+                    h.bound_addr.to_string(),
+                    format!("{}:{}", h.remote_host, h.remote_port),
+                ]
+            })
+            .collect();
+        let mut t = Toon::new();
+        t.table_strs("forwards", &["host", "local", "remote"], &rows);
+        Ok(text(t.into_string()))
+    }
+
+    #[tool(
+        description = "Re-read the config file from disk. Validates, swaps guards atomically, drops sessions for hosts that were removed or whose connection params changed. Returns the diff.",
+        annotations(title = "Reload", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn reload(&self) -> Result<CallToolResult, McpError> {
+        let new_cfg = match Config::load(&self.config_path) {
+            Ok(c) => c,
+            Err(e) => {
+                let msg = e.to_string();
+                self.audit.write("*", "reload", None, None, None, None, None, None, Some(msg.clone()));
+                return Err(e.into_mcp());
+            }
+        };
+        let new_guards = match GuardCache::build(&new_cfg) {
+            Ok(g) => g,
+            Err(e) => {
+                let msg = e.to_string();
+                self.audit.write("*", "reload", None, None, None, None, None, None, Some(msg.clone()));
+                return Err(e.into_mcp());
+            }
+        };
+        let old_cfg = self.cfg();
+        // Swap config + guards atomically. After this, the SessionPool sees
+        // the new config too (shared ArcSwap).
+        self.cfg_swap.store(Arc::new(new_cfg));
+        self.guards_swap.store(Arc::new(new_guards));
+        let dropped = self.pool.prune_against(&old_cfg).await;
+
+        let new = self.cfg();
+        self.audit.write("*", "reload", None, None, None, None, None, None, None);
+        let mut t = Toon::new();
+        t.field("hosts_before", old_cfg.hosts.len());
+        t.field("hosts_after", new.hosts.len());
+        t.field("sessions_dropped", dropped.len() as u64);
+        if !dropped.is_empty() {
+            t.field("dropped", dropped.join(","));
+        }
+        Ok(text(t.into_string()))
+    }
+
+    #[tool(
         description = "Close all live SSH sessions. Reopens on next call. Use to free server slots or after credential changes.",
         annotations(title = "DisconnectAll", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
@@ -645,21 +837,28 @@ impl SshServer {
                 return Ok(text(t.into_string()));
             }
         };
-        let pty_state = {
-            let guard = session.pty.lock().await;
-            guard.as_ref().map(Arc::clone)
-        };
+        let mut pty_states: Vec<Arc<pty::PtyState>> = Vec::new();
+        if let Some(p) = session.pty.lock().await.as_ref() {
+            pty_states.push(Arc::clone(p));
+        }
+        for p in session.named_ptys.lock().await.values() {
+            pty_states.push(Arc::clone(p));
+        }
         let mut t = Toon::new();
         t.field("host", &host_name);
-        match pty_state {
-            Some(p) => {
-                p.interrupt().await.map_err(|e| e.into_mcp())?;
-                self.audit.write(&host_name, "interrupt", None, None, None, None, None, None, None);
-                t.field("status", "sigint sent");
-            }
-            None => {
-                t.field("status", "no pty open");
-            }
+        let mut pty_acted = false;
+        for p in &pty_states {
+            p.interrupt().await.map_err(|e| e.into_mcp())?;
+            pty_acted = true;
+        }
+        let exec_aborted = session.cancel_all_execs().await;
+        self.audit.write(&host_name, "interrupt", None, None, None, None, None, None, None);
+        t.field("pty_sigint", pty_acted);
+        t.field("exec_aborted", exec_aborted as u64);
+        if !pty_acted && exec_aborted == 0 {
+            t.field("status", "no in-flight commands");
+        } else {
+            t.field("status", "interrupt fired");
         }
         Ok(text(t.into_string()))
     }
@@ -673,7 +872,7 @@ impl SshServer {
         Parameters(args): Parameters<UploadArgs>,
     ) -> Result<CallToolResult, McpError> {
         let host_name = self.resolve_host(args.host)?;
-        if let Err(e) = self.guards.for_host(&host_name).check_sftp_write(&args.remote) {
+        if let Err(e) = self.guards().for_host(&host_name).check_sftp_write(&args.remote) {
             self.audit.write(&host_name, "up", Some(&args.remote), None, None, None, None, Some(&e.to_string()), Some(e.to_string()));
             return Err(e.into_mcp());
         }
@@ -703,7 +902,7 @@ impl SshServer {
         Parameters(args): Parameters<DownloadArgs>,
     ) -> Result<CallToolResult, McpError> {
         let host_name = self.resolve_host(args.host)?;
-        if let Err(e) = self.guards.for_host(&host_name).check_sftp_read(&args.remote) {
+        if let Err(e) = self.guards().for_host(&host_name).check_sftp_read(&args.remote) {
             self.audit.write(&host_name, "dn", Some(&args.remote), None, None, None, None, Some(&e.to_string()), Some(e.to_string()));
             return Err(e.into_mcp());
         }
@@ -733,7 +932,7 @@ impl SshServer {
                 t.block("content", &encoded);
             } else {
                 let s = String::from_utf8_lossy(&buf);
-                let (display, _) = truncate_with_hint(&s, self.cfg.defaults.truncate_bytes);
+                let (display, _) = truncate_with_hint(&s, self.cfg().defaults.truncate_bytes);
                 t.block("content", &display);
             }
         } else if let Some(p) = args.local.as_deref() {
@@ -751,7 +950,7 @@ impl SshServer {
         Parameters(args): Parameters<LsArgs>,
     ) -> Result<CallToolResult, McpError> {
         let host_name = self.resolve_host(args.host)?;
-        if let Err(e) = self.guards.for_host(&host_name).check_sftp_read(&args.path) {
+        if let Err(e) = self.guards().for_host(&host_name).check_sftp_read(&args.path) {
             self.audit.write(&host_name, "ls", Some(&args.path), None, None, None, None, Some(&e.to_string()), Some(e.to_string()));
             return Err(e.into_mcp());
         }
@@ -810,7 +1009,7 @@ impl SshServer {
             ))
             .into_mcp());
         }
-        if let Err(e) = self.guards.for_host(&host_name).check_sftp_write(&args.remote) {
+        if let Err(e) = self.guards().for_host(&host_name).check_sftp_write(&args.remote) {
             self.audit.write(&host_name, "wr", Some(&args.remote), None, None, None, None, Some(&e.to_string()), Some(e.to_string()));
             return Err(e.into_mcp());
         }
@@ -841,7 +1040,7 @@ impl SshServer {
         Parameters(args): Parameters<MkdirArgs>,
     ) -> Result<CallToolResult, McpError> {
         let host_name = self.resolve_host(args.host)?;
-        if let Err(e) = self.guards.for_host(&host_name).check_sftp_write(&args.path) {
+        if let Err(e) = self.guards().for_host(&host_name).check_sftp_write(&args.path) {
             self.audit.write(&host_name, "mkdir", Some(&args.path), None, None, None, None, Some(&e.to_string()), Some(e.to_string()));
             return Err(e.into_mcp());
         }
@@ -869,7 +1068,7 @@ impl SshServer {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let host_name = self.resolve_host(args.host)?;
-        if let Err(e) = self.guards.for_host(&host_name).check_sftp_write(&args.path) {
+        if let Err(e) = self.guards().for_host(&host_name).check_sftp_write(&args.path) {
             self.audit.write(&host_name, "rm", Some(&args.path), None, None, None, None, Some(&e.to_string()), Some(e.to_string()));
             return Err(e.into_mcp());
         }
@@ -915,7 +1114,7 @@ impl SshServer {
         Parameters(args): Parameters<StatArgs>,
     ) -> Result<CallToolResult, McpError> {
         let host_name = self.resolve_host(args.host)?;
-        if let Err(e) = self.guards.for_host(&host_name).check_sftp_read(&args.path) {
+        if let Err(e) = self.guards().for_host(&host_name).check_sftp_read(&args.path) {
             self.audit.write(&host_name, "stat", Some(&args.path), None, None, None, None, Some(&e.to_string()), Some(e.to_string()));
             return Err(e.into_mcp());
         }
@@ -939,7 +1138,7 @@ impl SshServer {
     }
 
     #[tool(
-        description = "Read end of file (last N lines) or stream new lines for N seconds. Use for logs and live debugging. Not for `tail -F` via sh — that blocks the PTY.",
+        description = "Read end of file (last N lines) or run `timeout N tail -F` and return the buffered output at the end. Note: MCP returns one response per call, so follow output is delivered after `seconds` elapses, not streamed.",
         annotations(title = "Tail", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = true)
     )]
     async fn tail(
@@ -955,7 +1154,7 @@ impl SshServer {
         let lines = args.lines.unwrap_or(100);
         let follow = args.follow.unwrap_or(false);
         let secs = Duration::from_secs(args.seconds.unwrap_or(5).clamp(1, MAX_FOLLOW_SECS));
-        let max_capture = self.cfg.defaults.max_capture_bytes;
+        let max_capture = self.cfg().defaults.max_capture_bytes;
         let chunk = tail::tail(&session, &args.path, lines, follow, secs, max_capture).await.map_err(|e| e.into_mcp())?;
         self.audit.write(&host_name, "tail", Some(&args.path), Some(chunk.exit_code), None, None, Some(chunk.bytes), None, None);
         let mut t = Toon::new();
@@ -963,7 +1162,7 @@ impl SshServer {
             .field("path", &args.path)
             .field("bytes", chunk.bytes)
             .field("follow", follow);
-        let (display, total) = truncate_with_hint(&chunk.content, self.cfg.defaults.truncate_bytes);
+        let (display, total) = truncate_with_hint(&chunk.content, self.cfg().defaults.truncate_bytes);
         if let Some(n) = total {
             t.field("truncated_bytes", n);
         }
@@ -1002,7 +1201,7 @@ impl SshServer {
         bypass_confirm: bool,
         ctx: &RequestContext<RoleServer>,
     ) -> Result<(), SshError> {
-        let guards = self.guards.for_host(host);
+        let guards = self.guards().for_host(host);
         match guards.check(cmd) {
             GuardCheck::Allow => Ok(()),
             GuardCheck::Deny { pattern_name, pattern } => Err(SshError::BlockedByGuard { name: pattern_name, pattern }),
@@ -1029,22 +1228,34 @@ impl SshServer {
         &self,
         session: &Arc<Session>,
         opts: pty::PtyOpts,
+        shell: Option<&str>,
     ) -> Result<Arc<pty::PtyState>, SshError> {
-        // Fast path: cached PTY.
-        if let Some(state) = session.pty.lock().await.as_ref() {
-            return Ok(Arc::clone(state));
+        match shell {
+            None => {
+                if let Some(state) = session.pty.lock().await.as_ref() {
+                    return Ok(Arc::clone(state));
+                }
+                let new_state = Arc::new(pty::PtyState::open(session, opts).await?);
+                let mut guard = session.pty.lock().await;
+                if let Some(existing) = guard.as_ref() {
+                    return Ok(Arc::clone(existing));
+                }
+                *guard = Some(Arc::clone(&new_state));
+                Ok(new_state)
+            }
+            Some(name) => {
+                if let Some(state) = session.named_ptys.lock().await.get(name) {
+                    return Ok(Arc::clone(state));
+                }
+                let new_state = Arc::new(pty::PtyState::open(session, opts).await?);
+                let mut guard = session.named_ptys.lock().await;
+                if let Some(existing) = guard.get(name) {
+                    return Ok(Arc::clone(existing));
+                }
+                guard.insert(name.to_string(), Arc::clone(&new_state));
+                Ok(new_state)
+            }
         }
-        // Slow path: do the multi-second `PtyState::open` *outside* the
-        // option-mutex so concurrent `interrupt`/`disconnect` and other tools
-        // touching `session.pty` don't block on it. A racing sibling that
-        // also opens a PTY simply discards its channel — rare and cheap.
-        let new_state = Arc::new(pty::PtyState::open(session, opts).await?);
-        let mut guard = session.pty.lock().await;
-        if let Some(existing) = guard.as_ref() {
-            return Ok(Arc::clone(existing));
-        }
-        *guard = Some(Arc::clone(&new_state));
-        Ok(new_state)
     }
 }
 
@@ -1083,6 +1294,9 @@ fn format_exec(r: &exec::ExecResult, truncate: usize) -> String {
         .field("duration_ms", r.duration_ms as u64);
     if r.timed_out {
         t.field("timed_out", true);
+    }
+    if r.interrupted {
+        t.field("interrupted", true);
     }
     if r.capture_capped {
         t.field("capture_capped", true);

@@ -7,6 +7,7 @@ use russh::keys::{PrivateKeyWithHashAlg, load_secret_key};
 use crate::config::{AuthMethod, Config, Host, StrictHostKey};
 use crate::errors::{Result, SshError};
 use crate::known_hosts::{KnownHostMatch, KnownHostsStore};
+use crate::session::Session;
 
 pub type SshHandle = Handle<ClientHandler>;
 
@@ -102,6 +103,7 @@ pub async fn open(
     password: Option<&str>,
     ssh_cfg: Arc<client::Config>,
     store: Option<Arc<KnownHostsStore>>,
+    proxy_parent: Option<&Session>,
 ) -> Result<SshHandle> {
     let strict = cfg.defaults.strict_host_key_checking;
     let store = if matches!(strict, StrictHostKey::Off) { None } else { store };
@@ -113,17 +115,37 @@ pub async fn open(
         strict,
         store,
     };
-    let addr = (host.addr.as_str(), host.port);
 
     let connect_timeout = cfg.defaults.connect_timeout.0;
-    let mut session = match tokio::time::timeout(
-        connect_timeout,
-        client::connect(ssh_cfg, addr, handler),
-    )
-    .await
-    {
-        Ok(r) => r.map_err(SshError::from)?,
-        Err(_) => return Err(SshError::Timeout(connect_timeout.as_millis() as u64)),
+    let mut session = if let Some(parent) = proxy_parent {
+        // ProxyJump: open a direct-tcpip channel on the bastion and run the
+        // SSH handshake over it. Keeps the bastion's TCP+SSH session alive
+        // via `Session::_proxy_parent` on the caller side.
+        let channel = match tokio::time::timeout(
+            connect_timeout,
+            parent.handle.channel_open_direct_tcpip(
+                host.addr.clone(),
+                host.port as u32,
+                "127.0.0.1".to_string(),
+                0,
+            ),
+        )
+        .await
+        {
+            Ok(r) => r.map_err(SshError::from)?,
+            Err(_) => return Err(SshError::Timeout(connect_timeout.as_millis() as u64)),
+        };
+        let stream = channel.into_stream();
+        match tokio::time::timeout(connect_timeout, client::connect_stream(ssh_cfg, stream, handler)).await {
+            Ok(r) => r.map_err(SshError::from)?,
+            Err(_) => return Err(SshError::Timeout(connect_timeout.as_millis() as u64)),
+        }
+    } else {
+        let addr = (host.addr.as_str(), host.port);
+        match tokio::time::timeout(connect_timeout, client::connect(ssh_cfg, addr, handler)).await {
+            Ok(r) => r.map_err(SshError::from)?,
+            Err(_) => return Err(SshError::Timeout(connect_timeout.as_millis() as u64)),
+        }
     };
 
     let user = host.user.clone();
