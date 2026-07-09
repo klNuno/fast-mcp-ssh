@@ -39,11 +39,48 @@ pub async fn exec(
     deadline: Duration,
     max_capture: usize,
 ) -> Result<ExecResult> {
-    let start = Instant::now();
     // Grab a pre-opened channel from the per-session pool when one is
     // ready. Otherwise open a fresh session channel. Either way we hold
     // the matching semaphore permit until exec completes.
-    let (mut channel, _permit) = session.take_or_open_channel().await?;
+    let (channel, _permit, from_pool) = session.take_or_open_channel().await?;
+    let first = exec_on_channel(session, channel, cmd, deadline, max_capture).await;
+    // A parked channel can have been closed server-side while it waited in
+    // the pool (sshd restart, channel timeout). That shows up as an instant
+    // close with zero output and no ExitStatus — the exec request never ran.
+    // Retry once on a fresh channel instead of failing the whole tool call.
+    // Only when nothing was received: any data or exit status means the
+    // command may have run, and re-running it would not be idempotent-safe.
+    let retry = match &first {
+        Ok(r) => {
+            from_pool
+                && r.connection_lost
+                && r.stdout_bytes == 0
+                && r.stderr_bytes == 0
+                && !r.timed_out
+                && !r.interrupted
+        }
+        Err(_) => from_pool,
+    };
+    if !retry {
+        return first;
+    }
+    tracing::debug!("pooled channel was stale; retrying exec on a fresh channel");
+    let channel = session
+        .handle
+        .channel_open_session()
+        .await
+        .map_err(SshError::from)?;
+    exec_on_channel(session, channel, cmd, deadline, max_capture).await
+}
+
+async fn exec_on_channel(
+    session: &Session,
+    mut channel: russh::Channel<russh::client::Msg>,
+    cmd: &str,
+    deadline: Duration,
+    max_capture: usize,
+) -> Result<ExecResult> {
+    let start = Instant::now();
     // want_reply=false: do not wait for the SSH SUCCESS reply before
     // reading. Saves ~1 RTT per warm exec call. If the exec request fails
     // server-side we'll see Eof/Close immediately and the existing

@@ -447,8 +447,40 @@ impl SshServer {
         let verbose = args.verbose.unwrap_or(false);
         let password = args.password.map(zeroize::Zeroizing::new);
 
+        // Guard the whole batch up front, deduplicating confirm elicitations
+        // by pattern name: one user confirmation covers every command in the
+        // batch matching the same pattern, instead of K serial prompts.
+        let guards = self.guards().for_host(&host_name);
+        let mut confirmed: std::collections::HashSet<String> = std::collections::HashSet::new();
         for cmd in &args.cmds {
-            if let Err(e) = self.run_guards(&host_name, cmd, bypass, &ctx).await {
+            let check = guards.check(cmd);
+            let err = match check {
+                GuardCheck::Allow => None,
+                GuardCheck::Deny { pattern_name, pattern } => {
+                    Some(SshError::BlockedByGuard { name: pattern_name, pattern })
+                }
+                GuardCheck::Confirm { pattern_name } => {
+                    if bypass || confirmed.contains(&pattern_name) {
+                        None
+                    } else {
+                        let prompt = format!(
+                            "fast-mcp-ssh wants to run a sensitive command on '{host_name}' (matches '{pattern_name}'):\n\n{cmd}\n\nConfirming covers every command in this batch matching '{pattern_name}'. Reply 'yes' to proceed."
+                        );
+                        match elicit_confirmation(&ctx, &prompt).await {
+                            Ok(true) => {
+                                confirmed.insert(pattern_name);
+                                None
+                            }
+                            Ok(false) => Some(SshError::ConfirmationDenied),
+                            Err(e) => {
+                                tracing::warn!(?e, "elicitation failed; defaulting to deny (fail-closed)");
+                                Some(SshError::ConfirmationDenied)
+                            }
+                        }
+                    }
+                }
+            };
+            if let Some(e) = err {
                 let err_msg = e.to_string();
                 self.audit.write(&host_name, "exec_batch", Some(cmd), None, None, None, None, Some(&err_msg), Some(err_msg.clone()));
                 return Err(e.into_mcp());
@@ -758,16 +790,20 @@ impl SshServer {
         annotations(title = "Reload", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
     async fn reload(&self) -> Result<CallToolResult, McpError> {
-        let new_cfg = match Config::load(&self.config_path) {
-            Ok(c) => c,
-            Err(e) => {
-                let msg = e.to_string();
-                self.audit.write("*", "reload", None, None, None, None, None, None, Some(msg.clone()));
-                return Err(e.into_mcp());
-            }
-        };
-        let new_guards = match GuardCache::build(&new_cfg) {
-            Ok(g) => g,
+        // Config parse (fs + TOML + ~/.ssh/config import) and guard regex
+        // compilation are CPU/disk work; offload so in-flight calls on the
+        // single-threaded runtime don't stall behind a reload.
+        let path = self.config_path.clone();
+        let loaded = tokio::task::spawn_blocking(move || {
+            let cfg = Config::load(&path)?;
+            let guards = GuardCache::build(&cfg)?;
+            Ok::<_, SshError>((cfg, guards))
+        })
+        .await
+        .map_err(|e| SshError::Other(format!("reload task: {e}")))
+        .and_then(|r| r);
+        let (new_cfg, new_guards) = match loaded {
+            Ok(v) => v,
             Err(e) => {
                 let msg = e.to_string();
                 self.audit.write("*", "reload", None, None, None, None, None, None, Some(msg.clone()));
@@ -915,7 +951,9 @@ impl SshServer {
             .local
             .as_deref()
             .map(|s| PathBuf::from(shellexpand::tilde(s).into_owned()));
-        let (r, content) = sftp::download(&session, &args.remote, local_path.as_deref()).await.map_err(|e| e.into_mcp())?;
+        let (r, content) = sftp::download(&session, &args.remote, local_path.as_deref(), INLINE_MAX_BYTES)
+            .await
+            .map_err(|e| e.into_mcp())?;
         self.audit.write(&host_name, "dn", Some(&args.remote), None, Some(r.duration_ms), None, Some(r.bytes), None, None);
 
         let mut t = Toon::new();
@@ -924,9 +962,7 @@ impl SshServer {
             .field("bytes", r.bytes)
             .field("ms", r.duration_ms as u64);
         if let Some(buf) = content {
-            if buf.len() > INLINE_MAX_BYTES {
-                t.field("content", "(too large for inline; rerun with local=<path>)");
-            } else if sftp::looks_binary(&buf) {
+            if sftp::looks_binary(&buf) {
                 let encoded = base64::engine::general_purpose::STANDARD.encode(&buf);
                 t.field("encoding", "base64");
                 t.block("content", &encoded);
@@ -937,6 +973,10 @@ impl SshServer {
             }
         } else if let Some(p) = args.local.as_deref() {
             t.field("local", p);
+        } else {
+            // Inline requested but the remote file exceeds the cap; nothing
+            // was transferred (`bytes` reports the remote size).
+            t.field("content", "(too large for inline; rerun with local=<path>)");
         }
         Ok(text(t.into_string()))
     }
@@ -1224,6 +1264,11 @@ impl SshServer {
         }
     }
 
+    /// Singleflight: the slot mutex is held across `PtyState::open` so two
+    /// concurrent first `sh` calls can't both pay the full PTY init and then
+    /// throw one away (which also burned an sshd channel slot for nothing).
+    /// `interrupt` briefly contends on the same mutex during an open; the
+    /// open is a couple of round-trips, so that's acceptable.
     async fn ensure_pty(
         &self,
         session: &Arc<Session>,
@@ -1232,26 +1277,20 @@ impl SshServer {
     ) -> Result<Arc<pty::PtyState>, SshError> {
         match shell {
             None => {
-                if let Some(state) = session.pty.lock().await.as_ref() {
+                let mut guard = session.pty.lock().await;
+                if let Some(state) = guard.as_ref() {
                     return Ok(Arc::clone(state));
                 }
                 let new_state = Arc::new(pty::PtyState::open(session, opts).await?);
-                let mut guard = session.pty.lock().await;
-                if let Some(existing) = guard.as_ref() {
-                    return Ok(Arc::clone(existing));
-                }
                 *guard = Some(Arc::clone(&new_state));
                 Ok(new_state)
             }
             Some(name) => {
-                if let Some(state) = session.named_ptys.lock().await.get(name) {
+                let mut guard = session.named_ptys.lock().await;
+                if let Some(state) = guard.get(name) {
                     return Ok(Arc::clone(state));
                 }
                 let new_state = Arc::new(pty::PtyState::open(session, opts).await?);
-                let mut guard = session.named_ptys.lock().await;
-                if let Some(existing) = guard.get(name) {
-                    return Ok(Arc::clone(existing));
-                }
                 guard.insert(name.to_string(), Arc::clone(&new_state));
                 Ok(new_state)
             }

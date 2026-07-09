@@ -32,10 +32,6 @@ impl PatternBank {
         Ok(Self { patterns, set })
     }
 
-    fn is_match(&self, cmd: &str) -> bool {
-        !self.patterns.is_empty() && self.set.is_match(cmd)
-    }
-
     fn matched(&self, cmd: &str) -> Option<&CompiledPattern> {
         if self.patterns.is_empty() {
             return None;
@@ -101,13 +97,13 @@ impl CompiledGuards {
     }
 
     pub fn check(&self, cmd: &str) -> GuardCheck {
-        if self.deny.is_match(cmd) {
-            if let Some(p) = self.deny.matched(cmd) {
-                return GuardCheck::Deny {
-                    pattern_name: p.name.clone(),
-                    pattern: p.re.as_str().to_string(),
-                };
-            }
+        // Single RegexSet pass per bank. A separate `is_match` pre-check
+        // would re-scan the command a second time on every hit.
+        if let Some(p) = self.deny.matched(cmd) {
+            return GuardCheck::Deny {
+                pattern_name: p.name.clone(),
+                pattern: p.re.as_str().to_string(),
+            };
         }
         if self.read_only && looks_writeful(cmd) {
             return GuardCheck::Deny {
@@ -115,10 +111,8 @@ impl CompiledGuards {
                 pattern: "host marked read_only".into(),
             };
         }
-        if self.confirm.is_match(cmd) {
-            if let Some(p) = self.confirm.matched(cmd) {
-                return GuardCheck::Confirm { pattern_name: p.name.clone() };
-            }
+        if let Some(p) = self.confirm.matched(cmd) {
+            return GuardCheck::Confirm { pattern_name: p.name.clone() };
         }
         GuardCheck::Allow
     }
@@ -464,9 +458,21 @@ mod tests {
         ] {
             assert!(matches!(g.check(cmd), GuardCheck::Deny { .. }), "should deny: {cmd:?}");
         }
-        for cmd in ["rm ./tmp", "rm -rf ~/tmp", "rm foo/bar", "ls /"] {
+        for cmd in [
+            "rm ./tmp",
+            "rm -rf ~/tmp",
+            "rm foo/bar",
+            "ls /",
+            // Deeper absolute paths are legitimate day-to-day deletes; the
+            // guard only covers root itself and first-level root dirs.
+            "rm -f /tmp/t.log",
+            "rm -rf /tmp/bench-mkdir",
+            "rm -rf /home/user/project/target",
+        ] {
             assert!(!matches!(g.check(cmd), GuardCheck::Deny { .. }), "should allow: {cmd:?}");
         }
+        // Root dir with trailing slash still denied.
+        assert!(matches!(g.check("rm -rf /etc/"), GuardCheck::Deny { .. }));
     }
 
     #[test]

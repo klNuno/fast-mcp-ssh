@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use memchr::memmem;
 use russh::client::Msg;
 use russh::{ChannelMsg, ChannelReadHalf, ChannelWriteHalf};
-use tokio::sync::{Mutex, MutexGuard};
+use tokio::sync::{Mutex, MutexGuard, OwnedSemaphorePermit};
 use tokio::time::timeout;
 
 use crate::errors::{Result, SshError};
@@ -28,6 +28,9 @@ pub struct PtyState {
     /// Per-call sequence counter. Each `run()` rotates the sentinel token so
     /// a prior command output cannot forge an exit code for a subsequent call.
     seq: AtomicU64,
+    /// Channel slot against `max_channels_per_host`, held for the lifetime
+    /// of this PTY so long-lived shells count toward sshd MaxSessions.
+    _permit: OwnedSemaphorePermit,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -50,12 +53,13 @@ impl Default for PtyOpts {
 
 impl PtyState {
     pub async fn open(session: &Session, opts: PtyOpts) -> Result<Self> {
-        let chan = session
-            .handle
-            .channel_open_session()
-            .await
-            .map_err(SshError::from)?;
-        chan.request_pty(true, DEFAULT_PTY_TERM, opts.cols, opts.rows, 0, 0, &[])
+        // Reuse a pre-warmed pool channel when one is parked (-1 RTT), and
+        // hold its permit so the PTY counts against the channel quota.
+        let (chan, permit, _) = session.take_or_open_channel().await?;
+        // want_reply=false on request_pty saves another RTT; a rejected
+        // pty-req surfaces as a failed shell/init drain right after, and
+        // request_shell keeps want_reply=true as the actual failure detector.
+        chan.request_pty(false, DEFAULT_PTY_TERM, opts.cols, opts.rows, 0, 0, &[])
             .await
             .map_err(SshError::from)?;
         chan.request_shell(true).await.map_err(SshError::from)?;
@@ -64,11 +68,18 @@ impl PtyState {
         // `bind 'set enable-bracketed-paste off'` was a bashism that errored
         // under zsh/dash/fish. The portable `printf '\e[?2004l'` reset below
         // covers the same case across shells.
+        //
+        // The readiness marker is emitted via `printf '__%s__' <id>` so the
+        // assembled `__<id>__` string never appears in the PTY echo of the
+        // init block itself (the echo contains `'__%s__'` and `<id>`
+        // separately). One occurrence therefore deterministically means the
+        // shell has executed the whole init — no echo-counting heuristics,
+        // no fixed settle delay.
         let init = format!(
             "stty -echo -onlcr 2>/dev/null\n\
              printf '\\e[?2004l'\n\
              export PS1='' PS2='' PROMPT_COMMAND=''\n\
-             echo __INIT_{session_id}__\n"
+             printf '__%s__\\n' {session_id}\n"
         );
         chan.data(init.as_bytes()).await.map_err(SshError::from)?;
 
@@ -78,10 +89,10 @@ impl PtyState {
             write,
             session_id: session_id.clone(),
             seq: AtomicU64::new(0),
+            _permit: permit,
         };
-        let init_marker = format!("__INIT_{session_id}__");
-        let _ = pty
-            .drain_until_two(&init_marker, Duration::from_secs(15), opts.max_capture)
+        let init_marker = format!("__{session_id}__");
+        pty.drain_until_marker(&init_marker, Duration::from_secs(15), opts.max_capture)
             .await?;
         Ok(pty)
     }
@@ -93,33 +104,33 @@ impl PtyState {
         Ok(())
     }
 
-    /// Drain until we see the sentinel **twice** — once is the shell echo of the line we sent,
-    /// the second is the actual `echo` output. After the second we're certain the shell is
-    /// ready and any login banner has flushed.
-    async fn drain_until_two(
+    /// Drain until the init readiness marker appears once. The marker is
+    /// constructed so it cannot occur in the PTY echo of the init block (see
+    /// `open`), so a single occurrence is definitive — the shell has run the
+    /// whole init and any login banner has already flushed ahead of it.
+    async fn drain_until_marker(
         &self,
-        sentinel: &str,
+        marker: &str,
         deadline: Duration,
         max_capture: usize,
-    ) -> Result<String> {
+    ) -> Result<()> {
         let start = Instant::now();
         let mut buf = Vec::with_capacity(4096);
-        let finder = memmem::Finder::new(sentinel.as_bytes());
-        let mut count = 0usize;
+        let finder = memmem::Finder::new(marker.as_bytes());
         let mut scan_from = 0usize;
         let mut read = self.read.lock().await;
         loop {
             let remaining = deadline.saturating_sub(start.elapsed());
             if remaining.is_zero() {
                 tracing::warn!(
-                    sentinel = %sentinel,
+                    marker = %marker,
                     bytes_received = buf.len(),
                     preview = %String::from_utf8_lossy(&buf[..buf.len().min(512)]),
                     "PTY init drain timed out"
                 );
                 return Err(SshError::Timeout(deadline.as_millis() as u64));
             }
-            let res = timeout(remaining.min(Duration::from_millis(250)), read.wait()).await;
+            let res = timeout(remaining, read.wait()).await;
             match res {
                 Ok(Some(ChannelMsg::Data { data })) => append_capped(&mut buf, &data, max_capture),
                 Ok(Some(ChannelMsg::ExtendedData { data, .. })) => append_capped(&mut buf, &data, max_capture),
@@ -127,22 +138,14 @@ impl PtyState {
                     return Err(SshError::Other("PTY closed unexpectedly during init".into()));
                 }
                 Ok(Some(_)) => {}
-                Err(_) => {}
+                Err(_) => continue,
             }
-            let overlap = sentinel.len().saturating_sub(1);
+            let overlap = marker.len().saturating_sub(1);
             let scan_start = scan_from.saturating_sub(overlap);
-            for pos in finder.find_iter(&buf[scan_start..]) {
-                count += 1;
-                let end = scan_start + pos + sentinel.len();
-                scan_from = scan_from.max(end);
-                if count >= 2 {
-                    return Ok(into_string_fast(buf));
-                }
+            if finder.find(&buf[scan_start..]).is_some() {
+                return Ok(());
             }
             scan_from = buf.len();
-            if count == 1 && start.elapsed() > Duration::from_millis(800) {
-                return Ok(into_string_fast(buf));
-            }
         }
     }
 
@@ -167,22 +170,30 @@ impl PtyState {
         let payload = format!("{cmd}\nprintf '\\n%s:%s\\n' {token} \"$?\"\n");
         let read = self.read.lock().await;
         self.write.data(payload.as_bytes()).await.map_err(SshError::from)?;
-        let raw = self
+        // The drain already located the terminating `\n<token>:<code>` — reuse
+        // its position instead of re-scanning (and re-copying) the buffer.
+        let (mut buf, pos) = self
             .drain_until_terminated(&token, deadline, max_capture, read)
             .await?;
-        let (output, code) = parse_sentinel(&raw, &token);
-        Ok((output, code))
+        let code = parse_exit_code(&buf[pos + token.len() + 2..]);
+        buf.truncate(pos);
+        while matches!(buf.last(), Some(b'\n' | b'\r')) {
+            buf.pop();
+        }
+        Ok((into_string_fast(buf), code))
     }
 
     /// Variant that requires the sentinel to be the LAST line and followed by `:` and a number.
     /// Avoids false-positive where the shell echoes the `printf` line containing the token.
+    /// Returns the raw buffer plus the byte offset of the terminating
+    /// `\n<token>:` pattern so the caller can slice without re-scanning.
     async fn drain_until_terminated(
         &self,
         token: &str,
         deadline: Duration,
         max_capture: usize,
         mut read: MutexGuard<'_, ChannelReadHalf>,
-    ) -> Result<String> {
+    ) -> Result<(Vec<u8>, usize)> {
         let pattern = format!("\n{token}:");
         let pattern_bytes = pattern.as_bytes();
         let finder = memmem::Finder::new(pattern_bytes);
@@ -217,7 +228,7 @@ impl PtyState {
                     let candidate = &buf[tail_start..tail_start + nl_off];
                     let candidate = strip_trailing_cr(candidate);
                     if !candidate.is_empty() && candidate.iter().all(|c| c.is_ascii_digit()) {
-                        return Ok(into_string_fast(buf));
+                        return Ok((buf, pos));
                     }
                 }
             }
@@ -253,26 +264,17 @@ fn strip_trailing_cr(s: &[u8]) -> &[u8] {
     s
 }
 
-/// Parse output that ends with `\n<token>:<n>\n[trailing]`. Returns body before token + exit code.
-fn parse_sentinel(raw: &str, token: &str) -> (String, i32) {
-    let needle = format!("\n{token}:");
-    let idx = match raw.rfind(&needle) {
-        Some(i) => i,
-        None => return (raw.to_string(), -1),
-    };
-    let body = &raw[..idx];
-    let rest = &raw[idx + needle.len()..];
-    let exit_code: i32 = rest
-        .split(['\n', '\r'])
-        .next()
+/// Parse the exit code from the bytes following `\n<token>:` — a digit run
+/// terminated by `\n` or `\r` (PTY ONLCR emits CRLF).
+fn parse_exit_code(tail: &[u8]) -> i32 {
+    let end = tail
+        .iter()
+        .position(|&b| b == b'\n' || b == b'\r')
+        .unwrap_or(tail.len());
+    std::str::from_utf8(&tail[..end])
+        .ok()
         .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(-1);
-    let cleaned = strip_trailing_newlines(body).to_string();
-    (cleaned, exit_code)
-}
-
-fn strip_trailing_newlines(s: &str) -> &str {
-    s.trim_end_matches(['\n', '\r'])
+        .unwrap_or(-1)
 }
 
 /// Random hex token. 64 bits of entropy is enough to make collision with user
@@ -299,43 +301,49 @@ fn random_nonce() -> String {
 mod tests {
     use super::*;
 
+    /// Mirrors the slicing `run()` does after `drain_until_terminated`
+    /// returns `(buf, pos)`: exit code from the tail, body truncated at pos.
+    fn slice_like_run(raw: &[u8], token: &str, pos: usize) -> (String, i32) {
+        let code = parse_exit_code(&raw[pos + token.len() + 2..]);
+        let mut buf = raw[..pos].to_vec();
+        while matches!(buf.last(), Some(b'\n' | b'\r')) {
+            buf.pop();
+        }
+        (into_string_fast(buf), code)
+    }
+
     #[test]
     fn parses_sentinel() {
-        let raw = "hello world\nsecond line\n__DONE_abc__:0\n";
-        let (out, code) = parse_sentinel(raw, "__DONE_abc__");
+        let raw = b"hello world\nsecond line\n__DONE_abc__:0\n";
+        let pos = raw.len() - "\n__DONE_abc__:0\n".len();
+        let (out, code) = slice_like_run(raw, "__DONE_abc__", pos);
         assert_eq!(out, "hello world\nsecond line");
         assert_eq!(code, 0);
     }
 
     #[test]
     fn parses_nonzero_exit() {
-        let raw = "boom\n__DONE_x__:42\n";
-        let (out, code) = parse_sentinel(raw, "__DONE_x__");
+        let raw = b"boom\n__DONE_x__:42\n";
+        let pos = raw.len() - "\n__DONE_x__:42\n".len();
+        let (out, code) = slice_like_run(raw, "__DONE_x__", pos);
         assert_eq!(out, "boom");
         assert_eq!(code, 42);
     }
 
     #[test]
-    fn handles_missing_sentinel() {
-        let (out, code) = parse_sentinel("partial", "__DONE_x__");
-        assert_eq!(out, "partial");
-        assert_eq!(code, -1);
-    }
-
-    #[test]
-    fn ignores_pty_echo_of_printf_line() {
-        let raw = "user-cmd-output\nprintf '\\n%s:%s\\n' __DONE_x__ \"$?\"\nactual-stuff\n__DONE_x__:0\n";
-        let (out, code) = parse_sentinel(raw, "__DONE_x__");
-        assert_eq!(code, 0);
-        assert!(out.ends_with("actual-stuff"), "got: {out:?}");
-    }
-
-    #[test]
     fn handles_crlf_pty_output() {
-        let raw = "ok\r\n__DONE_x__:0\r\n";
-        let (out, code) = parse_sentinel(raw, "__DONE_x__");
+        let raw = b"ok\r\n__DONE_x__:0\r\n";
+        let pos = raw.len() - "\n__DONE_x__:0\r\n".len();
+        let (out, code) = slice_like_run(raw, "__DONE_x__", pos);
         assert_eq!(code, 0);
         assert!(out.contains("ok"));
+    }
+
+    #[test]
+    fn exit_code_garbage_is_minus_one() {
+        assert_eq!(parse_exit_code(b"abc\n"), -1);
+        assert_eq!(parse_exit_code(b""), -1);
+        assert_eq!(parse_exit_code(b"7\r\n"), 7);
     }
 
     #[test]

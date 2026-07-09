@@ -57,7 +57,7 @@ impl client::Handler for ClientHandler {
                     }
                     KnownHostMatch::Unknown => {
                         if matches!(self.strict, StrictHostKey::Tofu) {
-                            if let Err(e) = store.add(&self.host_name, &self.addr, self.port, &actual) {
+                            if let Err(e) = store.add(&self.host_name, &self.addr, self.port, &actual).await {
                                 tracing::error!(?e, "TOFU write known_hosts failed");
                                 return Ok(false);
                             }
@@ -96,6 +96,7 @@ pub fn build_client_config(cfg: &Config) -> Arc<client::Config> {
     })
 }
 
+#[allow(clippy::too_many_arguments)] // single internal call site (SessionPool::get_or_connect)
 pub async fn open(
     cfg: &Config,
     host_name: &str,
@@ -104,7 +105,8 @@ pub async fn open(
     ssh_cfg: Arc<client::Config>,
     store: Option<Arc<KnownHostsStore>>,
     proxy_parent: Option<&Session>,
-) -> Result<SshHandle> {
+    preferred_key: Option<&std::path::Path>,
+) -> Result<(SshHandle, Option<std::path::PathBuf>)> {
     let strict = cfg.defaults.strict_host_key_checking;
     let store = if matches!(strict, StrictHostKey::Off) { None } else { store };
     let handler = ClientHandler {
@@ -149,8 +151,11 @@ pub async fn open(
     };
 
     let user = host.user.clone();
+    let mut used_key = None;
     match host.auth {
-        AuthMethod::Key => authenticate_key(&mut session, host).await?,
+        AuthMethod::Key => {
+            used_key = Some(authenticate_key(&mut session, host, preferred_key).await?);
+        }
         AuthMethod::Agent => authenticate_agent(&mut session, &user).await?,
         AuthMethod::Password => {
             let pw = password.ok_or_else(|| SshError::PasswordRequired(host.addr.clone()))?;
@@ -163,21 +168,39 @@ pub async fn open(
             }
         }
     }
-    Ok(session)
+    Ok((session, used_key))
 }
 
-async fn authenticate_key(session: &mut SshHandle, host: &Host) -> Result<()> {
-    let key_paths = host.all_keys();
+/// Try configured keys in order, preferring the one that authenticated last
+/// time (avoids burning an auth round-trip per rejected key on reconnect).
+/// Returns the path of the key that succeeded so the caller can cache it.
+async fn authenticate_key(
+    session: &mut SshHandle,
+    host: &Host,
+    preferred_key: Option<&std::path::Path>,
+) -> Result<std::path::PathBuf> {
+    let mut key_paths = host.all_keys();
     if key_paths.is_empty() {
         return Err(SshError::Config(format!(
             "auth=key but no key path for {}",
             host.addr
         )));
     }
+    if let Some(pref) = preferred_key {
+        if let Some(idx) = key_paths.iter().position(|p| p == pref) {
+            key_paths.swap(0, idx);
+        }
+    }
     let hash = session.best_supported_rsa_hash().await.map_err(SshError::from)?.flatten();
     let mut last_err: Option<SshError> = None;
     for key_path in &key_paths {
-        let key = match load_secret_key(key_path, None) {
+        // File read + key parse are synchronous; offload so a slow disk
+        // doesn't stall the single-threaded runtime mid-handshake.
+        let path_for_load = key_path.clone();
+        let loaded = tokio::task::spawn_blocking(move || load_secret_key(&path_for_load, None))
+            .await
+            .map_err(|e| SshError::Other(format!("key load task: {e}")))?;
+        let key = match loaded {
             Ok(k) => k,
             Err(e) => {
                 tracing::warn!(path = %key_path.display(), error = ?e, "load key failed; trying next");
@@ -193,7 +216,7 @@ async fn authenticate_key(session: &mut SshHandle, host: &Host) -> Result<()> {
             .await
             .map_err(SshError::from)?;
         if res.success() {
-            return Ok(());
+            return Ok(key_path.clone());
         }
         last_err = Some(SshError::AuthFailed {
             user: host.user.clone(),
