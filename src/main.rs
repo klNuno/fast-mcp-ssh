@@ -62,12 +62,17 @@ fn main() -> anyhow::Result<()> {
 
 async fn async_main() -> anyhow::Result<()> {
     let ansi = std::io::stderr().is_terminal();
+    // Non-blocking writer: if the MCP host never drains our stderr pipe, a
+    // synchronous writer would eventually block the single runtime thread on
+    // a full pipe buffer and freeze every in-flight call. The appender drops
+    // log lines instead. The guard must live for the whole process.
+    let (stderr_writer, _stderr_guard) = tracing_appender::non_blocking(std::io::stderr());
     fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,fast_mcp_ssh=debug,russh=warn")),
+                .unwrap_or_else(|_| EnvFilter::new("info,fast_mcp_ssh=info,russh=warn")),
         )
-        .with_writer(std::io::stderr)
+        .with_writer(stderr_writer)
         .with_ansi(ansi)
         .init();
 

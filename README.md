@@ -47,13 +47,13 @@ Optional `--config <path>`. Default is `$FAST_MCP_SSH_HOME/hosts.toml`, falling 
 | `unforward` | `local_port`                                           | Release a forward. |
 | `forwards`  | none                                                   | List active forwards. |
 | `up`        | `host?`, `local`, `remote`                              | SFTP upload (streamed, 256 KB chunks). |
-| `dn`        | `host?`, `remote`, `local?`                             | SFTP download (streamed). With no `local`, returns content inline (text under 256 KB; binary returned base64-encoded). Refuses sensitive paths (shadow, ssh privkeys, cloud creds…). |
+| `dn`        | `host?`, `remote`, `local?`                             | SFTP download. With no `local`, returns content inline (text under 256 KB; binary returned base64-encoded) — files over the cap are refused after a stat, nothing is transferred. With `local`, files ≥ 4 MB are striped across 6 concurrent SFTP handles. Refuses sensitive paths (shadow, ssh privkeys, cloud creds…). |
 | `ls`        | `host?`, `path`, `limit?`, `offset?`                    | SFTP directory listing. Paginated (default 1000 per page). |
 | `wr`        | `host?`, `remote`, `content`, `mode?`                   | Write a file inline. Optional octal mode applied at create time. Hard cap 8 MB; larger files via `up`. |
 | `mkdir`     | `host?`, `path`, `parents?`                             | SFTP create directory. `parents=true` for `mkdir -p`. |
-| `rm`        | `host?`, `path`, `recursive?`                           | SFTP remove file. `recursive=true` for directories — always elicits confirmation. |
+| `rm`        | `host?`, `path`, `recursive?`                           | SFTP remove file. `recursive=true` for directories — always elicits confirmation; deletes are pipelined 16 at a time. |
 | `stat`      | `host?`, `path`                                         | SFTP stat: kind, size, mode, mtime, uid, gid. |
-| `tail`      | `host?`, `path`, `lines?`, `follow?`, `seconds?`         | `tail -n` (default) or `timeout N tail -F` (returns at end of window). |
+| `tail`      | `host?`, `path`, `lines?`, `follow?`, `seconds?`         | `tail -n` (default) or `timeout N tail -F` piped through `head -c`: returns at end of window, or immediately once the 256 KB capture cap fills. |
 
 `host` is optional on every tool when `[defaults] default_host = "<alias>"` is set in `hosts.toml`.
 
@@ -101,7 +101,7 @@ Server fingerprints are pinned via TOFU by default. The first time fast-mcp-ssh 
 ## Tests
 
 ```bash
-cargo test                    # 27 unit tests
+cargo test                    # 41 unit tests
 ./scripts/test-sh.ps1         # end-to-end smoke against real hosts (Windows)
 ```
 
@@ -126,6 +126,15 @@ target an x86_64 Linux host on the same gigabit LAN. Reproducible via [`benchmar
 
 The exec gap widened a lot in 0.1.2 — `nodelay = true` (TCP_NODELAY) on the russh client
 config alone shaved ~40 ms off every small-command round-trip on LAN.
+
+0.3.0 attacks the remaining fixed costs: PTY init is now deterministic (no settle
+delay, 2 fewer round-trips), `dn` inline refuses oversized files after a stat instead
+of downloading and discarding them (50 MB probe: 575 ms → 3 ms), `tail follow` returns
+as soon as the capture cap fills instead of sitting out the full window (busy log,
+10 s window: 10 004 ms → 31 ms), large downloads stripe across 6 SFTP handles,
+recursive deletes pipeline 16 requests deep, and every channel (PTY, SFTP, forwards,
+ProxyJump) now counts against `max_channels_per_host` so bursts can't trip sshd
+`MaxSessions`.
 
 ### Warm latency, median ms (lower is better)
 

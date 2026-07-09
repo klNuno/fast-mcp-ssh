@@ -21,12 +21,16 @@ pub async fn tail(
 ) -> Result<TailChunk> {
     let path_q = shell_escape(path);
     let cmd = if follow {
-        // Drop the `; true` so the caller sees the real tail/timeout exit
-        // code: 0 = clean EOF, 124 = killed by timeout (expected), 1 = file
-        // not found / unreadable. `2>/dev/null` keeps stderr quiet.
+        // Piping through `head -c` makes the call return as soon as the
+        // capture cap is hit instead of sitting out the full `timeout` window
+        // (and shipping bytes that would be dropped anyway): head exits at the
+        // cap, tail dies on SIGPIPE, the pipeline completes immediately.
+        // `2>&1` routes tail warnings (missing file, rotation) into the
+        // captured output since the pipeline exit code is head's (0).
         format!(
-            "timeout {sec} tail -n {lines} -F {path_q} 2>/dev/null",
-            sec = max_wait.as_secs().max(1)
+            "timeout {sec} tail -n {lines} -F {path_q} 2>&1 | head -c {cap}",
+            sec = max_wait.as_secs().max(1),
+            cap = max_capture
         )
     } else {
         format!("tail -n {lines} {path_q}")

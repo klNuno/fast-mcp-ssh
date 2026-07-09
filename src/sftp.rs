@@ -2,13 +2,22 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use russh_sftp::protocol::{FileAttributes, OpenFlags};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::time::timeout;
 
 use crate::errors::{Result, SshError};
 use crate::session::Session;
 
 const TRANSFER_CHUNK: usize = 256 * 1024;
+/// Downloads at or above this size (with a known size) are striped across
+/// several concurrent SFTP file handles. russh-sftp reads are strictly
+/// sequential per handle (one FXP_READ in flight), so a single stream is
+/// capped at ~one `read_len` (~255 KiB with OpenSSH) per round-trip;
+/// N handles multiply that.
+const PARALLEL_DOWNLOAD_MIN: u64 = 4 * 1024 * 1024;
+const PARALLEL_DOWNLOAD_WORKERS: u64 = 6;
+/// Max in-flight SFTP delete requests during a recursive remove.
+const RM_CONCURRENCY: usize = 16;
 
 pub struct SftpResult {
     pub bytes: usize,
@@ -85,10 +94,16 @@ pub async fn upload(session: &Session, local: &Path, remote: &str) -> Result<Sft
     Ok(SftpResult { bytes: total, duration_ms: start.elapsed().as_millis() })
 }
 
+/// Download `remote`. With `local`, streams (or stripes) to disk and returns
+/// `None` content. Without, returns the bytes inline — unless the file
+/// exceeds `inline_max`, in which case nothing is transferred beyond the
+/// probe and the content is `None` with `bytes` set to the remote size
+/// (previously the whole file was downloaded and then thrown away).
 pub async fn download(
     session: &Session,
     remote: &str,
     local: Option<&Path>,
+    inline_max: usize,
 ) -> Result<(SftpResult, Option<Vec<u8>>)> {
     let start = Instant::now();
     let sftp = session.sftp().await?;
@@ -96,12 +111,31 @@ pub async fn download(
         .open_with_flags(remote, OpenFlags::READ)
         .await
         .map_err(SshError::from)?;
+    // fstat on the already-open handle: one round-trip buys the size for
+    // the too-large-for-inline early exit, exact preallocation, and the
+    // striped-download split.
+    let size = remote_file
+        .metadata()
+        .await
+        .ok()
+        .and_then(|m| m.size);
     session.touch();
 
     if let Some(path) = local {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 tokio::fs::create_dir_all(parent).await?;
+            }
+        }
+        if let Some(sz) = size {
+            if sz >= PARALLEL_DOWNLOAD_MIN {
+                drop(remote_file);
+                let total = download_striped(&sftp, remote, path, sz).await?;
+                session.touch();
+                return Ok((
+                    SftpResult { bytes: total, duration_ms: start.elapsed().as_millis() },
+                    None,
+                ));
             }
         }
         let mut local_file = tokio::fs::File::create(path).await?;
@@ -122,20 +156,105 @@ pub async fn download(
         ));
     }
 
-    let mut content = Vec::with_capacity(TRANSFER_CHUNK);
+    // Inline: refuse before transferring when the size is known to exceed
+    // the cap. Unknown or lying sizes are still bounded by the capped read.
+    if let Some(sz) = size {
+        if sz as usize > inline_max {
+            return Ok((
+                SftpResult { bytes: sz as usize, duration_ms: start.elapsed().as_millis() },
+                None,
+            ));
+        }
+    }
+    let cap = inline_max + 1;
+    let mut content = Vec::with_capacity(size.map_or(TRANSFER_CHUNK, |s| (s as usize).min(cap)));
     let mut buf = vec![0u8; TRANSFER_CHUNK];
     loop {
-        let n = remote_file.read(&mut buf).await?;
+        let room = cap - content.len();
+        if room == 0 {
+            break;
+        }
+        let want = room.min(TRANSFER_CHUNK);
+        let n = remote_file.read(&mut buf[..want]).await?;
         if n == 0 {
             break;
         }
         content.extend_from_slice(&buf[..n]);
     }
     let total = content.len();
+    if total > inline_max {
+        return Ok((
+            SftpResult { bytes: total, duration_ms: start.elapsed().as_millis() },
+            None,
+        ));
+    }
     Ok((
         SftpResult { bytes: total, duration_ms: start.elapsed().as_millis() },
         Some(content),
     ))
+}
+
+/// Stripe a large download across several SFTP file handles on the shared
+/// subsystem channel. Each worker opens its own handle, seeks to its stripe,
+/// and streams it to its own handle on the pre-sized local file. Requests
+/// from all handles pipeline on the wire, lifting the one-read-in-flight
+/// ceiling of a single handle (~read_len per RTT).
+async fn download_striped(
+    sftp: &std::sync::Arc<russh_sftp::client::SftpSession>,
+    remote: &str,
+    path: &Path,
+    size: u64,
+) -> Result<usize> {
+    let workers = PARALLEL_DOWNLOAD_WORKERS
+        .min(size.div_ceil(PARALLEL_DOWNLOAD_MIN))
+        .max(1);
+    let stripe = size.div_ceil(workers);
+    // Pre-size the file so workers can write their stripes independently.
+    {
+        let f = tokio::fs::File::create(path).await?;
+        f.set_len(size).await?;
+    }
+    let mut set = tokio::task::JoinSet::new();
+    for w in 0..workers {
+        let offset = w * stripe;
+        let len = stripe.min(size - offset);
+        if len == 0 {
+            break;
+        }
+        let sftp = std::sync::Arc::clone(sftp);
+        let remote = remote.to_string();
+        let path = path.to_path_buf();
+        set.spawn(async move {
+            let mut rf = sftp
+                .open_with_flags(remote, OpenFlags::READ)
+                .await
+                .map_err(SshError::from)?;
+            rf.seek(std::io::SeekFrom::Start(offset)).await?;
+            let mut lf = tokio::fs::OpenOptions::new().write(true).open(&path).await?;
+            lf.seek(std::io::SeekFrom::Start(offset)).await?;
+            let mut buf = vec![0u8; TRANSFER_CHUNK];
+            let mut left = len as usize;
+            while left > 0 {
+                let want = left.min(TRANSFER_CHUNK);
+                let n = rf.read(&mut buf[..want]).await?;
+                if n == 0 {
+                    return Err(SshError::Other(format!(
+                        "sftp download: short read at offset {}",
+                        offset + (len as usize - left) as u64
+                    )));
+                }
+                lf.write_all(&buf[..n]).await?;
+                left -= n;
+            }
+            lf.flush().await?;
+            Ok::<usize, SshError>(len as usize)
+        });
+    }
+    let mut total = 0usize;
+    while let Some(joined) = set.join_next().await {
+        total += joined.map_err(|e| SshError::Other(format!("download worker: {e}")))??;
+    }
+    Ok(total)
 }
 
 pub async fn write_inline(
@@ -176,15 +295,26 @@ pub async fn mkdir(session: &Session, path: &str, parents: bool) -> Result<()> {
                 acc.push('/');
             }
             acc.push_str(seg);
-            if sftp.metadata(acc.clone()).await.is_ok() {
-                continue;
-            }
-            with_timeout("mkdir", 30, async {
+            // No pre-flight stat: try the create and, on failure, stat once
+            // to see whether the directory already existed. Halves the SFTP
+            // round-trips per component in the common "parents exist" case
+            // (SFTPv3 has no distinct exists code — OpenSSH returns FAILURE).
+            let res = with_timeout("mkdir", 30, async {
                 sftp.create_dir(acc.clone())
                     .await
                     .map_err(SshError::from)
             })
-            .await?;
+            .await;
+            if let Err(e) = res {
+                let is_dir = sftp
+                    .metadata(acc.clone())
+                    .await
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false);
+                if !is_dir {
+                    return Err(e);
+                }
+            }
         }
     } else {
         with_timeout("mkdir", 30, async {
@@ -250,6 +380,11 @@ async fn remove_dir_recursive(session: &Session, path: &str) -> Result<u64> {
                 .map_err(SshError::from)
         })
         .await?;
+        // Deletes are independent request/response pairs on the shared SFTP
+        // channel: pipeline up to RM_CONCURRENCY in flight instead of paying
+        // one full round-trip per file. Drained before this directory's own
+        // rmdir (pushed above) is popped.
+        let mut inflight = tokio::task::JoinSet::new();
         for entry in entries {
             let name = entry.file_name();
             if name == "." || name == ".." {
@@ -263,14 +398,24 @@ async fn remove_dir_recursive(session: &Session, path: &str) -> Result<u64> {
             if entry.metadata().is_dir() {
                 stack.push((child, false));
             } else {
-                with_timeout("rm", 30, async {
-                    sftp.remove_file(child)
-                        .await
-                        .map_err(SshError::from)
-                })
-                .await?;
-                count += 1;
+                if inflight.len() >= RM_CONCURRENCY {
+                    if let Some(joined) = inflight.join_next().await {
+                        joined.map_err(|e| SshError::Other(format!("rm worker: {e}")))??;
+                        count += 1;
+                    }
+                }
+                let sftp = std::sync::Arc::clone(&sftp);
+                inflight.spawn(async move {
+                    match timeout(Duration::from_secs(30), sftp.remove_file(child)).await {
+                        Ok(r) => r.map_err(SshError::from),
+                        Err(_) => Err(SshError::Other("sftp rm timed out after 30s".into())),
+                    }
+                });
             }
+        }
+        while let Some(joined) = inflight.join_next().await {
+            joined.map_err(|e| SshError::Other(format!("rm worker: {e}")))??;
+            count += 1;
         }
     }
     Ok(count)
@@ -307,7 +452,7 @@ pub async fn stat(session: &Session, path: &str) -> Result<StatEntry> {
 pub async fn list_dir(session: &Session, path: &str) -> Result<Vec<ListEntry>> {
     let sftp = session.sftp().await?;
     let entries = sftp.read_dir(path).await.map_err(SshError::from)?;
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(entries.size_hint().0);
     for entry in entries {
         let attrs = entry.metadata();
         let kind = if attrs.is_dir() {

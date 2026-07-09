@@ -35,6 +35,13 @@ pub struct ParkedChannel {
     pub permit: OwnedSemaphorePermit,
 }
 
+/// Cached SFTP subsystem plus the semaphore permit for its channel, so the
+/// long-lived SFTP channel counts against `max_channels_per_host`.
+struct SftpState {
+    session: Arc<SftpSession>,
+    _permit: OwnedSemaphorePermit,
+}
+
 /// One persistent SSH connection per host.
 /// `handle` is the russh client handle (TCP+SSH session). Channels are spawned per-call (`exec`)
 /// or kept alive (`pty`, `sftp`).
@@ -46,7 +53,7 @@ pub struct Session {
     /// independent persistent shell with its own working directory and
     /// environment.
     pub named_ptys: Mutex<HashMap<String, Arc<pty::PtyState>>>,
-    pub sftp: Mutex<Option<Arc<SftpSession>>>,
+    sftp: Mutex<Option<SftpState>>,
     /// Caps concurrent open channels for this host so we don't exceed sshd
     /// `MaxSessions` (default 10).
     channel_limit: Arc<Semaphore>,
@@ -63,6 +70,9 @@ pub struct Session {
     /// Without this, the parent handle drops and the direct-tcpip transport
     /// dies under us. Underscored because it is held purely for liveness.
     _proxy_parent: Option<Arc<Session>>,
+    /// Channel slot on the bastion consumed by the ProxyJump direct-tcpip
+    /// transport, held for the lifetime of this session.
+    _proxy_permit: Option<OwnedSemaphorePermit>,
     /// In-flight `exec` cancellation tokens keyed by an incrementing id.
     /// `interrupt` walks this map to abort runaway commands without
     /// disconnecting the whole session.
@@ -73,13 +83,14 @@ pub struct Session {
 impl Session {
     #[allow(dead_code)]
     pub fn new(handle: SshHandle, max_channels: usize) -> Self {
-        Self::new_with_parent(handle, max_channels, None)
+        Self::new_with_parent(handle, max_channels, None, None)
     }
 
     pub fn new_with_parent(
         handle: SshHandle,
         max_channels: usize,
         parent: Option<Arc<Session>>,
+        proxy_permit: Option<OwnedSemaphorePermit>,
     ) -> Self {
         Self {
             handle,
@@ -93,6 +104,7 @@ impl Session {
             last_used_ms: AtomicU64::new(0),
             started: Instant::now(),
             _proxy_parent: parent,
+            _proxy_permit: proxy_permit,
             exec_cancels: Mutex::new(HashMap::new()),
             next_exec_id: AtomicU64::new(0),
         }
@@ -143,13 +155,16 @@ impl Session {
 
     /// Take a pre-opened channel + its permit from the pool, or open a fresh
     /// one. Always notifies the refill task so the pool topples back up.
+    /// The bool is true when the channel came from the pool — parked channels
+    /// can have been closed server-side while waiting, so callers on that
+    /// path should retry once with a fresh channel on immediate failure.
     pub async fn take_or_open_channel(
         &self,
-    ) -> Result<(russh::Channel<russh::client::Msg>, OwnedSemaphorePermit)> {
+    ) -> Result<(russh::Channel<russh::client::Msg>, OwnedSemaphorePermit, bool)> {
         let parked = self.channel_pool.lock().await.pop();
         if let Some(p) = parked {
             self.refill_notify.notify_one();
-            return Ok((p.channel, p.permit));
+            return Ok((p.channel, p.permit, true));
         }
         let permit = self.acquire_channel().await?;
         let channel = self
@@ -158,22 +173,20 @@ impl Session {
             .await
             .map_err(SshError::from)?;
         self.refill_notify.notify_one();
-        Ok((channel, permit))
+        Ok((channel, permit, false))
     }
 
     /// Lazily open and cache an SFTP subsystem on this session. Subsequent calls
     /// return the cached `Arc<SftpSession>`. Saves a channel-open + subsystem
-    /// round-trip per SFTP operation.
+    /// round-trip per SFTP operation. The channel comes from the pre-warmed
+    /// pool when available and its semaphore permit is held for the lifetime
+    /// of the cached subsystem.
     pub async fn sftp(&self) -> Result<Arc<SftpSession>> {
         let mut guard = self.sftp.lock().await;
         if let Some(s) = guard.as_ref() {
-            return Ok(Arc::clone(s));
+            return Ok(Arc::clone(&s.session));
         }
-        let channel = self
-            .handle
-            .channel_open_session()
-            .await
-            .map_err(SshError::from)?;
+        let (channel, permit, _) = self.take_or_open_channel().await?;
         // want_reply=false saves the SUCCESS round-trip; russh-sftp issues
         // its own INIT on the stream and surfaces a hard error if the
         // subsystem isn't actually live.
@@ -185,7 +198,7 @@ impl Session {
             .await
             .map_err(SshError::from)?;
         let arc = Arc::new(sftp);
-        *guard = Some(Arc::clone(&arc));
+        *guard = Some(SftpState { session: Arc::clone(&arc), _permit: permit });
         Ok(arc)
     }
 }
@@ -204,6 +217,9 @@ pub struct SessionPool {
     /// Cached passwords from elicitation (host -> password). Memory only, never persisted.
     /// `Zeroizing` wipes the buffer when the entry is dropped.
     passwords: Arc<DashMap<String, Zeroizing<String>>>,
+    /// Key path that last authenticated per host, tried first on reconnect so
+    /// multi-key configs don't re-pay an auth round-trip per rejected key.
+    key_cache: Arc<DashMap<String, std::path::PathBuf>>,
     /// Per-host singleflight locks for `get_or_connect`.
     connect_locks: Arc<DashMap<String, ConnectLock>>,
     idle_timeout: Duration,
@@ -228,6 +244,7 @@ impl SessionPool {
             sessions: Arc::new(DashMap::new()),
             config,
             passwords: Arc::new(DashMap::new()),
+            key_cache: Arc::new(DashMap::new()),
             connect_locks: Arc::new(DashMap::new()),
             idle_timeout,
             max_channels,
@@ -344,9 +361,16 @@ impl SessionPool {
         } else {
             None
         };
+        // The ProxyJump direct-tcpip transport occupies a channel on the
+        // bastion for this session's whole lifetime; count it.
+        let proxy_permit = match &parent {
+            Some(p) => Some(p.acquire_channel().await?),
+            None => None,
+        };
 
         let password = password_override.or_else(|| self.cached_password(host_name));
-        let handle = match connect::open(
+        let preferred_key = self.key_cache.get(host_name).map(|e| e.value().clone());
+        let (handle, used_key) = match connect::open(
             &cfg,
             host_name,
             &host,
@@ -354,6 +378,7 @@ impl SessionPool {
             Arc::clone(&self.ssh_cfg),
             self.known_hosts.clone(),
             parent.as_deref(),
+            preferred_key.as_deref(),
         )
         .await
         {
@@ -367,7 +392,10 @@ impl SessionPool {
             }
             Err(e) => return Err(e),
         };
-        let session = Arc::new(Session::new_with_parent(handle, self.max_channels, parent));
+        if let Some(k) = used_key {
+            self.key_cache.insert(host_name.to_string(), k);
+        }
+        let session = Arc::new(Session::new_with_parent(handle, self.max_channels, parent, proxy_permit));
         session.touch();
         self.sessions.insert(host_name.to_string(), session.clone());
         if session.pool_target > 0 {
@@ -427,16 +455,27 @@ fn spawn_pool_refill(weak: std::sync::Weak<Session>) {
                 notify.notified().await;
                 continue;
             }
-            // Try to reserve a channel slot without blocking exec calls.
-            // If everything is in use, back off briefly and re-check.
-            let permit = match Arc::clone(&session.channel_limit).try_acquire_owned() {
+            // Reserve a channel slot. Waiting on the semaphore (instead of
+            // try_acquire + sleep polling) means the refill starts its open
+            // the instant a slot frees after a burst, so the next exec finds
+            // a parked channel instead of re-paying the CHANNEL_OPEN RTT.
+            // Hold only the semaphore Arc across the wait so the session can
+            // still drop (and this task exit) while we're parked.
+            let sem = Arc::clone(&session.channel_limit);
+            drop(session);
+            let permit = match sem.acquire_owned().await {
                 Ok(p) => p,
-                Err(_) => {
-                    drop(session);
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
+                Err(_) => return,
             };
+            let Some(session) = weak.upgrade() else { return };
+            if session.handle.is_closed() {
+                return;
+            }
+            // Re-check: the pool may have been refilled by returned channels
+            // while we waited for a slot.
+            if session.channel_pool.lock().await.len() >= session.pool_target {
+                continue;
+            }
             match session.handle.channel_open_session().await {
                 Ok(channel) => {
                     session

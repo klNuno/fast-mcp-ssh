@@ -63,6 +63,16 @@ pub async fn start(
             let session_for_conn = Arc::clone(&session_for_task);
             let remote_host_for_conn = remote_host_for_task.clone();
             tokio::spawn(async move {
+                // Count this channel against the per-host semaphore so
+                // forwards can't blow past sshd MaxSessions and starve exec.
+                let _permit = match session_for_conn.acquire_channel().await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(?e, %peer, "forward: channel slot unavailable");
+                        let _ = socket.shutdown().await;
+                        return;
+                    }
+                };
                 let channel = match session_for_conn
                     .handle
                     .channel_open_direct_tcpip(
@@ -81,7 +91,11 @@ pub async fn start(
                     }
                 };
                 let mut stream = channel.into_stream();
-                if let Err(e) = tokio::io::copy_bidirectional(&mut socket, &mut stream).await {
+                // 64 KiB buffers match `maximum_packet_size`; the 8 KiB
+                // default would split every SSH data frame ~8x.
+                if let Err(e) =
+                    tokio::io::copy_bidirectional_with_sizes(&mut socket, &mut stream, 64 * 1024, 64 * 1024).await
+                {
                     tracing::debug!(?e, %peer, "forward copy ended");
                 }
             });

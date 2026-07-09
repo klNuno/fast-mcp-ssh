@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Mutex, RwLock};
+use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -34,8 +34,9 @@ pub struct KnownHostsStore {
     inner: RwLock<Stored>,
     /// Serializes flushes so two TOFU writers can't race the
     /// `read-snapshot → write tmp → rename` sequence and produce a
-    /// truncated file or interleaved renames.
-    flush_lock: Mutex<()>,
+    /// truncated file or interleaved renames. Async so it can be held
+    /// across the `spawn_blocking` file write.
+    flush_lock: tokio::sync::Mutex<()>,
 }
 
 impl KnownHostsStore {
@@ -58,7 +59,7 @@ impl KnownHostsStore {
         Ok(std::sync::Arc::new(Self {
             path,
             inner: RwLock::new(stored),
-            flush_lock: Mutex::new(()),
+            flush_lock: tokio::sync::Mutex::new(()),
         }))
     }
 
@@ -97,7 +98,7 @@ impl KnownHostsStore {
         KnownHostMatch::Unknown
     }
 
-    pub fn add(&self, host: &str, addr: &str, port: u16, fingerprint: &str) -> Result<()> {
+    pub async fn add(&self, host: &str, addr: &str, port: u16, fingerprint: &str) -> Result<()> {
         {
             let mut guard = self.inner.write().map_err(|_| SshError::Other("known_hosts lock poisoned".into()))?;
             let endpoint = Self::endpoint_key(addr, port);
@@ -111,14 +112,11 @@ impl KnownHostsStore {
             // the addr:port form only.
             guard.host.remove(host);
         }
-        self.flush()
+        self.flush().await
     }
 
-    fn flush(&self) -> Result<()> {
-        let _flush_guard = self
-            .flush_lock
-            .lock()
-            .map_err(|_| SshError::Other("known_hosts flush_lock poisoned".into()))?;
+    async fn flush(&self) -> Result<()> {
+        let _flush_guard = self.flush_lock.lock().await;
         let serialized = {
             let guard = self
                 .inner
@@ -127,20 +125,28 @@ impl KnownHostsStore {
             toml::to_string_pretty(&*guard)
                 .map_err(|e| SshError::Config(format!("serialize known_hosts: {e}")))?
         };
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        // Atomic write: tmp + rename. A crash mid-write leaves either the old
-        // file or the tmp file (which we ignore on next start), never a
-        // truncated TOML.
-        let tmp = self.path.with_extension("toml.tmp");
-        std::fs::write(&tmp, serialized)?;
-        std::fs::rename(&tmp, &self.path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
-        }
-        Ok(())
+        // Offload the file write: this runs mid-handshake on a current_thread
+        // runtime, and a slow disk (or AV scanning the rename) would stall
+        // every in-flight call.
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            // Atomic write: tmp + rename. A crash mid-write leaves either the
+            // old file or the tmp file (which we ignore on next start), never
+            // a truncated TOML.
+            let tmp = path.with_extension("toml.tmp");
+            std::fs::write(&tmp, serialized)?;
+            std::fs::rename(&tmp, &path)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| SshError::Other(format!("known_hosts flush task: {e}")))?
     }
 }

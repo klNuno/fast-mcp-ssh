@@ -10,11 +10,14 @@ use crate::errors::{Result, SshError};
 
 const DEFAULT_DENY: &[(&str, &str)] = &[
     // Matches: rm -rf /, rm -rf '/', rm -rf "/", rm -rf //, rm -rf /*,
-    // rm -rf -- /, rm --recursive --force /, rm -rf /etc, RM -rf /, etc.
-    // Won't match relative paths (./tmp, ../foo).
+    // rm -rf -- /, rm --recursive --force /, rm -rf /etc, rm -rf /etc/, RM -rf /.
+    // Won't match relative paths (./tmp, ../foo) or deeper absolute paths
+    // (rm -f /tmp/x.log): only root itself and first-level root dirs are
+    // denied. The previous trailing `(\s|$|/)` alternative made ANY absolute
+    // path match — every legitimate `rm /path/to/file` was blocked.
     (
         "rm-rf-root",
-        r#"(?im)\brm\b(?:\s+(?:-{1,2}[a-zA-Z\-]+|--))*\s+['"]?/+\*?[a-zA-Z]*['"]?(\s|$|/)"#,
+        r#"(?im)\brm\b(?:\s+(?:-{1,2}[a-zA-Z\-]+|--))*\s+['"]?/+\*?[a-zA-Z]*/?['"]?(\s|$)"#,
     ),
     ("dd-disk", r#"(?im)\bdd\b.*\bof\s*=\s*['"]?/dev/(sd|nvme|hd|vd)"#),
     ("mkfs", r#"(?im)\bmkfs(\.[a-z0-9]+)?\s+['"]?/dev/"#),
