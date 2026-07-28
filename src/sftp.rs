@@ -123,24 +123,24 @@ pub async fn download(
     session.touch();
 
     if let Some(path) = local {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            tokio::fs::create_dir_all(parent).await?;
         }
-        if let Some(sz) = size {
-            if sz >= PARALLEL_DOWNLOAD_MIN {
-                drop(remote_file);
-                let total = download_striped(&sftp, remote, path, sz).await?;
-                session.touch();
-                return Ok((
-                    SftpResult {
-                        bytes: total,
-                        duration_ms: start.elapsed().as_millis(),
-                    },
-                    None,
-                ));
-            }
+        if let Some(sz) = size
+            && sz >= PARALLEL_DOWNLOAD_MIN
+        {
+            drop(remote_file);
+            let total = download_striped(&sftp, remote, path, sz).await?;
+            session.touch();
+            return Ok((
+                SftpResult {
+                    bytes: total,
+                    duration_ms: start.elapsed().as_millis(),
+                },
+                None,
+            ));
         }
         let mut local_file = tokio::fs::File::create(path).await?;
         let mut buf = vec![0u8; TRANSFER_CHUNK];
@@ -165,16 +165,16 @@ pub async fn download(
 
     // Inline: refuse before transferring when the size is known to exceed
     // the cap. Unknown or lying sizes are still bounded by the capped read.
-    if let Some(sz) = size {
-        if sz as usize > inline_max {
-            return Ok((
-                SftpResult {
-                    bytes: sz as usize,
-                    duration_ms: start.elapsed().as_millis(),
-                },
-                None,
-            ));
-        }
+    if let Some(sz) = size
+        && sz as usize > inline_max
+    {
+        return Ok((
+            SftpResult {
+                bytes: sz as usize,
+                duration_ms: start.elapsed().as_millis(),
+            },
+            None,
+        ));
     }
     let cap = inline_max + 1;
     let mut content = Vec::with_capacity(size.map_or(TRANSFER_CHUNK, |s| (s as usize).min(cap)));
@@ -414,11 +414,11 @@ async fn remove_dir_recursive(session: &Session, path: &str) -> Result<u64> {
             if entry.metadata().is_dir() {
                 stack.push((child, false));
             } else {
-                if inflight.len() >= RM_CONCURRENCY {
-                    if let Some(joined) = inflight.join_next().await {
-                        joined.map_err(|e| SshError::Other(format!("rm worker: {e}")))??;
-                        count += 1;
-                    }
+                if inflight.len() >= RM_CONCURRENCY
+                    && let Some(joined) = inflight.join_next().await
+                {
+                    joined.map_err(|e| SshError::Other(format!("rm worker: {e}")))??;
+                    count += 1;
                 }
                 let sftp = std::sync::Arc::clone(&sftp);
                 inflight.spawn(async move {
