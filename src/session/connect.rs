@@ -57,7 +57,10 @@ impl client::Handler for ClientHandler {
                     }
                     KnownHostMatch::Unknown => {
                         if matches!(self.strict, StrictHostKey::Tofu) {
-                            if let Err(e) = store.add(&self.host_name, &self.addr, self.port, &actual).await {
+                            if let Err(e) = store
+                                .add(&self.host_name, &self.addr, self.port, &actual)
+                                .await
+                            {
                                 tracing::error!(?e, "TOFU write known_hosts failed");
                                 return Ok(false);
                             }
@@ -108,7 +111,11 @@ pub async fn open(
     preferred_key: Option<&std::path::Path>,
 ) -> Result<(SshHandle, Option<std::path::PathBuf>)> {
     let strict = cfg.defaults.strict_host_key_checking;
-    let store = if matches!(strict, StrictHostKey::Off) { None } else { store };
+    let store = if matches!(strict, StrictHostKey::Off) {
+        None
+    } else {
+        store
+    };
     let handler = ClientHandler {
         host_name: host_name.to_string(),
         addr: host.addr.clone(),
@@ -138,7 +145,12 @@ pub async fn open(
             Err(_) => return Err(SshError::Timeout(connect_timeout.as_millis() as u64)),
         };
         let stream = channel.into_stream();
-        match tokio::time::timeout(connect_timeout, client::connect_stream(ssh_cfg, stream, handler)).await {
+        match tokio::time::timeout(
+            connect_timeout,
+            client::connect_stream(ssh_cfg, stream, handler),
+        )
+        .await
+        {
             Ok(r) => r.map_err(SshError::from)?,
             Err(_) => return Err(SshError::Timeout(connect_timeout.as_millis() as u64)),
         }
@@ -164,7 +176,10 @@ pub async fn open(
                 .await
                 .map_err(SshError::from)?;
             if !res.success() {
-                return Err(SshError::AuthFailed { user: user.clone(), host: host.addr.clone() });
+                return Err(SshError::AuthFailed {
+                    user: user.clone(),
+                    host: host.addr.clone(),
+                });
             }
         }
     }
@@ -191,7 +206,11 @@ async fn authenticate_key(
             key_paths.swap(0, idx);
         }
     }
-    let hash = session.best_supported_rsa_hash().await.map_err(SshError::from)?.flatten();
+    let hash = session
+        .best_supported_rsa_hash()
+        .await
+        .map_err(SshError::from)?
+        .flatten();
     let mut last_err: Option<SshError> = None;
     for key_path in &key_paths {
         // File read + key parse are synchronous; offload so a slow disk
@@ -204,15 +223,15 @@ async fn authenticate_key(
             Ok(k) => k,
             Err(e) => {
                 tracing::warn!(path = %key_path.display(), error = ?e, "load key failed; trying next");
-                last_err = Some(SshError::Config(format!("load key {}: {e}", key_path.display())));
+                last_err = Some(SshError::Config(format!(
+                    "load key {}: {e}",
+                    key_path.display()
+                )));
                 continue;
             }
         };
         let res = session
-            .authenticate_publickey(
-                &host.user,
-                PrivateKeyWithHashAlg::new(Arc::new(key), hash),
-            )
+            .authenticate_publickey(&host.user, PrivateKeyWithHashAlg::new(Arc::new(key), hash))
             .await
             .map_err(SshError::from)?;
         if res.success() {
@@ -255,7 +274,9 @@ async fn authenticate_agent(session: &mut SshHandle, user: &str) -> Result<()> {
         .await
         .map_err(|e| SshError::Config(format!("agent identities: {e}")))?;
     if identities.is_empty() {
-        return Err(SshError::Config("ssh-agent has no identities loaded".into()));
+        return Err(SshError::Config(
+            "ssh-agent has no identities loaded".into(),
+        ));
     }
     for ident in identities {
         let pubkey = ident.public_key().into_owned();
@@ -267,7 +288,10 @@ async fn authenticate_agent(session: &mut SshHandle, user: &str) -> Result<()> {
             return Ok(());
         }
     }
-    Err(SshError::AuthFailed { user: user.to_string(), host: "agent".into() })
+    Err(SshError::AuthFailed {
+        user: user.to_string(),
+        host: "agent".into(),
+    })
 }
 
 pub async fn is_handle_alive(handle: &SshHandle) -> bool {

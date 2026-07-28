@@ -93,8 +93,13 @@ pub async fn start(
                 let mut stream = channel.into_stream();
                 // 64 KiB buffers match `maximum_packet_size`; the 8 KiB
                 // default would split every SSH data frame ~8x.
-                if let Err(e) =
-                    tokio::io::copy_bidirectional_with_sizes(&mut socket, &mut stream, 64 * 1024, 64 * 1024).await
+                if let Err(e) = tokio::io::copy_bidirectional_with_sizes(
+                    &mut socket,
+                    &mut stream,
+                    64 * 1024,
+                    64 * 1024,
+                )
+                .await
                 {
                     tracing::debug!(?e, %peer, "forward copy ended");
                 }

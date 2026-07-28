@@ -70,9 +70,9 @@ const CODE_AUTH_FAILED: i32 = -32005;
 fn recovery_for(err: &SshError) -> &'static str {
     match err {
         SshError::Timeout(_) => "retry_later",
-        SshError::UnknownHost(_)
-        | SshError::Config(_)
-        | SshError::PasswordRequired(_) => "check_input",
+        SshError::UnknownHost(_) | SshError::Config(_) | SshError::PasswordRequired(_) => {
+            "check_input"
+        }
         SshError::BlockedByGuard { .. } | SshError::ConfirmationDenied => "ask_user",
         SshError::AuthFailed { .. } => "ask_user",
         SshError::FingerprintMismatch { .. } => "unrecoverable",
@@ -105,7 +105,9 @@ impl SshError {
             SshError::BlockedByGuard { name, pattern } => rmcp::ErrorData::new(
                 ErrorCode(CODE_GUARD_BLOCKED),
                 msg,
-                Some(json!({ "kind": "guard_blocked", "guard": name, "pattern": pattern, "recovery": recovery })),
+                Some(
+                    json!({ "kind": "guard_blocked", "guard": name, "pattern": pattern, "recovery": recovery }),
+                ),
             ),
             SshError::ConfirmationDenied => rmcp::ErrorData::new(
                 ErrorCode(CODE_CONFIRMATION_DENIED),
@@ -117,7 +119,11 @@ impl SshError {
                 msg,
                 Some(json!({ "kind": "timeout", "ms": ms, "recovery": recovery })),
             ),
-            SshError::FingerprintMismatch { host, expected, actual } => rmcp::ErrorData::new(
+            SshError::FingerprintMismatch {
+                host,
+                expected,
+                actual,
+            } => rmcp::ErrorData::new(
                 ErrorCode(CODE_FINGERPRINT_MISMATCH),
                 msg,
                 Some(json!({
@@ -131,7 +137,9 @@ impl SshError {
             SshError::AuthFailed { user, host } => rmcp::ErrorData::new(
                 ErrorCode(CODE_AUTH_FAILED),
                 msg,
-                Some(json!({ "kind": "auth_failed", "user": user, "host": host, "recovery": recovery })),
+                Some(
+                    json!({ "kind": "auth_failed", "user": user, "host": host, "recovery": recovery }),
+                ),
             ),
             SshError::Russh(e) => map_russh_error(e, msg),
             SshError::Io(_)
@@ -154,14 +162,13 @@ fn map_russh_error(e: russh::Error, msg: String) -> rmcp::ErrorData {
     use russh::Error as R;
     use serde_json::json;
     match e {
-        R::ConnectionTimeout
-        | R::KeepaliveTimeout
-        | R::InactivityTimeout
-        | R::Elapsed(_) => rmcp::ErrorData::new(
-            ErrorCode(CODE_TIMEOUT),
-            msg,
-            Some(json!({ "kind": "timeout", "recovery": "retry_later" })),
-        ),
+        R::ConnectionTimeout | R::KeepaliveTimeout | R::InactivityTimeout | R::Elapsed(_) => {
+            rmcp::ErrorData::new(
+                ErrorCode(CODE_TIMEOUT),
+                msg,
+                Some(json!({ "kind": "timeout", "recovery": "retry_later" })),
+            )
+        }
         R::NotAuthenticated | R::NoAuthMethod | R::UnsupportedAuthMethod => rmcp::ErrorData::new(
             ErrorCode(CODE_AUTH_FAILED),
             msg,

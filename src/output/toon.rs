@@ -23,7 +23,10 @@ pub struct Toon {
 
 impl Toon {
     pub fn new() -> Self {
-        Self { buf: String::new(), indent: 0 }
+        Self {
+            buf: String::new(),
+            indent: 0,
+        }
     }
 
     pub fn into_string(self) -> String {
@@ -115,7 +118,9 @@ impl Toon {
 }
 
 impl Default for Toon {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub trait ToonValue {
@@ -123,22 +128,60 @@ pub trait ToonValue {
 }
 
 impl ToonValue for &str {
-    fn write_to(&self, buf: &mut String) { escape_scalar(self, buf); }
+    fn write_to(&self, buf: &mut String) {
+        escape_scalar(self, buf);
+    }
 }
 impl ToonValue for String {
-    fn write_to(&self, buf: &mut String) { escape_scalar(self.as_str(), buf); }
+    fn write_to(&self, buf: &mut String) {
+        escape_scalar(self.as_str(), buf);
+    }
 }
 impl ToonValue for &String {
-    fn write_to(&self, buf: &mut String) { escape_scalar(self.as_str(), buf); }
+    fn write_to(&self, buf: &mut String) {
+        escape_scalar(self.as_str(), buf);
+    }
 }
-impl ToonValue for u16 { fn write_to(&self, buf: &mut String) { let _ = write!(buf, "{self}"); } }
-impl ToonValue for u32 { fn write_to(&self, buf: &mut String) { let _ = write!(buf, "{self}"); } }
-impl ToonValue for u64 { fn write_to(&self, buf: &mut String) { let _ = write!(buf, "{self}"); } }
-impl ToonValue for i32 { fn write_to(&self, buf: &mut String) { let _ = write!(buf, "{self}"); } }
-impl ToonValue for i64 { fn write_to(&self, buf: &mut String) { let _ = write!(buf, "{self}"); } }
-impl ToonValue for usize { fn write_to(&self, buf: &mut String) { let _ = write!(buf, "{self}"); } }
-impl ToonValue for bool { fn write_to(&self, buf: &mut String) { buf.push_str(if *self { "true" } else { "false" }); } }
-impl ToonValue for f64 { fn write_to(&self, buf: &mut String) { let _ = write!(buf, "{self}"); } }
+impl ToonValue for u16 {
+    fn write_to(&self, buf: &mut String) {
+        let _ = write!(buf, "{self}");
+    }
+}
+impl ToonValue for u32 {
+    fn write_to(&self, buf: &mut String) {
+        let _ = write!(buf, "{self}");
+    }
+}
+impl ToonValue for u64 {
+    fn write_to(&self, buf: &mut String) {
+        let _ = write!(buf, "{self}");
+    }
+}
+impl ToonValue for i32 {
+    fn write_to(&self, buf: &mut String) {
+        let _ = write!(buf, "{self}");
+    }
+}
+impl ToonValue for i64 {
+    fn write_to(&self, buf: &mut String) {
+        let _ = write!(buf, "{self}");
+    }
+}
+impl ToonValue for usize {
+    fn write_to(&self, buf: &mut String) {
+        let _ = write!(buf, "{self}");
+    }
+}
+impl ToonValue for bool {
+    fn write_to(&self, buf: &mut String) {
+        buf.push_str(if *self { "true" } else { "false" });
+    }
+}
+impl ToonValue for f64 {
+    fn write_to(&self, buf: &mut String) {
+        let _ = write!(buf, "{self}");
+    }
+}
 
 fn escape_scalar(s: &str, buf: &mut String) {
     if !needs_quote(s) {
@@ -252,5 +295,4 @@ mod tests {
         assert!(out.contains("name addr port"));
         assert!(out.contains("a 1.1.1.1 22"));
     }
-
 }

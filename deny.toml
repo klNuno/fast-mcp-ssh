@@ -3,7 +3,14 @@ all-features = true
 
 [advisories]
 yanked = "deny"
-ignore = []
+ignore = [
+    # Marvin: timing sidechannel in RSA decryption. Reached through russh's
+    # `rsa` feature, which is what makes RSA user keys and RSA host keys work
+    # at all. No fixed release exists. SSH uses RSA for signatures rather than
+    # decryption, and dropping the feature would lock out every user still on
+    # an `id_rsa`. Re-check whenever the `rsa` crate ships a stable 0.10.
+    "RUSTSEC-2023-0071",
+]
 
 [licenses]
 allow = [
