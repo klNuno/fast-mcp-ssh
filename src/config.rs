@@ -19,7 +19,10 @@ const DEFAULT_DENY: &[(&str, &str)] = &[
         "rm-rf-root",
         r#"(?im)\brm\b(?:\s+(?:-{1,2}[a-zA-Z\-]+|--))*\s+['"]?/+\*?[a-zA-Z]*/?['"]?(\s|$)"#,
     ),
-    ("dd-disk", r#"(?im)\bdd\b.*\bof\s*=\s*['"]?/dev/(sd|nvme|hd|vd)"#),
+    (
+        "dd-disk",
+        r#"(?im)\bdd\b.*\bof\s*=\s*['"]?/dev/(sd|nvme|hd|vd)"#,
+    ),
     ("mkfs", r#"(?im)\bmkfs(\.[a-z0-9]+)?\s+['"]?/dev/"#),
     ("forkbomb", r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:"),
     ("redirect-disk", r#">\s*['"]?/dev/(sd|nvme|hd|vd)"#),
@@ -36,8 +39,14 @@ const DEFAULT_CONFIRM: &[(&str, &str)] = &[
     ("reboot", r"(?im)\breboot\b"),
     ("sql-drop", r"(?i)\bDROP\s+(TABLE|DATABASE|SCHEMA)\b"),
     ("sql-truncate", r"(?i)\bTRUNCATE\s+TABLE\b"),
-    ("systemctl-stop", r"(?im)\bsystemctl\s+(stop|disable|mask)\b"),
-    ("docker-rm", r"(?im)\bdocker\s+(rm|rmi|volume\s+rm|system\s+prune)\b"),
+    (
+        "systemctl-stop",
+        r"(?im)\bsystemctl\s+(stop|disable|mask)\b",
+    ),
+    (
+        "docker-rm",
+        r"(?im)\bdocker\s+(rm|rmi|volume\s+rm|system\s+prune)\b",
+    ),
 ];
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -213,7 +222,9 @@ pub struct HumanDuration(pub Duration);
 impl<'de> Deserialize<'de> for HumanDuration {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
         let s = String::deserialize(d)?;
-        parse_duration(&s).map(HumanDuration).map_err(serde::de::Error::custom)
+        parse_duration(&s)
+            .map(HumanDuration)
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -229,7 +240,9 @@ fn parse_duration(s: &str) -> std::result::Result<Duration, String> {
         return Err("empty duration".into());
     }
     let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
-    let n: u64 = num.parse().map_err(|e| format!("bad number in duration '{s}': {e}"))?;
+    let n: u64 = num
+        .parse()
+        .map_err(|e| format!("bad number in duration '{s}': {e}"))?;
     let mult = match unit.trim() {
         "" | "s" | "sec" | "secs" => 1,
         "ms" => 0,
@@ -245,15 +258,33 @@ fn parse_duration(s: &str) -> std::result::Result<Duration, String> {
     }
 }
 
-fn default_true() -> bool { true }
-fn default_port() -> u16 { 22 }
-fn default_output() -> OutputFmt { OutputFmt::Toon }
-fn default_idle() -> HumanDuration { HumanDuration(Duration::from_secs(900)) }
-fn default_keepalive() -> HumanDuration { HumanDuration(Duration::from_secs(30)) }
-fn default_connect_timeout() -> HumanDuration { HumanDuration(Duration::from_secs(15)) }
-fn default_truncate() -> usize { 32 * 1024 }
-fn default_max_capture() -> usize { 256 * 1024 }
-fn default_max_channels() -> usize { 8 }
+fn default_true() -> bool {
+    true
+}
+fn default_port() -> u16 {
+    22
+}
+fn default_output() -> OutputFmt {
+    OutputFmt::Toon
+}
+fn default_idle() -> HumanDuration {
+    HumanDuration(Duration::from_secs(900))
+}
+fn default_keepalive() -> HumanDuration {
+    HumanDuration(Duration::from_secs(30))
+}
+fn default_connect_timeout() -> HumanDuration {
+    HumanDuration(Duration::from_secs(15))
+}
+fn default_truncate() -> usize {
+    32 * 1024
+}
+fn default_max_capture() -> usize {
+    256 * 1024
+}
+fn default_max_channels() -> usize {
+    8
+}
 fn default_audit_path() -> PathBuf {
     config_dir().join("audit.log")
 }
@@ -262,7 +293,9 @@ pub fn config_dir() -> PathBuf {
     if let Ok(env) = std::env::var("FAST_MCP_SSH_HOME") {
         return PathBuf::from(env);
     }
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".fast-mcp-ssh")
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".fast-mcp-ssh")
 }
 
 pub fn default_config_path() -> PathBuf {
@@ -386,8 +419,9 @@ impl Config {
     }
 
     fn merge_ssh_config(&mut self) {
-        // Best-effort import of ~/.ssh/config aliases. Reads via ssh2-config-rs
-        // and adds any non-wildcard host that is not already declared in hosts.toml.
+        // Best-effort import of ~/.ssh/config aliases. Reads via our own
+        // ssh_config parser and adds any non-wildcard host that is not already
+        // declared in hosts.toml.
         let p = match dirs::home_dir() {
             Some(h) => h.join(".ssh").join("config"),
             None => return,
@@ -395,70 +429,119 @@ impl Config {
         if !p.exists() {
             return;
         }
-        use std::io::BufReader;
-        use ssh2_config_rs::{ParseRule, SshConfig};
-        let file = match std::fs::File::open(&p) {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::warn!(?e, "open ~/.ssh/config failed");
-                return;
-            }
-        };
-        let mut reader = BufReader::new(file);
-        let parsed = match SshConfig::default().parse(&mut reader, ParseRule::ALLOW_UNKNOWN_FIELDS) {
+        let parsed = match crate::ssh_config::SshConfig::parse_file(&p) {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(?e, "parse ~/.ssh/config failed");
                 return;
             }
         };
-        for host_block in parsed.get_hosts() {
-            for pattern in host_block.pattern.iter() {
-                let alias = pattern.pattern.as_str();
-                if alias.contains('*') || alias.contains('?') {
-                    continue;
-                }
-                if self.hosts.contains_key(alias) {
-                    continue;
-                }
-                let resolved = parsed.query(alias);
-                let Some(addr) = resolved.host_name.clone() else { continue };
-                let user = resolved.user.clone().unwrap_or_else(|| "root".into());
-                let port = resolved.port.unwrap_or(22);
-                let key = resolved
-                    .identity_file
-                    .as_ref()
-                    .and_then(|v| v.first().cloned());
-                self.hosts.insert(
-                    alias.to_string(),
-                    Host {
-                        addr,
-                        user,
-                        port,
-                        auth: if key.is_some() { AuthMethod::Key } else { AuthMethod::Agent },
-                        key,
-                        keys: None,
-                        guards: None,
-                        known_host_fingerprint: None,
-                        proxy_jump: None,
+        // First pass inserts the hosts; ProxyJump can only be honored once we
+        // know which aliases actually made it into the map.
+        let mut jumps: Vec<(String, String)> = Vec::new();
+        for alias in parsed.list_aliases() {
+            if self.hosts.contains_key(&alias) {
+                continue;
+            }
+            let resolved = parsed.query(&alias);
+            let Some(addr) = resolved.host_name.clone() else {
+                continue;
+            };
+            let user = resolved.user.clone().unwrap_or_else(|| "root".into());
+            let port = resolved.port.unwrap_or(22);
+            let key = resolved.identity_files.first().map(PathBuf::from);
+            if let Some(pj) = resolved.proxy_jump.as_deref().and_then(jump_alias) {
+                jumps.push((alias.clone(), pj));
+            }
+            self.hosts.insert(
+                alias,
+                Host {
+                    addr,
+                    user,
+                    port,
+                    auth: if key.is_some() {
+                        AuthMethod::Key
+                    } else {
+                        AuthMethod::Agent
                     },
-                );
+                    key,
+                    keys: None,
+                    guards: None,
+                    known_host_fingerprint: None,
+                    proxy_jump: None,
+                },
+            );
+        }
+        for (alias, target) in jumps {
+            // Only wire a jump we can actually reach: the bastion has to be a
+            // host in the map, and the chain must stay acyclic or validate()
+            // would reject the whole config over an imported side file.
+            if alias == target || !self.hosts.contains_key(&target) {
+                continue;
+            }
+            if self.jump_would_cycle(&alias, &target) {
+                continue;
+            }
+            if let Some(h) = self.hosts.get_mut(&alias) {
+                h.proxy_jump = Some(target);
             }
         }
+    }
+
+    /// True if pointing `from`'s proxy_jump at `to` would close a loop.
+    fn jump_would_cycle(&self, from: &str, to: &str) -> bool {
+        let mut cur = to;
+        for _ in 0..self.hosts.len() + 1 {
+            if cur == from {
+                return true;
+            }
+            match self.hosts.get(cur).and_then(|h| h.proxy_jump.as_deref()) {
+                Some(next) => cur = next,
+                None => return false,
+            }
+        }
+        true
+    }
+}
+
+/// Reduces an OpenSSH `ProxyJump` value to a bare alias we can look up:
+/// takes the first hop of a comma-separated chain and drops any `user@` and
+/// `:port` decoration. `none` disables the jump.
+fn jump_alias(value: &str) -> Option<String> {
+    let first = value.split(',').next()?.trim();
+    if first.is_empty() || first.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    let host = first.rsplit('@').next()?;
+    let host = match host.rsplit_once(':') {
+        // Only strip a numeric port; keeps IPv6-ish values intact.
+        Some((h, port)) if !h.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => h,
+        _ => host,
+    };
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
     }
 }
 
 pub fn default_deny_patterns() -> Vec<NamedPattern> {
     DEFAULT_DENY
         .iter()
-        .map(|(n, p)| NamedPattern { name: (*n).into(), pattern: (*p).into() })
+        .map(|(n, p)| NamedPattern {
+            name: (*n).into(),
+            pattern: (*p).into(),
+        })
         .collect()
 }
 
 pub fn default_confirm_patterns() -> Vec<NamedPattern> {
     DEFAULT_CONFIRM
         .iter()
-        .map(|(n, p)| NamedPattern { name: (*n).into(), pattern: (*p).into() })
+        .map(|(n, p)| NamedPattern {
+            name: (*n).into(),
+            pattern: (*p).into(),
+        })
         .collect()
 }
 

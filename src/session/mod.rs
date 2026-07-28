@@ -160,7 +160,11 @@ impl Session {
     /// path should retry once with a fresh channel on immediate failure.
     pub async fn take_or_open_channel(
         &self,
-    ) -> Result<(russh::Channel<russh::client::Msg>, OwnedSemaphorePermit, bool)> {
+    ) -> Result<(
+        russh::Channel<russh::client::Msg>,
+        OwnedSemaphorePermit,
+        bool,
+    )> {
         let parked = self.channel_pool.lock().await.pop();
         if let Some(p) = parked {
             self.refill_notify.notify_one();
@@ -198,7 +202,10 @@ impl Session {
             .await
             .map_err(SshError::from)?;
         let arc = Arc::new(sftp);
-        *guard = Some(SftpState { session: Arc::clone(&arc), _permit: permit });
+        *guard = Some(SftpState {
+            session: Arc::clone(&arc),
+            _permit: permit,
+        });
         Ok(arc)
     }
 }
@@ -234,7 +241,10 @@ impl SessionPool {
         let idle_timeout = snapshot.defaults.session_idle_timeout.0;
         let max_channels = snapshot.defaults.max_channels_per_host;
         let ssh_cfg = connect::build_client_config(&snapshot);
-        let known_hosts = if matches!(snapshot.defaults.strict_host_key_checking, StrictHostKey::Off) {
+        let known_hosts = if matches!(
+            snapshot.defaults.strict_host_key_checking,
+            StrictHostKey::Off
+        ) {
             None
         } else {
             Some(KnownHostsStore::open_or_create()?)
@@ -395,7 +405,12 @@ impl SessionPool {
         if let Some(k) = used_key {
             self.key_cache.insert(host_name.to_string(), k);
         }
-        let session = Arc::new(Session::new_with_parent(handle, self.max_channels, parent, proxy_permit));
+        let session = Arc::new(Session::new_with_parent(
+            handle,
+            self.max_channels,
+            parent,
+            proxy_permit,
+        ));
         session.touch();
         self.sessions.insert(host_name.to_string(), session.clone());
         if session.pool_target > 0 {
@@ -443,7 +458,9 @@ impl SessionPool {
 fn spawn_pool_refill(weak: std::sync::Weak<Session>) {
     tokio::spawn(async move {
         loop {
-            let Some(session) = weak.upgrade() else { return };
+            let Some(session) = weak.upgrade() else {
+                return;
+            };
             // SSH connection died; stop refilling.
             if session.handle.is_closed() {
                 return;
@@ -467,7 +484,9 @@ fn spawn_pool_refill(weak: std::sync::Weak<Session>) {
                 Ok(p) => p,
                 Err(_) => return,
             };
-            let Some(session) = weak.upgrade() else { return };
+            let Some(session) = weak.upgrade() else {
+                return;
+            };
             if session.handle.is_closed() {
                 return;
             }

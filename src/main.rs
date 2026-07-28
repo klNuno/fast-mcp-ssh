@@ -13,6 +13,7 @@ mod output;
 mod server;
 mod session;
 mod sftp;
+mod ssh_config;
 mod tail;
 
 use std::io::IsTerminal;
@@ -144,7 +145,13 @@ async fn async_main() -> anyhow::Result<()> {
         "fast-mcp-ssh starting"
     );
 
-    let server = SshServer::new(cfg_swap.clone(), pool, audit.clone(), guards_swap, cfg_path.clone());
+    let server = SshServer::new(
+        cfg_swap.clone(),
+        pool,
+        audit.clone(),
+        guards_swap,
+        cfg_path.clone(),
+    );
     let service = server.serve(stdio()).await?;
     let serve_result = service.waiting().await;
 

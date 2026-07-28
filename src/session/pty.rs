@@ -64,7 +64,7 @@ impl PtyState {
             .map_err(SshError::from)?;
         chan.request_shell(true).await.map_err(SshError::from)?;
 
-        let session_id = random_token("rdy");
+        let session_id = random_token("rdy")?;
         // `bind 'set enable-bracketed-paste off'` was a bashism that errored
         // under zsh/dash/fish. The portable `printf '\e[?2004l'` reset below
         // covers the same case across shells.
@@ -100,7 +100,10 @@ impl PtyState {
     /// Send a Ctrl-C (`\x03`) to the running foreground command on this PTY.
     /// Does not contend with `run()` because the write half is independent.
     pub async fn interrupt(&self) -> Result<()> {
-        self.write.data(&b"\x03"[..]).await.map_err(SshError::from)?;
+        self.write
+            .data(&b"\x03"[..])
+            .await
+            .map_err(SshError::from)?;
         Ok(())
     }
 
@@ -133,9 +136,13 @@ impl PtyState {
             let res = timeout(remaining, read.wait()).await;
             match res {
                 Ok(Some(ChannelMsg::Data { data })) => append_capped(&mut buf, &data, max_capture),
-                Ok(Some(ChannelMsg::ExtendedData { data, .. })) => append_capped(&mut buf, &data, max_capture),
+                Ok(Some(ChannelMsg::ExtendedData { data, .. })) => {
+                    append_capped(&mut buf, &data, max_capture)
+                }
                 Ok(Some(ChannelMsg::Eof)) | Ok(Some(ChannelMsg::Close)) | Ok(None) => {
-                    return Err(SshError::Other("PTY closed unexpectedly during init".into()));
+                    return Err(SshError::Other(
+                        "PTY closed unexpectedly during init".into(),
+                    ));
                 }
                 Ok(Some(_)) => {}
                 Err(_) => continue,
@@ -165,11 +172,14 @@ impl PtyState {
         max_capture: usize,
     ) -> Result<(String, i32)> {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
-        let nonce = random_nonce();
+        let nonce = random_nonce()?;
         let token = format!("__DONE_{}_{}_{}__", self.session_id, seq, nonce);
         let payload = format!("{cmd}\nprintf '\\n%s:%s\\n' {token} \"$?\"\n");
         let read = self.read.lock().await;
-        self.write.data(payload.as_bytes()).await.map_err(SshError::from)?;
+        self.write
+            .data(payload.as_bytes())
+            .await
+            .map_err(SshError::from)?;
         // The drain already located the terminating `\n<token>:<code>` — reuse
         // its position instead of re-scanning (and re-copying) the buffer.
         let (mut buf, pos) = self
@@ -209,7 +219,9 @@ impl PtyState {
             let res = timeout(remaining, read.wait()).await;
             match res {
                 Ok(Some(ChannelMsg::Data { data })) => append_capped(&mut buf, &data, max_capture),
-                Ok(Some(ChannelMsg::ExtendedData { data, .. })) => append_capped(&mut buf, &data, max_capture),
+                Ok(Some(ChannelMsg::ExtendedData { data, .. })) => {
+                    append_capped(&mut buf, &data, max_capture)
+                }
                 Ok(Some(ChannelMsg::Eof)) | Ok(Some(ChannelMsg::Close)) | Ok(None) => {
                     return Err(SshError::Other("PTY closed unexpectedly".into()));
                 }
@@ -278,23 +290,26 @@ fn parse_exit_code(tail: &[u8]) -> i32 {
 }
 
 /// Random hex token. 64 bits of entropy is enough to make collision with user
-/// output unrealistic. Panics on `getrandom` failure — falling back to nanos
-/// here would make the sentinel predictable, which the spoof-resistance
-/// guarantee in `PtyState::run` relies on.
-fn random_token(prefix: &str) -> String {
-    let mut bytes = [0u8; 8];
-    getrandom::getrandom(&mut bytes)
-        .expect("getrandom must succeed for unforgeable PTY sentinels");
-    format!("{prefix}{:016x}", u64::from_le_bytes(bytes))
+/// output unrealistic. Fails the call rather than falling back to nanos: a
+/// predictable sentinel breaks the spoof-resistance guarantee in
+/// `PtyState::run`. The error propagates instead of panicking because the
+/// release profile is `panic = "abort"`, where one bad call would take the
+/// whole server down.
+fn random_token(prefix: &str) -> Result<String> {
+    Ok(format!("{prefix}{:016x}", random_u64()?))
 }
 
 /// Per-call nonce appended to the `__DONE_*` sentinel. Same hard-fail policy
 /// as `random_token`: an attacker who learns nonces can spoof exit codes.
-fn random_nonce() -> String {
+fn random_nonce() -> Result<String> {
+    Ok(format!("{:016x}", random_u64()?))
+}
+
+fn random_u64() -> Result<u64> {
     let mut bytes = [0u8; 8];
-    getrandom::getrandom(&mut bytes)
-        .expect("getrandom must succeed for unforgeable PTY sentinels");
-    format!("{:016x}", u64::from_le_bytes(bytes))
+    getrandom::fill(&mut bytes)
+        .map_err(|e| SshError::Other(format!("system RNG unavailable: {e}")))?;
+    Ok(u64::from_le_bytes(bytes))
 }
 
 #[cfg(test)]
@@ -348,15 +363,17 @@ mod tests {
 
     #[test]
     fn random_token_is_unique() {
-        let a = random_token("x");
-        let b = random_token("x");
+        let a = random_token("x").expect("system RNG");
+        let b = random_token("x").expect("system RNG");
         assert_ne!(a, b);
         assert!(a.starts_with("x"));
     }
 
     #[test]
     fn random_nonce_differs_per_call() {
-        assert_ne!(random_nonce(), random_nonce());
+        let a = random_nonce().expect("system RNG");
+        let b = random_nonce().expect("system RNG");
+        assert_ne!(a, b);
     }
 
     #[test]

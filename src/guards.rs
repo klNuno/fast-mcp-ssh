@@ -4,7 +4,9 @@ use std::sync::OnceLock;
 
 use regex::{Regex, RegexSet};
 
-use crate::config::{Config, Guards, NamedPattern, default_confirm_patterns, default_deny_patterns};
+use crate::config::{
+    Config, Guards, NamedPattern, default_confirm_patterns, default_deny_patterns,
+};
 use crate::errors::{Result, SshError};
 
 #[derive(Debug, Clone)]
@@ -26,9 +28,8 @@ pub struct PatternBank {
 
 impl PatternBank {
     fn new(patterns: Vec<CompiledPattern>) -> Result<Self> {
-        let set = RegexSet::new(patterns.iter().map(|p| p.re.as_str())).map_err(|e| {
-            SshError::Config(format!("regex set compile failed: {e}"))
-        })?;
+        let set = RegexSet::new(patterns.iter().map(|p| p.re.as_str()))
+            .map_err(|e| SshError::Config(format!("regex set compile failed: {e}")))?;
         Ok(Self { patterns, set })
     }
 
@@ -55,8 +56,13 @@ pub struct CompiledGuards {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GuardCheck {
     Allow,
-    Confirm { pattern_name: String },
-    Deny { pattern_name: String, pattern: String },
+    Confirm {
+        pattern_name: String,
+    },
+    Deny {
+        pattern_name: String,
+        pattern: String,
+    },
 }
 
 impl CompiledGuards {
@@ -112,7 +118,9 @@ impl CompiledGuards {
             };
         }
         if let Some(p) = self.confirm.matched(cmd) {
-            return GuardCheck::Confirm { pattern_name: p.name.clone() };
+            return GuardCheck::Confirm {
+                pattern_name: p.name.clone(),
+            };
         }
         GuardCheck::Allow
     }
@@ -246,47 +254,104 @@ impl GuardCache {
 }
 
 fn compile_one(p: &NamedPattern) -> Result<CompiledPattern> {
-    let re = Regex::new(&p.pattern).map_err(|e| {
-        SshError::Config(format!("bad regex in guard '{}': {e}", p.name))
-    })?;
-    Ok(CompiledPattern { name: p.name.clone(), re })
+    let re = Regex::new(&p.pattern)
+        .map_err(|e| SshError::Config(format!("bad regex in guard '{}': {e}", p.name)))?;
+    Ok(CompiledPattern {
+        name: p.name.clone(),
+        re,
+    })
 }
 
 /// Commands that always write/mutate filesystem state. Matched on the first
 /// token of each pipeline segment, case-insensitive. Read-only mode blocks
 /// any segment whose first token is in this set.
 const ALWAYS_WRITE: &[&str] = &[
-    "rm", "mv", "cp", "mkdir", "rmdir", "chmod", "chown", "ln", "touch",
-    "dd", "mkfs", "shred", "fallocate", "truncate", "tee", "sponge",
-    "reboot", "shutdown", "halt", "poweroff",
+    "rm",
+    "mv",
+    "cp",
+    "mkdir",
+    "rmdir",
+    "chmod",
+    "chown",
+    "ln",
+    "touch",
+    "dd",
+    "mkfs",
+    "shred",
+    "fallocate",
+    "truncate",
+    "tee",
+    "sponge",
+    "reboot",
+    "shutdown",
+    "halt",
+    "poweroff",
 ];
 
 /// Commands whose write nature depends on the second token. Matched as
 /// `(first, second)` after lowercasing.
 const SUBCOMMAND_WRITE: &[(&str, &str)] = &[
-    ("systemctl", "restart"), ("systemctl", "stop"), ("systemctl", "start"),
-    ("systemctl", "enable"), ("systemctl", "disable"), ("systemctl", "mask"),
-    ("systemctl", "unmask"), ("systemctl", "reload"),
-    ("service", "restart"), ("service", "stop"), ("service", "start"),
-    ("docker", "run"), ("docker", "rm"), ("docker", "rmi"),
-    ("docker", "stop"), ("docker", "start"), ("docker", "restart"),
-    ("docker", "kill"), ("docker", "exec"), ("docker", "compose"),
-    ("docker", "build"), ("docker", "pull"), ("docker", "push"),
-    ("apt", "install"), ("apt", "upgrade"), ("apt", "remove"), ("apt", "purge"),
+    ("systemctl", "restart"),
+    ("systemctl", "stop"),
+    ("systemctl", "start"),
+    ("systemctl", "enable"),
+    ("systemctl", "disable"),
+    ("systemctl", "mask"),
+    ("systemctl", "unmask"),
+    ("systemctl", "reload"),
+    ("service", "restart"),
+    ("service", "stop"),
+    ("service", "start"),
+    ("docker", "run"),
+    ("docker", "rm"),
+    ("docker", "rmi"),
+    ("docker", "stop"),
+    ("docker", "start"),
+    ("docker", "restart"),
+    ("docker", "kill"),
+    ("docker", "exec"),
+    ("docker", "compose"),
+    ("docker", "build"),
+    ("docker", "pull"),
+    ("docker", "push"),
+    ("apt", "install"),
+    ("apt", "upgrade"),
+    ("apt", "remove"),
+    ("apt", "purge"),
     ("apt", "autoremove"),
-    ("apt-get", "install"), ("apt-get", "upgrade"), ("apt-get", "remove"),
+    ("apt-get", "install"),
+    ("apt-get", "upgrade"),
+    ("apt-get", "remove"),
     ("apt-get", "purge"),
-    ("yum", "install"), ("yum", "remove"), ("yum", "update"),
-    ("dnf", "install"), ("dnf", "remove"), ("dnf", "update"),
-    ("pacman", "-S"), ("pacman", "-R"), ("pacman", "-U"), ("pacman", "-Syu"),
-    ("pip", "install"), ("pip", "uninstall"),
-    ("pip3", "install"), ("pip3", "uninstall"),
-    ("npm", "install"), ("npm", "i"), ("npm", "uninstall"),
-    ("yarn", "add"), ("yarn", "remove"),
-    ("pnpm", "add"), ("pnpm", "remove"),
-    ("git", "push"), ("git", "reset"), ("git", "checkout"),
-    ("git", "rebase"), ("git", "merge"), ("git", "pull"),
-    ("git", "commit"), ("git", "clean"),
+    ("yum", "install"),
+    ("yum", "remove"),
+    ("yum", "update"),
+    ("dnf", "install"),
+    ("dnf", "remove"),
+    ("dnf", "update"),
+    ("pacman", "-S"),
+    ("pacman", "-R"),
+    ("pacman", "-U"),
+    ("pacman", "-Syu"),
+    ("pip", "install"),
+    ("pip", "uninstall"),
+    ("pip3", "install"),
+    ("pip3", "uninstall"),
+    ("npm", "install"),
+    ("npm", "i"),
+    ("npm", "uninstall"),
+    ("yarn", "add"),
+    ("yarn", "remove"),
+    ("pnpm", "add"),
+    ("pnpm", "remove"),
+    ("git", "push"),
+    ("git", "reset"),
+    ("git", "checkout"),
+    ("git", "rebase"),
+    ("git", "merge"),
+    ("git", "pull"),
+    ("git", "commit"),
+    ("git", "clean"),
 ];
 
 /// Tokenized read-only check. Splits `cmd` into pipeline segments
@@ -351,11 +416,12 @@ fn parse_segments(cmd: &str) -> Vec<Segment> {
         }
         *tokens_seen += 1;
     };
-    let push_segment = |out: &mut Vec<Segment>, cur: &mut Segment, buf: &mut String, tokens_seen: &mut usize| {
-        push_token(buf, cur, tokens_seen);
-        out.push(std::mem::take(cur));
-        *tokens_seen = 0;
-    };
+    let push_segment =
+        |out: &mut Vec<Segment>, cur: &mut Segment, buf: &mut String, tokens_seen: &mut usize| {
+            push_token(buf, cur, tokens_seen);
+            out.push(std::mem::take(cur));
+            *tokens_seen = 0;
+        };
 
     while let Some(c) = iter.next() {
         if in_single {
@@ -456,7 +522,10 @@ mod tests {
             "rm -fr /",
             "rm -Rf /",
         ] {
-            assert!(matches!(g.check(cmd), GuardCheck::Deny { .. }), "should deny: {cmd:?}");
+            assert!(
+                matches!(g.check(cmd), GuardCheck::Deny { .. }),
+                "should deny: {cmd:?}"
+            );
         }
         for cmd in [
             "rm ./tmp",
@@ -469,7 +538,10 @@ mod tests {
             "rm -rf /tmp/bench-mkdir",
             "rm -rf /home/user/project/target",
         ] {
-            assert!(!matches!(g.check(cmd), GuardCheck::Deny { .. }), "should allow: {cmd:?}");
+            assert!(
+                !matches!(g.check(cmd), GuardCheck::Deny { .. }),
+                "should allow: {cmd:?}"
+            );
         }
         // Root dir with trailing slash still denied.
         assert!(matches!(g.check("rm -rf /etc/"), GuardCheck::Deny { .. }));
@@ -486,7 +558,10 @@ mod tests {
 
     #[test]
     fn read_only_blocks_write() {
-        let gc = Guards { read_only: true, ..Default::default() };
+        let gc = Guards {
+            read_only: true,
+            ..Default::default()
+        };
         let g = CompiledGuards::compile(&gc).unwrap();
         assert!(matches!(g.check("rm /tmp/foo"), GuardCheck::Deny { .. }));
         assert!(matches!(g.check("ls /tmp"), GuardCheck::Allow));
@@ -496,7 +571,10 @@ mod tests {
     fn read_only_no_substring_false_positives() {
         // The previous `lc.contains("rm ")` substring check tripped on quoted echos.
         // Tokenization should accept these on a read_only host.
-        let gc = Guards { read_only: true, ..Default::default() };
+        let gc = Guards {
+            read_only: true,
+            ..Default::default()
+        };
         let g = CompiledGuards::compile(&gc).unwrap();
         for cmd in [
             "echo 'rm '",
@@ -505,34 +583,60 @@ mod tests {
             "ls -la 'has > sign'",
             "cat /tmp/firmware.bin",
         ] {
-            assert!(!matches!(g.check(cmd), GuardCheck::Deny { .. }), "should allow: {cmd:?}");
+            assert!(
+                !matches!(g.check(cmd), GuardCheck::Deny { .. }),
+                "should allow: {cmd:?}"
+            );
         }
     }
 
     #[test]
     fn read_only_blocks_no_space_redirects() {
         // `cmd>file` (no spaces) bypassed the old substring check.
-        let gc = Guards { read_only: true, ..Default::default() };
+        let gc = Guards {
+            read_only: true,
+            ..Default::default()
+        };
         let g = CompiledGuards::compile(&gc).unwrap();
-        for cmd in ["echo hi>file", "echo hi >file", "echo hi> file", "tail -f log >> out"] {
-            assert!(matches!(g.check(cmd), GuardCheck::Deny { .. }), "should deny: {cmd:?}");
+        for cmd in [
+            "echo hi>file",
+            "echo hi >file",
+            "echo hi> file",
+            "tail -f log >> out",
+        ] {
+            assert!(
+                matches!(g.check(cmd), GuardCheck::Deny { .. }),
+                "should deny: {cmd:?}"
+            );
         }
     }
 
     #[test]
     fn read_only_pipeline_segments() {
-        let gc = Guards { read_only: true, ..Default::default() };
+        let gc = Guards {
+            read_only: true,
+            ..Default::default()
+        };
         let g = CompiledGuards::compile(&gc).unwrap();
         // Read in first segment, write in second — still writes overall.
-        assert!(matches!(g.check("ls /tmp | tee out"), GuardCheck::Deny { .. }));
+        assert!(matches!(
+            g.check("ls /tmp | tee out"),
+            GuardCheck::Deny { .. }
+        ));
         // All-read pipeline.
-        assert!(!matches!(g.check("cat /etc/hostname | head -c 16"), GuardCheck::Deny { .. }));
+        assert!(!matches!(
+            g.check("cat /etc/hostname | head -c 16"),
+            GuardCheck::Deny { .. }
+        ));
     }
 
     #[test]
     fn dd_disk_blocked() {
         let g = CompiledGuards::compile(&Guards::default()).unwrap();
-        assert!(matches!(g.check("dd if=/dev/zero of=/dev/sda"), GuardCheck::Deny { .. }));
+        assert!(matches!(
+            g.check("dd if=/dev/zero of=/dev/sda"),
+            GuardCheck::Deny { .. }
+        ));
     }
 
     #[test]

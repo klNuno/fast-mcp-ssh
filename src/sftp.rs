@@ -89,9 +89,14 @@ pub async fn upload(session: &Session, local: &Path, remote: &str) -> Result<Sft
         let _ = sftp.remove_file(&partial).await;
         return Err(e);
     }
-    sftp.rename(&partial, remote).await.map_err(SshError::from)?;
+    sftp.rename(&partial, remote)
+        .await
+        .map_err(SshError::from)?;
     session.touch();
-    Ok(SftpResult { bytes: total, duration_ms: start.elapsed().as_millis() })
+    Ok(SftpResult {
+        bytes: total,
+        duration_ms: start.elapsed().as_millis(),
+    })
 }
 
 /// Download `remote`. With `local`, streams (or stripes) to disk and returns
@@ -114,11 +119,7 @@ pub async fn download(
     // fstat on the already-open handle: one round-trip buys the size for
     // the too-large-for-inline early exit, exact preallocation, and the
     // striped-download split.
-    let size = remote_file
-        .metadata()
-        .await
-        .ok()
-        .and_then(|m| m.size);
+    let size = remote_file.metadata().await.ok().and_then(|m| m.size);
     session.touch();
 
     if let Some(path) = local {
@@ -133,7 +134,10 @@ pub async fn download(
                 let total = download_striped(&sftp, remote, path, sz).await?;
                 session.touch();
                 return Ok((
-                    SftpResult { bytes: total, duration_ms: start.elapsed().as_millis() },
+                    SftpResult {
+                        bytes: total,
+                        duration_ms: start.elapsed().as_millis(),
+                    },
                     None,
                 ));
             }
@@ -151,7 +155,10 @@ pub async fn download(
         }
         local_file.shutdown().await?;
         return Ok((
-            SftpResult { bytes: total, duration_ms: start.elapsed().as_millis() },
+            SftpResult {
+                bytes: total,
+                duration_ms: start.elapsed().as_millis(),
+            },
             None,
         ));
     }
@@ -161,7 +168,10 @@ pub async fn download(
     if let Some(sz) = size {
         if sz as usize > inline_max {
             return Ok((
-                SftpResult { bytes: sz as usize, duration_ms: start.elapsed().as_millis() },
+                SftpResult {
+                    bytes: sz as usize,
+                    duration_ms: start.elapsed().as_millis(),
+                },
                 None,
             ));
         }
@@ -184,12 +194,18 @@ pub async fn download(
     let total = content.len();
     if total > inline_max {
         return Ok((
-            SftpResult { bytes: total, duration_ms: start.elapsed().as_millis() },
+            SftpResult {
+                bytes: total,
+                duration_ms: start.elapsed().as_millis(),
+            },
             None,
         ));
     }
     Ok((
-        SftpResult { bytes: total, duration_ms: start.elapsed().as_millis() },
+        SftpResult {
+            bytes: total,
+            duration_ms: start.elapsed().as_millis(),
+        },
         Some(content),
     ))
 }
@@ -230,7 +246,10 @@ async fn download_striped(
                 .await
                 .map_err(SshError::from)?;
             rf.seek(std::io::SeekFrom::Start(offset)).await?;
-            let mut lf = tokio::fs::OpenOptions::new().write(true).open(&path).await?;
+            let mut lf = tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .await?;
             lf.seek(std::io::SeekFrom::Start(offset)).await?;
             let mut buf = vec![0u8; TRANSFER_CHUNK];
             let mut left = len as usize;
@@ -281,7 +300,10 @@ pub async fn write_inline(
     file.shutdown().await?;
     drop(file);
     session.touch();
-    Ok(SftpResult { bytes: content.len(), duration_ms: start.elapsed().as_millis() })
+    Ok(SftpResult {
+        bytes: content.len(),
+        duration_ms: start.elapsed().as_millis(),
+    })
 }
 
 pub async fn mkdir(session: &Session, path: &str, parents: bool) -> Result<()> {
@@ -300,9 +322,7 @@ pub async fn mkdir(session: &Session, path: &str, parents: bool) -> Result<()> {
             // round-trips per component in the common "parents exist" case
             // (SFTPv3 has no distinct exists code — OpenSSH returns FAILURE).
             let res = with_timeout("mkdir", 30, async {
-                sftp.create_dir(acc.clone())
-                    .await
-                    .map_err(SshError::from)
+                sftp.create_dir(acc.clone()).await.map_err(SshError::from)
             })
             .await;
             if let Err(e) = res {
@@ -365,9 +385,7 @@ async fn remove_dir_recursive(session: &Session, path: &str) -> Result<u64> {
     while let Some((dir, visited)) = stack.pop() {
         if visited {
             with_timeout("rmdir", 30, async {
-                sftp.remove_dir(dir.clone())
-                    .await
-                    .map_err(SshError::from)
+                sftp.remove_dir(dir.clone()).await.map_err(SshError::from)
             })
             .await?;
             count += 1;
@@ -375,9 +393,7 @@ async fn remove_dir_recursive(session: &Session, path: &str) -> Result<u64> {
         }
         stack.push((dir.clone(), true));
         let entries = with_timeout("readdir", 30, async {
-            sftp.read_dir(dir.clone())
-                .await
-                .map_err(SshError::from)
+            sftp.read_dir(dir.clone()).await.map_err(SshError::from)
         })
         .await?;
         // Deletes are independent request/response pairs on the shared SFTP

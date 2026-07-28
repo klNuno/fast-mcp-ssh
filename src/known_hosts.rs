@@ -100,7 +100,10 @@ impl KnownHostsStore {
 
     pub async fn add(&self, host: &str, addr: &str, port: u16, fingerprint: &str) -> Result<()> {
         {
-            let mut guard = self.inner.write().map_err(|_| SshError::Other("known_hosts lock poisoned".into()))?;
+            let mut guard = self
+                .inner
+                .write()
+                .map_err(|_| SshError::Other("known_hosts lock poisoned".into()))?;
             let endpoint = Self::endpoint_key(addr, port);
             guard.host.insert(
                 endpoint,
