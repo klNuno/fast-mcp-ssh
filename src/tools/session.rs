@@ -1,0 +1,166 @@
+//! Session-lifecycle tools: `disconnect`, `disconnect_all`, `reload`.
+
+use std::sync::Arc;
+
+use rmcp::{
+    ErrorData as McpError, handler::server::wrapper::Parameters, model::*, tool, tool_router,
+};
+
+use crate::config::Config;
+use crate::errors::SshError;
+use crate::guards::GuardCache;
+use crate::output::Toon;
+use crate::server::SshServer;
+use crate::tools::{HostOnlyArgs, text};
+
+#[tool_router(router = session_router, vis = "pub")]
+impl SshServer {
+    #[tool(
+        description = "Close persistent SSH session and drop cached PTY. Reopens on next call. Use to free server slot or after credential changes. Not for Ctrl-C — use interrupt.",
+        annotations(
+            title = "Disconnect",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn disconnect(
+        &self,
+        Parameters(args): Parameters<HostOnlyArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let host_name = self.resolve_host(args.host)?;
+        // Take the cached session out of the pool first so any new tool call
+        // reconnects on its own. Then send a real SSH disconnect on the handle
+        // so the server tears down channels even if another in-flight tool
+        // still holds an Arc<Session> clone — without this, the TCP+SSH stays
+        // alive for that other call.
+        let removed = self.pool.take_session(&host_name);
+        if let Some(sess) = removed {
+            tracing::info!(host = %host_name, "closing session");
+            let _ = sess
+                .handle
+                .disconnect(russh::Disconnect::ByApplication, "user requested", "")
+                .await;
+        }
+        self.pool.forget_password(&host_name);
+        self.audit.write(
+            &host_name,
+            "disconnect",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let mut t = Toon::new();
+        t.field("host", &host_name).field("status", "closed");
+        Ok(text(t.into_string()))
+    }
+
+    #[tool(
+        description = "Re-read the config file from disk. Validates, swaps guards atomically, drops sessions for hosts that were removed or whose connection params changed. Returns the diff.",
+        annotations(
+            title = "Reload",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn reload(&self) -> Result<CallToolResult, McpError> {
+        // Config parse (fs + TOML + ~/.ssh/config import) and guard regex
+        // compilation are CPU/disk work; offload so in-flight calls on the
+        // single-threaded runtime don't stall behind a reload.
+        let path = self.config_path.clone();
+        let loaded = tokio::task::spawn_blocking(move || {
+            let cfg = Config::load(&path)?;
+            let guards = GuardCache::build(&cfg)?;
+            Ok::<_, SshError>((cfg, guards))
+        })
+        .await
+        .map_err(|e| SshError::Other(format!("reload task: {e}")))
+        .and_then(|r| r);
+        let (new_cfg, new_guards) = match loaded {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = e.to_string();
+                self.audit.write(
+                    "*",
+                    "reload",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(msg.clone()),
+                );
+                return Err(e.into_mcp());
+            }
+        };
+        let old_cfg = self.cfg();
+        // Swap config + guards atomically. After this, the SessionPool sees
+        // the new config too (shared ArcSwap).
+        self.cfg_swap.store(Arc::new(new_cfg));
+        self.guards_swap.store(Arc::new(new_guards));
+        let dropped = self.pool.prune_against(&old_cfg).await;
+
+        let new = self.cfg();
+        self.audit
+            .write("*", "reload", None, None, None, None, None, None, None);
+        let mut t = Toon::new();
+        t.field("hosts_before", old_cfg.hosts.len());
+        t.field("hosts_after", new.hosts.len());
+        t.field("sessions_dropped", dropped.len() as u64);
+        if !dropped.is_empty() {
+            t.field("dropped", dropped.join(","));
+        }
+        Ok(text(t.into_string()))
+    }
+
+    #[tool(
+        description = "Close all live SSH sessions. Reopens on next call. Use to free server slots or after credential changes.",
+        annotations(
+            title = "DisconnectAll",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn disconnect_all(&self) -> Result<CallToolResult, McpError> {
+        let names = self.pool.list_active();
+        let mut closed = 0u64;
+        for name in &names {
+            if let Some(sess) = self.pool.take_session(name) {
+                let _ = sess
+                    .handle
+                    .disconnect(russh::Disconnect::ByApplication, "user requested", "")
+                    .await;
+                self.pool.forget_password(name);
+                closed += 1;
+            }
+        }
+        self.audit.write(
+            "*",
+            "disconnect_all",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let mut t = Toon::new();
+        t.field("closed", closed);
+        if !names.is_empty() {
+            let joined = names.join(",");
+            t.field("hosts", joined);
+        }
+        Ok(text(t.into_string()))
+    }
+}

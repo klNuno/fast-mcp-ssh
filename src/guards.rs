@@ -436,11 +436,11 @@ fn parse_segments(cmd: &str) -> Vec<Segment> {
             if c == '"' {
                 in_double = false;
             } else if c == '\\' {
-                if let Some(&next) = iter.peek() {
-                    if matches!(next, '"' | '\\' | '$' | '`' | '\n') {
-                        buf.push(iter.next().unwrap());
-                        continue;
-                    }
+                if let Some(&next) = iter.peek()
+                    && matches!(next, '"' | '\\' | '$' | '`' | '\n')
+                {
+                    buf.push(iter.next().unwrap());
+                    continue;
                 }
                 buf.push(c);
             } else {

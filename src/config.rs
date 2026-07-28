@@ -330,12 +330,12 @@ impl Config {
     /// * `auth = "password"` is fine — password is supplied per-call
     /// * `auth = "agent"` is fine — no key path needed
     pub fn validate(&self) -> Result<()> {
-        if let Some(dh) = &self.defaults.default_host {
-            if !self.hosts.contains_key(dh) {
-                return Err(SshError::Config(format!(
-                    "default_host '{dh}' is not declared in [host.*]"
-                )));
-            }
+        if let Some(dh) = &self.defaults.default_host
+            && !self.hosts.contains_key(dh)
+        {
+            return Err(SshError::Config(format!(
+                "default_host '{dh}' is not declared in [host.*]"
+            )));
         }
         for (name, h) in &self.hosts {
             if matches!(h.auth, AuthMethod::Key) && h.all_keys().is_empty() {
@@ -394,27 +394,26 @@ impl Config {
 
     fn expand_paths(&mut self) {
         for h in self.hosts.values_mut() {
-            if let Some(k) = &h.key {
-                if let Some(s) = k.to_str() {
-                    if let Ok(expanded) = shellexpand::full(s) {
-                        h.key = Some(PathBuf::from(expanded.into_owned()));
-                    }
-                }
+            if let Some(k) = &h.key
+                && let Some(s) = k.to_str()
+                && let Ok(expanded) = shellexpand::full(s)
+            {
+                h.key = Some(PathBuf::from(expanded.into_owned()));
             }
             if let Some(extra) = h.keys.as_mut() {
                 for k in extra.iter_mut() {
-                    if let Some(s) = k.to_str() {
-                        if let Ok(expanded) = shellexpand::full(s) {
-                            *k = PathBuf::from(expanded.into_owned());
-                        }
+                    if let Some(s) = k.to_str()
+                        && let Ok(expanded) = shellexpand::full(s)
+                    {
+                        *k = PathBuf::from(expanded.into_owned());
                     }
                 }
             }
         }
-        if let Some(s) = self.defaults.audit_log_path.to_str() {
-            if let Ok(expanded) = shellexpand::full(s) {
-                self.defaults.audit_log_path = PathBuf::from(expanded.into_owned());
-            }
+        if let Some(s) = self.defaults.audit_log_path.to_str()
+            && let Ok(expanded) = shellexpand::full(s)
+        {
+            self.defaults.audit_log_path = PathBuf::from(expanded.into_owned());
         }
     }
 

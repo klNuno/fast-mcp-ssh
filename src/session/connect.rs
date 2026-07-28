@@ -201,10 +201,10 @@ async fn authenticate_key(
             host.addr
         )));
     }
-    if let Some(pref) = preferred_key {
-        if let Some(idx) = key_paths.iter().position(|p| p == pref) {
-            key_paths.swap(0, idx);
-        }
+    if let Some(pref) = preferred_key
+        && let Some(idx) = key_paths.iter().position(|p| p == pref)
+    {
+        key_paths.swap(0, idx);
     }
     let hash = session
         .best_supported_rsa_hash()

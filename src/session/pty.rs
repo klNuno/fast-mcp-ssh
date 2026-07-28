@@ -268,10 +268,10 @@ fn into_string_fast(bytes: Vec<u8>) -> String {
 }
 
 fn strip_trailing_cr(s: &[u8]) -> &[u8] {
-    if let Some(last) = s.last() {
-        if *last == b'\r' {
-            return &s[..s.len() - 1];
-        }
+    if let Some(last) = s.last()
+        && *last == b'\r'
+    {
+        return &s[..s.len() - 1];
     }
     s
 }

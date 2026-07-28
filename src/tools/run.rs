@@ -1,0 +1,559 @@
+//! Command execution tools: `exec`, `exec_batch`, `sh`, `interrupt`.
+
+use std::sync::Arc;
+
+use rmcp::{
+    ErrorData as McpError, RoleServer, handler::server::wrapper::Parameters, model::*, schemars,
+    service::RequestContext, tool, tool_router,
+};
+use serde::Deserialize;
+
+use crate::errors::SshError;
+use crate::guards::GuardCheck;
+use crate::output::{Toon, truncate_with_hint};
+use crate::server::{SshServer, elicit_confirmation};
+use crate::session::{exec, pty};
+use crate::tools::{
+    HostOnlyArgs, MAX_BATCH_CMDS, batch_preview, clamp_timeout, text, validate_cmd,
+};
+
+// Intentionally no `Debug` derive: the `password` field would otherwise leak
+// in clear text if anyone added `tracing::debug!(?args)` later.
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ExecArgs {
+    /// Host alias. Omit if a default_host is configured.
+    #[serde(default)]
+    pub host: Option<String>,
+    /// Command for the remote login shell. Pipes/redirects supported.
+    pub cmd: String,
+    /// Per-call timeout. Default 60s. Format: "30s", "5m", "2h", "500ms" or seconds as integer.
+    #[serde(default)]
+    pub timeout: Option<u64>,
+    /// Password for password-auth hosts. Cached in memory after first call.
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Set true to bypass a confirm-prompt guard after seeing it once.
+    #[serde(default)]
+    pub confirm: Option<bool>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ExecBatchArgs {
+    /// Host alias. Omit if a default_host is configured.
+    #[serde(default)]
+    pub host: Option<String>,
+    /// Commands run in parallel on fresh exec channels (capped by max_channels_per_host).
+    pub cmds: Vec<String>,
+    /// Per-call timeout applied to each command. Default 60s.
+    #[serde(default)]
+    pub timeout: Option<u64>,
+    /// Password for password-auth hosts. Cached after first call.
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Set true to bypass confirm-prompt guards.
+    #[serde(default)]
+    pub confirm: Option<bool>,
+    /// If true, include full preview (200 chars on errors, 40 on success). Default false: errors-only preview.
+    #[serde(default)]
+    pub verbose: Option<bool>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ShArgs {
+    /// Host alias. Omit if a default_host is configured.
+    #[serde(default)]
+    pub host: Option<String>,
+    /// Command run inside the persistent PTY. cd/export/source persist across calls.
+    pub cmd: String,
+    /// Per-call timeout. Default 60s.
+    #[serde(default)]
+    pub timeout: Option<u64>,
+    /// Password for password-auth hosts. Cached after first call.
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Set true to bypass confirm-prompt guards.
+    #[serde(default)]
+    pub confirm: Option<bool>,
+    /// PTY width. Default 200. Honored on first sh per host.
+    #[serde(default)]
+    pub cols: Option<u32>,
+    /// PTY height. Default 50. Honored on first sh per host.
+    #[serde(default)]
+    pub rows: Option<u32>,
+    /// Optional shell name for an isolated persistent PTY. Each unique name
+    /// gets its own working directory and environment. Omit to use the
+    /// default shell.
+    #[serde(default)]
+    pub shell: Option<String>,
+}
+
+#[tool_router(router = run_router, vis = "pub")]
+impl SshServer {
+    #[tool(
+        description = "Run one-shot command, stateless. Use for independent or parallelizable commands. Not for cd/export/source — use sh.",
+        annotations(
+            title = "Exec",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn exec(
+        &self,
+        Parameters(args): Parameters<ExecArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        validate_cmd(&args.cmd)?;
+        let timeout = clamp_timeout(args.timeout);
+        let host_name = self.resolve_host(args.host)?;
+        let password = args.password.map(zeroize::Zeroizing::new);
+
+        if let Err(e) = self
+            .run_guards(&host_name, &args.cmd, args.confirm.unwrap_or(false), &ctx)
+            .await
+        {
+            let err_msg = e.to_string();
+            self.audit.write(
+                &host_name,
+                "exec",
+                Some(&args.cmd),
+                None,
+                None,
+                None,
+                None,
+                Some(&err_msg),
+                Some(err_msg.clone()),
+            );
+            return Err(e.into_mcp());
+        }
+        let session = self
+            .pool
+            .get_or_connect(&host_name, password.clone())
+            .await
+            .map_err(|e| {
+                self.audit.write(
+                    &host_name,
+                    "exec",
+                    Some(&args.cmd),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(e.to_string()),
+                );
+                e.into_mcp()
+            })?;
+        if let Some(pw) = password {
+            self.pool.cache_password(&host_name, pw);
+        }
+
+        let max_capture = self.cfg().defaults.max_capture_bytes;
+        let result = exec::exec(&session, &args.cmd, timeout, max_capture)
+            .await
+            .map_err(|e| {
+                self.audit.write(
+                    &host_name,
+                    "exec",
+                    Some(&args.cmd),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(e.to_string()),
+                );
+                e.into_mcp()
+            })?;
+
+        self.audit.write(
+            &host_name,
+            "exec",
+            Some(&args.cmd),
+            Some(result.exit_code),
+            Some(result.duration_ms),
+            None,
+            Some(result.stdout_bytes + result.stderr_bytes),
+            None,
+            None,
+        );
+        Ok(text(format_exec(
+            &result,
+            self.cfg().defaults.truncate_bytes,
+        )))
+    }
+
+    #[tool(
+        description = "Run N parallel commands on one host in one round-trip. Use for independent fan-out (probes, status checks). Not for sequential pipelines — use sh.",
+        annotations(
+            title = "ExecBatch",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn exec_batch(
+        &self,
+        Parameters(args): Parameters<ExecBatchArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if args.cmds.is_empty() {
+            return Err(
+                SshError::Config("cmds must contain at least one command".into()).into_mcp(),
+            );
+        }
+        if args.cmds.len() > MAX_BATCH_CMDS {
+            return Err(SshError::Config(format!(
+                "too many commands: {} (max {})",
+                args.cmds.len(),
+                MAX_BATCH_CMDS
+            ))
+            .into_mcp());
+        }
+        for cmd in &args.cmds {
+            validate_cmd(cmd)?;
+        }
+        let timeout = clamp_timeout(args.timeout);
+        let host_name = self.resolve_host(args.host)?;
+        let bypass = args.confirm.unwrap_or(false);
+        let verbose = args.verbose.unwrap_or(false);
+        let password = args.password.map(zeroize::Zeroizing::new);
+
+        // Guard the whole batch up front, deduplicating confirm elicitations
+        // by pattern name: one user confirmation covers every command in the
+        // batch matching the same pattern, instead of K serial prompts.
+        let guards = self.guards().for_host(&host_name);
+        let mut confirmed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for cmd in &args.cmds {
+            let check = guards.check(cmd);
+            let err = match check {
+                GuardCheck::Allow => None,
+                GuardCheck::Deny {
+                    pattern_name,
+                    pattern,
+                } => Some(SshError::BlockedByGuard {
+                    name: pattern_name,
+                    pattern,
+                }),
+                GuardCheck::Confirm { pattern_name } => {
+                    if bypass || confirmed.contains(&pattern_name) {
+                        None
+                    } else {
+                        let prompt = format!(
+                            "fast-mcp-ssh wants to run a sensitive command on '{host_name}' (matches '{pattern_name}'):\n\n{cmd}\n\nConfirming covers every command in this batch matching '{pattern_name}'. Reply 'yes' to proceed."
+                        );
+                        match elicit_confirmation(&ctx, &prompt).await {
+                            Ok(true) => {
+                                confirmed.insert(pattern_name);
+                                None
+                            }
+                            Ok(false) => Some(SshError::ConfirmationDenied),
+                            Err(e) => {
+                                tracing::warn!(
+                                    ?e,
+                                    "elicitation failed; defaulting to deny (fail-closed)"
+                                );
+                                Some(SshError::ConfirmationDenied)
+                            }
+                        }
+                    }
+                }
+            };
+            if let Some(e) = err {
+                let err_msg = e.to_string();
+                self.audit.write(
+                    &host_name,
+                    "exec_batch",
+                    Some(cmd),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&err_msg),
+                    Some(err_msg.clone()),
+                );
+                return Err(e.into_mcp());
+            }
+        }
+
+        let session = self
+            .pool
+            .get_or_connect(&host_name, password.clone())
+            .await
+            .map_err(|e| e.into_mcp())?;
+        if let Some(pw) = password {
+            self.pool.cache_password(&host_name, pw);
+        }
+
+        let max_capture = self.cfg().defaults.max_capture_bytes;
+        // JoinSet aborts in-flight tasks when dropped, so a request cancelled
+        // by the client doesn't leave commands running on the remote host.
+        // Track cmd-by-task-id so a panicked task still gets audited against
+        // the right command.
+        let mut set = tokio::task::JoinSet::new();
+        let mut by_id: std::collections::HashMap<tokio::task::Id, String> =
+            std::collections::HashMap::with_capacity(args.cmds.len());
+        for cmd in args.cmds.into_iter() {
+            let s = Arc::clone(&session);
+            let cmd_for_task = cmd.clone();
+            let abort =
+                set.spawn(async move { exec::exec(&s, &cmd_for_task, timeout, max_capture).await });
+            by_id.insert(abort.id(), cmd);
+        }
+
+        let mut t = Toon::new();
+        t.field("host", &host_name);
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        while let Some(joined) = set.join_next_with_id().await {
+            match joined {
+                Ok((id, Ok(r))) => {
+                    let cmd = by_id.remove(&id).unwrap_or_default();
+                    let preview = batch_preview(&r, verbose);
+                    self.audit.write(
+                        &host_name,
+                        "exec_batch",
+                        Some(&cmd),
+                        Some(r.exit_code),
+                        Some(r.duration_ms),
+                        None,
+                        Some(r.stdout_bytes),
+                        None,
+                        None,
+                    );
+                    rows.push(vec![
+                        cmd,
+                        r.exit_code.to_string(),
+                        r.duration_ms.to_string(),
+                        r.stdout_bytes.to_string(),
+                        preview,
+                    ]);
+                }
+                Ok((id, Err(e))) => {
+                    let cmd = by_id.remove(&id).unwrap_or_default();
+                    let err_msg = e.to_string();
+                    self.audit.write(
+                        &host_name,
+                        "exec_batch",
+                        Some(&cmd),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(err_msg.clone()),
+                    );
+                    rows.push(vec![cmd, "-1".into(), "0".into(), "0".into(), err_msg]);
+                }
+                Err(e) => {
+                    let id = e.id();
+                    let cmd = by_id.remove(&id).unwrap_or_else(|| "-".into());
+                    let err_msg = e.to_string();
+                    self.audit.write(
+                        &host_name,
+                        "exec_batch",
+                        Some(&cmd),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(err_msg.clone()),
+                    );
+                    rows.push(vec![cmd, "-1".into(), "0".into(), "0".into(), err_msg]);
+                }
+            }
+        }
+        t.table_strs("results", &["cmd", "exit", "ms", "bytes", "preview"], &rows);
+        Ok(text(t.into_string()))
+    }
+
+    #[tool(
+        description = "Stateful PTY shell. Use for cd/export/activate venv/sequential pipelines. Not for parallel work — use exec_batch.",
+        annotations(
+            title = "Sh",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn sh(
+        &self,
+        Parameters(args): Parameters<ShArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        validate_cmd(&args.cmd)?;
+        let timeout = clamp_timeout(args.timeout);
+        let host_name = self.resolve_host(args.host)?;
+        let password = args.password.map(zeroize::Zeroizing::new);
+
+        if let Err(e) = self
+            .run_guards(&host_name, &args.cmd, args.confirm.unwrap_or(false), &ctx)
+            .await
+        {
+            let err_msg = e.to_string();
+            self.audit.write(
+                &host_name,
+                "sh",
+                Some(&args.cmd),
+                None,
+                None,
+                None,
+                None,
+                Some(&err_msg),
+                Some(err_msg.clone()),
+            );
+            return Err(e.into_mcp());
+        }
+
+        let session = self
+            .pool
+            .get_or_connect(&host_name, password.clone())
+            .await
+            .map_err(|e| e.into_mcp())?;
+        if let Some(pw) = password {
+            self.pool.cache_password(&host_name, pw);
+        }
+
+        let max_capture = self.cfg().defaults.max_capture_bytes;
+        let opts = pty::PtyOpts {
+            cols: args.cols.unwrap_or(pty::DEFAULT_PTY_COLS),
+            rows: args.rows.unwrap_or(pty::DEFAULT_PTY_ROWS),
+            max_capture,
+        };
+        let pty_state = self
+            .ensure_pty(&session, opts, args.shell.as_deref())
+            .await
+            .map_err(|e| e.into_mcp())?;
+        let (output, exit_code) = pty_state
+            .run(&args.cmd, timeout, max_capture)
+            .await
+            .map_err(|e| e.into_mcp())?;
+        session.touch();
+
+        let bytes = output.len();
+        self.audit.write(
+            &host_name,
+            "sh",
+            Some(&args.cmd),
+            Some(exit_code),
+            None,
+            None,
+            Some(bytes),
+            None,
+            None,
+        );
+
+        let mut t = Toon::new();
+        t.field("host", &host_name);
+        if let Some(s) = &args.shell {
+            t.field("shell", s.as_str());
+        }
+        t.field("exit_code", exit_code as i64);
+        t.field("bytes", bytes);
+        let (display, _) = truncate_with_hint(&output, self.cfg().defaults.truncate_bytes);
+        t.block("stdout", &display);
+        if exit_code != 0 {
+            t.hint("non-zero exit. cd preserved across sh calls.");
+        }
+        Ok(text(t.into_string()))
+    }
+
+    #[tool(
+        description = "Send Ctrl-C (SIGINT) to the PTY foreground command. Use to stop a runaway sh command. Keeps session and shell state. Not for full disconnect — use disconnect.",
+        annotations(
+            title = "Interrupt",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn interrupt(
+        &self,
+        Parameters(args): Parameters<HostOnlyArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let host_name = self.resolve_host(args.host)?;
+        let session = match self.pool.get(&host_name) {
+            Some(s) => s,
+            None => {
+                let mut t = Toon::new();
+                t.field("host", &host_name)
+                    .field("status", "no active session");
+                return Ok(text(t.into_string()));
+            }
+        };
+        let mut pty_states: Vec<Arc<pty::PtyState>> = Vec::new();
+        if let Some(p) = session.pty.lock().await.as_ref() {
+            pty_states.push(Arc::clone(p));
+        }
+        for p in session.named_ptys.lock().await.values() {
+            pty_states.push(Arc::clone(p));
+        }
+        let mut t = Toon::new();
+        t.field("host", &host_name);
+        let mut pty_acted = false;
+        for p in &pty_states {
+            p.interrupt().await.map_err(|e| e.into_mcp())?;
+            pty_acted = true;
+        }
+        let exec_aborted = session.cancel_all_execs().await;
+        self.audit.write(
+            &host_name,
+            "interrupt",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        t.field("pty_sigint", pty_acted);
+        t.field("exec_aborted", exec_aborted as u64);
+        if !pty_acted && exec_aborted == 0 {
+            t.field("status", "no in-flight commands");
+        } else {
+            t.field("status", "interrupt fired");
+        }
+        Ok(text(t.into_string()))
+    }
+}
+
+fn format_exec(r: &exec::ExecResult, truncate: usize) -> String {
+    let mut t = Toon::new();
+    t.field("exit_code", r.exit_code as i64)
+        .field("duration_ms", r.duration_ms as u64);
+    if r.timed_out {
+        t.field("timed_out", true);
+    }
+    if r.interrupted {
+        t.field("interrupted", true);
+    }
+    if r.capture_capped {
+        t.field("capture_capped", true);
+    }
+    if r.connection_lost {
+        t.field("connection_lost", true);
+    }
+    let (stdout_disp, stdout_full) = truncate_with_hint(&r.stdout, truncate);
+    let (stderr_disp, stderr_full) = truncate_with_hint(&r.stderr, truncate.min(2048));
+    if let Some(n) = stdout_full {
+        t.field("stdout_bytes", r.stdout_bytes)
+            .field("stdout_total_bytes", n);
+    }
+    if let Some(n) = stderr_full {
+        t.field("stderr_bytes", r.stderr_bytes)
+            .field("stderr_total_bytes", n);
+    }
+    t.block("stdout", &stdout_disp);
+    if !r.stderr.is_empty() {
+        t.block("stderr", &stderr_disp);
+    }
+    if r.exit_code != 0 && !r.timed_out {
+        t.hint("non-zero exit. inspect stderr.");
+    }
+    t.into_string()
+}

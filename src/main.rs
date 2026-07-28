@@ -15,6 +15,7 @@ mod session;
 mod sftp;
 mod ssh_config;
 mod tail;
+mod tools;
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
