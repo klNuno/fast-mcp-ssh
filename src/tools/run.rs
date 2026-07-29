@@ -32,9 +32,6 @@ pub struct ExecArgs {
     /// Password for password-auth hosts. Cached in memory after first call.
     #[serde(default)]
     pub password: Option<String>,
-    /// Set true to bypass a confirm-prompt guard after seeing it once.
-    #[serde(default)]
-    pub confirm: Option<bool>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -50,9 +47,6 @@ pub struct ExecBatchArgs {
     /// Password for password-auth hosts. Cached after first call.
     #[serde(default)]
     pub password: Option<String>,
-    /// Set true to bypass confirm-prompt guards.
-    #[serde(default)]
-    pub confirm: Option<bool>,
     /// If true, include full preview (200 chars on errors, 40 on success). Default false: errors-only preview.
     #[serde(default)]
     pub verbose: Option<bool>,
@@ -71,9 +65,6 @@ pub struct ShArgs {
     /// Password for password-auth hosts. Cached after first call.
     #[serde(default)]
     pub password: Option<String>,
-    /// Set true to bypass confirm-prompt guards.
-    #[serde(default)]
-    pub confirm: Option<bool>,
     /// PTY width. Default 200. Honored on first sh per host.
     #[serde(default)]
     pub cols: Option<u32>,
@@ -110,7 +101,7 @@ impl SshServer {
         let password = args.password.map(zeroize::Zeroizing::new);
 
         if let Err(e) = self
-            .run_guards(&host_name, &args.cmd, args.confirm.unwrap_or(false), &ctx)
+            .run_guards(&host_name, &args.cmd, &ctx)
             .await
         {
             let err_msg = e.to_string();
@@ -217,7 +208,6 @@ impl SshServer {
         }
         let timeout = clamp_timeout(args.timeout);
         let host_name = self.resolve_host(args.host)?;
-        let bypass = args.confirm.unwrap_or(false);
         let verbose = args.verbose.unwrap_or(false);
         let password = args.password.map(zeroize::Zeroizing::new);
 
@@ -238,7 +228,9 @@ impl SshServer {
                     pattern,
                 }),
                 GuardCheck::Confirm { pattern_name } => {
-                    if bypass || confirmed.contains(&pattern_name) {
+                    if confirmed.contains(&pattern_name)
+                        || self.confirm_remembered(&host_name, cmd)
+                    {
                         None
                     } else {
                         let prompt = format!(
@@ -246,6 +238,7 @@ impl SshServer {
                         );
                         match elicit_confirmation(&ctx, &prompt).await {
                             Ok(true) => {
+                                self.remember_confirm(&host_name, cmd);
                                 confirmed.insert(pattern_name);
                                 None
                             }
@@ -390,7 +383,7 @@ impl SshServer {
         let password = args.password.map(zeroize::Zeroizing::new);
 
         if let Err(e) = self
-            .run_guards(&host_name, &args.cmd, args.confirm.unwrap_or(false), &ctx)
+            .run_guards(&host_name, &args.cmd, &ctx)
             .await
         {
             let err_msg = e.to_string();

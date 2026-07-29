@@ -1,7 +1,11 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwapOption;
+use russh::Preferred;
 use russh::client::{self, Handle};
+use russh::keys::ssh_key::{Algorithm, EcdsaCurve, HashAlg};
 use russh::keys::{PrivateKeyWithHashAlg, load_secret_key};
 
 use crate::config::{AuthMethod, Config, Host, StrictHostKey};
@@ -15,6 +19,40 @@ pub type SshHandle = Handle<ClientHandler>;
 const DEFAULT_MAX_PACKET: u32 = 65_535;
 const DEFAULT_WINDOW: u32 = 8 * 1024 * 1024;
 
+/// Host-key algorithms we advertise. Same order as `Preferred::DEFAULT` minus
+/// `Algorithm::Rsa { hash: None }`, which is `ssh-rsa` with a SHA-1 signature.
+/// Kex, ciphers and MACs are already SHA-1-free upstream; this brings host
+/// keys in line. rsa-sha2-512/256 stay, so RSA host keys still negotiate.
+const KEY_ALGORITHMS: &[Algorithm] = &[
+    Algorithm::Ed25519,
+    Algorithm::Ecdsa {
+        curve: EcdsaCurve::NistP256,
+    },
+    Algorithm::Ecdsa {
+        curve: EcdsaCurve::NistP384,
+    },
+    Algorithm::Ecdsa {
+        curve: EcdsaCurve::NistP521,
+    },
+    Algorithm::Rsa {
+        hash: Some(HashAlg::Sha512),
+    },
+    Algorithm::Rsa {
+        hash: Some(HashAlg::Sha256),
+    },
+];
+
+/// Why the handler refused the server key. russh turns `Ok(false)` into a
+/// generic error that would fall through to `internal_error` / `retry_later`,
+/// so the reason travels out of the handler through a shared cell and `open`
+/// reads it after a failed handshake.
+#[derive(Debug)]
+pub enum KeyRejection {
+    Mismatch { expected: String, actual: String },
+    Unknown { actual: String },
+    Store(String),
+}
+
 pub struct ClientHandler {
     pub host_name: String,
     pub addr: String,
@@ -22,6 +60,14 @@ pub struct ClientHandler {
     pub expected_fingerprint: Option<String>,
     pub strict: StrictHostKey,
     pub store: Option<Arc<KnownHostsStore>>,
+    rejection: Arc<ArcSwapOption<KeyRejection>>,
+}
+
+impl ClientHandler {
+    fn reject(&self, reason: KeyRejection) -> std::result::Result<bool, russh::Error> {
+        self.rejection.store(Some(Arc::new(reason)));
+        Ok(false)
+    }
 }
 
 impl client::Handler for ClientHandler {
@@ -38,7 +84,10 @@ impl client::Handler for ClientHandler {
         if let Some(expected) = &self.expected_fingerprint {
             if actual != *expected {
                 tracing::warn!(host = %self.host_name, %expected, %actual, "server fingerprint mismatch (config)");
-                return Ok(false);
+                return self.reject(KeyRejection::Mismatch {
+                    expected: expected.clone(),
+                    actual,
+                });
             }
             return Ok(true);
         }
@@ -47,13 +96,19 @@ impl client::Handler for ClientHandler {
             StrictHostKey::Off => Ok(true),
             StrictHostKey::Strict | StrictHostKey::Tofu => {
                 let Some(store) = self.store.as_ref() else {
-                    return Ok(matches!(self.strict, StrictHostKey::Off));
+                    return self.reject(KeyRejection::Store(
+                        "known_hosts store unavailable while host key checking is enabled".into(),
+                    ));
                 };
                 match store.check(&self.host_name, &self.addr, self.port, &actual) {
                     KnownHostMatch::Ok => Ok(true),
                     KnownHostMatch::Mismatch { expected } => {
                         tracing::warn!(host = %self.host_name, %expected, %actual, "known_hosts fingerprint mismatch");
-                        Ok(false)
+                        self.reject(KeyRejection::Mismatch { expected, actual })
+                    }
+                    KnownHostMatch::Unavailable(why) => {
+                        tracing::error!(host = %self.host_name, %why, "known_hosts unreadable");
+                        self.reject(KeyRejection::Store(why))
                     }
                     KnownHostMatch::Unknown => {
                         if matches!(self.strict, StrictHostKey::Tofu) {
@@ -62,7 +117,9 @@ impl client::Handler for ClientHandler {
                                 .await
                             {
                                 tracing::error!(?e, "TOFU write known_hosts failed");
-                                return Ok(false);
+                                return self.reject(KeyRejection::Store(format!(
+                                    "could not persist the new fingerprint: {e}"
+                                )));
                             }
                             // warn, not info: the first connect to a new host
                             // is the TOFU window — if it was MITM'd, future
@@ -76,12 +133,40 @@ impl client::Handler for ClientHandler {
                             Ok(true)
                         } else {
                             tracing::warn!(host = %self.host_name, "strict host key checking: host unknown");
-                            Ok(false)
+                            self.reject(KeyRejection::Unknown { actual })
                         }
                     }
                 }
             }
         }
+    }
+}
+
+/// Turn a handshake failure into the host-key rejection the handler recorded,
+/// when there is one. Without this a changed key reaches the caller as a
+/// generic russh error whose recovery hint says "retry".
+fn handshake_error(
+    host_name: &str,
+    cell: &ArcSwapOption<KeyRejection>,
+    e: russh::Error,
+) -> SshError {
+    let Some(reason) = cell.load_full() else {
+        return SshError::from(e);
+    };
+    match &*reason {
+        KeyRejection::Mismatch { expected, actual } => SshError::FingerprintMismatch {
+            host: host_name.to_string(),
+            expected: expected.clone(),
+            actual: actual.clone(),
+        },
+        KeyRejection::Unknown { actual } => SshError::Config(format!(
+            "host '{host_name}' is not in known_hosts and strict_host_key_checking = \"strict\". \
+             Verify the fingerprint {actual} out-of-band, then pin it as \
+             known_host_fingerprint for the host in hosts.toml."
+        )),
+        KeyRejection::Store(why) => SshError::Other(format!(
+            "host key check for '{host_name}' could not complete: {why}"
+        )),
     }
 }
 
@@ -95,6 +180,10 @@ pub fn build_client_config(cfg: &Config) -> Arc<client::Config> {
         maximum_packet_size: DEFAULT_MAX_PACKET,
         window_size: DEFAULT_WINDOW,
         nodelay: true,
+        preferred: Preferred {
+            key: Cow::Borrowed(KEY_ALGORITHMS),
+            ..Preferred::DEFAULT
+        },
         ..Default::default()
     })
 }
@@ -116,6 +205,9 @@ pub async fn open(
     } else {
         store
     };
+    // Shared with the handler so a host-key refusal survives russh collapsing
+    // `Ok(false)` into an opaque error.
+    let rejection = Arc::new(ArcSwapOption::<KeyRejection>::empty());
     let handler = ClientHandler {
         host_name: host_name.to_string(),
         addr: host.addr.clone(),
@@ -123,6 +215,7 @@ pub async fn open(
         expected_fingerprint: host.known_host_fingerprint.clone(),
         strict,
         store,
+        rejection: Arc::clone(&rejection),
     };
 
     let connect_timeout = cfg.defaults.connect_timeout.0;

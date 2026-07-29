@@ -18,6 +18,12 @@ const PARALLEL_DOWNLOAD_MIN: u64 = 4 * 1024 * 1024;
 const PARALLEL_DOWNLOAD_WORKERS: u64 = 6;
 /// Max in-flight SFTP delete requests during a recursive remove.
 const RM_CONCURRENCY: usize = 16;
+/// Blast-radius preview bounds. Past either the walk stops and the reported
+/// counts become lower bounds — the confirmation must not itself take minutes.
+const PREVIEW_MAX_ENTRIES: u64 = 10_000;
+const PREVIEW_MAX_TIME: Duration = Duration::from_secs(2);
+/// Largest entries surfaced in the recursive-`rm` prompt.
+const PREVIEW_TOP_N: usize = 5;
 
 pub struct SftpResult {
     pub bytes: usize,
@@ -32,6 +38,15 @@ pub struct ListEntry {
     pub mtime: u64,
 }
 
+/// One page of a directory listing plus enough context to paginate.
+pub struct DirPage {
+    pub entries: Vec<ListEntry>,
+    /// Entries the server reported. Exact — counting retains no allocation.
+    pub total: usize,
+    /// True when entries exist past the returned page.
+    pub more: bool,
+}
+
 pub struct StatEntry {
     pub kind: &'static str,
     pub size: u64,
@@ -39,6 +54,20 @@ pub struct StatEntry {
     pub mtime: u64,
     pub uid: u32,
     pub gid: u32,
+    /// Resolved target when `kind == "link"`. `None` for everything else, or
+    /// when the link dangles.
+    pub target: Option<String>,
+}
+
+/// Bounded summary of what a recursive delete would destroy.
+pub struct TreePreview {
+    pub files: u64,
+    pub dirs: u64,
+    pub total_bytes: u64,
+    /// `(path, bytes)`, largest first, at most `PREVIEW_TOP_N`.
+    pub largest: Vec<(String, u64)>,
+    /// Walk hit a bound or an unreadable subdirectory: counts are lower bounds.
+    pub partial: bool,
 }
 
 async fn with_timeout<T, F>(label: &'static str, secs: u64, fut: F) -> Result<T>
@@ -50,6 +79,62 @@ where
         Err(_) => Err(SshError::Other(format!(
             "sftp {label} timed out after {secs}s"
         ))),
+    }
+}
+
+/// Resolve `path` server-side via FXP_REALPATH so a path guard can be re-run
+/// against what the path actually points at. SFTP follows symlinks, so
+/// `ln -s /etc/shadow /tmp/s` would otherwise launder a blocked read through a
+/// harmless-looking string. One round-trip; two only when the path does not
+/// exist yet (normal for `wr` / `up`), in which case the parent is resolved and
+/// the leaf re-joined so a symlinked parent directory can't dodge the guard
+/// either. Never returns Ok on total failure — a guard must not be skipped
+/// because a lookup errored.
+pub async fn resolve_path(session: &Session, path: &str) -> Result<String> {
+    let sftp = session.sftp().await?;
+    let direct = with_timeout("realpath", 30, async {
+        sftp.canonicalize(path.to_string())
+            .await
+            .map_err(SshError::from)
+    })
+    .await;
+    if let Ok(p) = direct {
+        return Ok(p);
+    }
+    let (parent, leaf) = split_parent(path);
+    let base = with_timeout("realpath", 30, async {
+        sftp.canonicalize(parent.to_string())
+            .await
+            .map_err(SshError::from)
+    })
+    .await?;
+    Ok(join_remote(&base, leaf))
+}
+
+/// Split a POSIX remote path into `(parent, leaf)`. Trailing slashes are
+/// trimmed first so `/tmp/d/` yields `("/tmp", "d")`.
+fn split_parent(path: &str) -> (&str, &str) {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return ("/", "");
+    }
+    match trimmed.rfind('/') {
+        Some(0) => ("/", trimmed.get(1..).unwrap_or("")),
+        Some(i) => (
+            trimmed.get(..i).unwrap_or("/"),
+            trimmed.get(i + 1..).unwrap_or(""),
+        ),
+        None => (".", trimmed),
+    }
+}
+
+fn join_remote(base: &str, leaf: &str) -> String {
+    if leaf.is_empty() {
+        base.to_string()
+    } else if base.ends_with('/') {
+        format!("{base}{leaf}")
+    } else {
+        format!("{base}/{leaf}")
     }
 }
 
@@ -350,12 +435,33 @@ pub async fn mkdir(session: &Session, path: &str, parents: bool) -> Result<()> {
 
 pub async fn remove(session: &Session, path: &str, recursive: bool) -> Result<u64> {
     let sftp = session.sftp().await?;
-    let meta = with_timeout("stat", 30, async {
-        sftp.metadata(path.to_string())
+    // lstat, not stat: FXP_STAT follows the link, so `ln -s /etc /tmp/x`
+    // followed by `rm /tmp/x recursive=true` would walk into /etc. Child
+    // entries were already safe (readdir carries lstat attrs); the entry point
+    // was the hole.
+    let meta = with_timeout("lstat", 30, async {
+        sftp.symlink_metadata(path.to_string())
             .await
             .map_err(SshError::from)
     })
     .await?;
+    if meta.is_symlink() {
+        if recursive {
+            return Err(SshError::Other(format!(
+                "{path} is a symlink; refusing recursive delete because it would \
+                 delete the link target's tree, not the link. Re-run with \
+                 recursive=false to remove the symlink itself."
+            )));
+        }
+        with_timeout("rm", 30, async {
+            sftp.remove_file(path.to_string())
+                .await
+                .map_err(SshError::from)
+        })
+        .await?;
+        session.touch();
+        return Ok(1);
+    }
     if meta.is_dir() {
         if !recursive {
             return Err(SshError::Other(format!(
@@ -439,8 +545,12 @@ async fn remove_dir_recursive(session: &Session, path: &str) -> Result<u64> {
 
 pub async fn stat(session: &Session, path: &str) -> Result<StatEntry> {
     let sftp = session.sftp().await?;
-    let attrs = with_timeout("stat", 30, async {
-        sftp.metadata(path.to_string())
+    // lstat, not stat: FXP_STAT follows the link and reports the target's
+    // attributes, so a symlink is indistinguishable from what it points at.
+    // The link itself is what the caller asked about; the target is reported
+    // separately below.
+    let attrs = with_timeout("lstat", 30, async {
+        sftp.symlink_metadata(path.to_string())
             .await
             .map_err(SshError::from)
     })
@@ -454,6 +564,19 @@ pub async fn stat(session: &Session, path: &str) -> Result<StatEntry> {
     } else {
         "other"
     };
+    // A dangling link still stats fine but fails to resolve. That is reported
+    // as an absent target, not as a failed `stat`.
+    let target = if kind == "link" {
+        with_timeout("readlink", 30, async {
+            sftp.read_link(path.to_string())
+                .await
+                .map_err(SshError::from)
+        })
+        .await
+        .ok()
+    } else {
+        None
+    };
     session.touch();
     Ok(StatEntry {
         kind,
@@ -462,6 +585,7 @@ pub async fn stat(session: &Session, path: &str) -> Result<StatEntry> {
         mtime: u64::from(attrs.mtime.unwrap_or(0)),
         uid: attrs.uid.unwrap_or(0),
         gid: attrs.gid.unwrap_or(0),
+        target,
     })
 }
 

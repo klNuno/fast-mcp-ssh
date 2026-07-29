@@ -31,6 +31,26 @@ struct AuditEntryOwned {
 const AUDIT_QUEUE_CAP: usize = 1024;
 const AUDIT_BATCH: usize = 32;
 
+/// Size-based rotation policy. Enforced on the writer task, never on a tool
+/// call: rotation renames and reopens files, which is exactly the disk I/O the
+/// channel exists to keep off the request path.
+#[derive(Debug, Clone, Copy)]
+pub struct AuditRotation {
+    /// Rotate once the live file crosses this size. `0` disables rotation.
+    pub max_bytes: u64,
+    /// Generations of `audit.log.N` to keep. `0` discards on rotate.
+    pub keep_files: usize,
+}
+
+impl Default for AuditRotation {
+    fn default() -> Self {
+        Self {
+            max_bytes: 16 * 1024 * 1024,
+            keep_files: 5,
+        }
+    }
+}
+
 /// Append-only NDJSON audit log writer. Backed by a bounded mpsc channel +
 /// a dedicated task that writes batches, so callers never block the runtime
 /// on disk I/O. A full queue drops the entry and emits a tracing warning;

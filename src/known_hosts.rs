@@ -27,6 +27,10 @@ pub enum KnownHostMatch {
     Ok,
     Mismatch { expected: String },
     Unknown,
+    /// The store could not be consulted. Distinct from `Unknown` on purpose:
+    /// under `tofu`, `Unknown` means "pin whatever the server just sent", so
+    /// collapsing an unreadable store into it would accept a changed key.
+    Unavailable(String),
 }
 
 pub struct KnownHostsStore {
@@ -73,7 +77,11 @@ impl KnownHostsStore {
     pub fn check(&self, host: &str, addr: &str, port: u16, fingerprint: &str) -> KnownHostMatch {
         let guard = match self.inner.read() {
             Ok(g) => g,
-            Err(_) => return KnownHostMatch::Unknown,
+            Err(_) => {
+                return KnownHostMatch::Unavailable(
+                    "known_hosts lock poisoned; refusing to re-pin a possibly changed key".into(),
+                );
+            }
         };
         let endpoint = Self::endpoint_key(addr, port);
         if let Some(e) = guard.host.get(&endpoint) {
@@ -151,5 +159,62 @@ impl KnownHostsStore {
         })
         .await
         .map_err(|e| SshError::Other(format!("known_hosts flush task: {e}")))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store_with(entries: &[(&str, &str)]) -> std::sync::Arc<KnownHostsStore> {
+        let mut stored = Stored::default();
+        for (k, fp) in entries {
+            stored.host.insert(
+                (*k).to_string(),
+                Entry {
+                    fingerprint: (*fp).to_string(),
+                },
+            );
+        }
+        std::sync::Arc::new(KnownHostsStore {
+            path: PathBuf::from("known_hosts.toml"),
+            inner: RwLock::new(stored),
+            flush_lock: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    #[test]
+    fn endpoint_entry_beats_alias_entry() {
+        let store = store_with(&[("10.0.0.1:22", "SHA256:aaa"), ("box1", "SHA256:zzz")]);
+        assert!(matches!(
+            store.check("box1", "10.0.0.1", 22, "SHA256:aaa"),
+            KnownHostMatch::Ok
+        ));
+        assert!(matches!(
+            store.check("box1", "10.0.0.1", 22, "SHA256:bbb"),
+            KnownHostMatch::Mismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn poisoned_lock_refuses_instead_of_reporting_unknown() {
+        let store = store_with(&[("10.0.0.1:22", "SHA256:aaa")]);
+        let poisoner = std::sync::Arc::clone(&store);
+        // Silence the panic the poisoning thread is supposed to produce.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.inner.write();
+            panic!("poison the lock");
+        })
+        .join();
+        std::panic::set_hook(prev);
+
+        assert!(store.inner.is_poisoned(), "lock should be poisoned");
+        // `Unknown` here would let TOFU re-pin whatever the server sent.
+        assert!(matches!(
+            store.check("box1", "10.0.0.1", 22, "SHA256:aaa"),
+            KnownHostMatch::Unavailable(_)
+        ));
     }
 }
