@@ -1,14 +1,10 @@
-# Version-update PRs are parked (`open-pull-requests-limit: 0`) while the repo
-# is private: each one opened a PR that ran the full CI matrix against a
-# private-repo Actions quota. Security updates still come through. Raise the
-# limit back to 5 / drop it to the default when the repo goes public.
 version: 2
 updates:
   - package-ecosystem: cargo
     directory: /
     schedule:
       interval: weekly
-    open-pull-requests-limit: 0
+    open-pull-requests-limit: 3
     groups:
       patch-and-minor:
         update-types: [minor, patch]
@@ -17,4 +13,4 @@ updates:
     directory: /
     schedule:
       interval: monthly
-    open-pull-requests-limit: 0
+    open-pull-requests-limit: 2

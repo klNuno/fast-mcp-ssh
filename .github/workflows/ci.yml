@@ -1,10 +1,9 @@
 name: CI
 
-# Manual only while the repo is private: every push and every dependabot PR
-# burned a full 5-job matrix against a private-repo Actions quota for a project
-# with a single contributor. Restore the `push` / `pull_request` triggers when
-# the repo goes public and Actions become free again.
 on:
+  push:
+    branches: [main]
+  pull_request:
   workflow_dispatch:
 
 env:
