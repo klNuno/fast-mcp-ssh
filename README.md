@@ -45,6 +45,9 @@ and fill in your hosts. Keys go in `~/.fast-mcp-ssh/keys/<name>`; `auth` is
 }
 ```
 
+In the [MCP registry](https://registry.modelcontextprotocol.io) it is
+`mcp-name: io.github.klNuno/fast-mcp-ssh`.
+
 ## Tools
 
 `host` is optional on every tool once `[defaults] default_host` is set.
