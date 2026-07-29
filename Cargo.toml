@@ -17,7 +17,6 @@ exclude = [
     "/docs",
     "/.github",
     "/target-*",
-    "/CHANGELOG.md",
 ]
 
 [[bin]]
