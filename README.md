@@ -2,10 +2,11 @@
 <p align="center">SSH, SFTP and persistent shells for AI agents. One Rust binary, no runtime.</p>
 
 <p align="center">
+  <a href="https://crates.io/crates/fast-mcp-ssh"><img src="https://img.shields.io/crates/v/fast-mcp-ssh?logo=rust&color=b7410e" alt="crates.io" /></a>
+  <a href="https://github.com/klNuno/fast-mcp-ssh/actions/workflows/ci.yml"><img src="https://github.com/klNuno/fast-mcp-ssh/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License" /></a>
   <img src="https://img.shields.io/badge/rust-1.89%2B-b7410e?logo=rust" alt="Rust 1.89+" />
   <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-0078D6" alt="Platform" />
-  <img src="https://img.shields.io/badge/MCP-stdio-8A2BE2" alt="MCP stdio" />
 </p>
 
 An MCP server that gives a model real SSH access: one connection per host kept
@@ -17,8 +18,13 @@ tokens than JSON on tabular data.
 ## Install
 
 ```bash
-cargo install --path .          # or: cargo build --release
+cargo install fast-mcp-ssh
 ```
+
+Or take a prebuilt binary from the
+[latest release](https://github.com/klNuno/fast-mcp-ssh/releases/latest) and
+check it against the matching `.sha256`. Linux and macOS ship x86_64 and
+aarch64, Windows ships x86_64.
 
 Copy [`hosts.example.toml`](./hosts.example.toml) to `~/.fast-mcp-ssh/hosts.toml`
 and fill in your hosts. Keys go in `~/.fast-mcp-ssh/keys/<name>`; `auth` is
@@ -104,6 +110,7 @@ like a successful one.
 ## Development
 
 ```bash
+cargo install --path .        # build and install from a clone
 cargo test                    # unit tests
 cargo clippy --all-targets    # no warnings allowed in CI
 ./scripts/test-sh.ps1         # end-to-end against a real host (Windows)
