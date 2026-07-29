@@ -106,7 +106,7 @@ impl Session {
             channel_limit: Arc::new(Semaphore::new(max_channels.max(1))),
             max_channels: max_channels.max(1),
             channel_pool: Mutex::new(Vec::with_capacity(DEFAULT_POOL_TARGET)),
-            pool_target: DEFAULT_POOL_TARGET.min(max_channels.saturating_sub(1).max(0)),
+            pool_target: DEFAULT_POOL_TARGET.min(max_channels.saturating_sub(1)),
             refill_notify: Arc::new(Notify::new()),
             last_used_ms: AtomicU64::new(0),
             started: Instant::now(),
