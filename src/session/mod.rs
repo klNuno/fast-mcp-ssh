@@ -26,6 +26,10 @@ pub use connect::SshHandle;
 /// Each spare costs one slot against sshd `MaxSessions`. Two is a safe
 /// default with the standard `MaxSessions=10`.
 const DEFAULT_POOL_TARGET: usize = 2;
+/// How long a call waits for a free channel slot before giving up with
+/// `ChannelLimit`. Long enough to ride out a burst of parallel `exec`s, short
+/// enough that a leaked slot surfaces as an actionable error.
+const CHANNEL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// A pre-opened SSH session channel held in the pool. Owns the semaphore
 /// permit so concurrency accounting stays correct when the channel is
@@ -57,6 +61,8 @@ pub struct Session {
     /// Caps concurrent open channels for this host so we don't exceed sshd
     /// `MaxSessions` (default 10).
     channel_limit: Arc<Semaphore>,
+    /// The configured cap, kept for the `ChannelLimit` error message.
+    max_channels: usize,
     /// Pool of pre-opened session channels. Each entry has already paid the
     /// `CHANNEL_OPEN`/`CHANNEL_OPEN_CONFIRMATION` round-trip, so an exec call
     /// can grab one and immediately send the exec request (-1 RTT).
@@ -98,6 +104,7 @@ impl Session {
             named_ptys: Mutex::new(HashMap::new()),
             sftp: Mutex::new(None),
             channel_limit: Arc::new(Semaphore::new(max_channels.max(1))),
+            max_channels: max_channels.max(1),
             channel_pool: Mutex::new(Vec::with_capacity(DEFAULT_POOL_TARGET)),
             pool_target: DEFAULT_POOL_TARGET.min(max_channels.saturating_sub(1).max(0)),
             refill_notify: Arc::new(Notify::new()),
@@ -146,11 +153,19 @@ impl Session {
     }
 
     /// Acquire a channel slot. Holds back if too many channels already open.
+    /// Bounded: an unbounded wait would hang the call forever behind a leaked
+    /// forward or a stuck PTY, with no hint about which knob to turn.
     pub async fn acquire_channel(&self) -> Result<OwnedSemaphorePermit> {
-        Arc::clone(&self.channel_limit)
-            .acquire_owned()
-            .await
-            .map_err(|_| SshError::Other("channel semaphore closed".into()))
+        let sem = Arc::clone(&self.channel_limit);
+        let start = Instant::now();
+        match tokio::time::timeout(CHANNEL_ACQUIRE_TIMEOUT, sem.acquire_owned()).await {
+            Ok(Ok(p)) => Ok(p),
+            Ok(Err(_)) => Err(SshError::Other("channel semaphore closed".into())),
+            Err(_) => Err(SshError::ChannelLimit {
+                limit: self.max_channels,
+                waited_ms: start.elapsed().as_millis() as u64,
+            }),
+        }
     }
 
     /// Take a pre-opened channel + its permit from the pool, or open a fresh

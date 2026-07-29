@@ -71,6 +71,57 @@ pub(crate) fn text(s: String) -> CallToolResult {
     CallToolResult::success(vec![ContentBlock::text(s)])
 }
 
+impl crate::server::SshServer {
+    /// Re-run the remote path guard against what the path actually resolves to
+    /// server-side. SFTP follows symlinks, so `ln -s /etc/shadow /tmp/s` would
+    /// otherwise launder a blocked read through a harmless-looking string.
+    /// Costs one FXP_REALPATH on the already-open SFTP channel.
+    pub(crate) async fn guard_resolved(
+        &self,
+        host: &str,
+        tool: &'static str,
+        session: &crate::session::Session,
+        path: &str,
+        write: bool,
+    ) -> Result<(), McpError> {
+        let resolved = match crate::sftp::resolve_path(session, path).await {
+            Ok(p) => p,
+            // A path that cannot be resolved at all is left to the operation
+            // itself to fail on; the string guard already ran.
+            Err(_) => return Ok(()),
+        };
+        if resolved == path {
+            return Ok(());
+        }
+        let guards = self.guards().for_host(host);
+        let verdict = if write {
+            guards.check_sftp_write(&resolved)
+        } else {
+            guards.check_sftp_read(&resolved)
+        };
+        if let Err(e) = verdict {
+            let msg = format!("{path} resolves to {resolved}: {e}");
+            self.audit.write(
+                host,
+                tool,
+                Some(path),
+                None,
+                None,
+                None,
+                None,
+                Some(&msg),
+                Some(msg.clone()),
+            );
+            return Err(SshError::BlockedByGuard {
+                name: "resolved-path".into(),
+                pattern: msg,
+            }
+            .into_mcp());
+        }
+        Ok(())
+    }
+}
+
 pub(crate) fn batch_preview(r: &exec::ExecResult, verbose: bool) -> String {
     let (src, max) = if r.exit_code != 0 {
         let stderr_trimmed = r.stderr.trim();

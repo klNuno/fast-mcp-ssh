@@ -1,6 +1,5 @@
 //! Filesystem tools: `ls`, `stat`, `dn`, `up`, `wr`, `mkdir`, `rm`, `tail`.
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use base64::Engine;
@@ -11,6 +10,7 @@ use rmcp::{
 use serde::Deserialize;
 
 use crate::errors::SshError;
+use crate::guards;
 use crate::output::{Toon, truncate_with_hint};
 use crate::server::{SshServer, elicit_confirmation};
 use crate::sftp;
@@ -162,7 +162,25 @@ impl SshServer {
             .get_or_connect(&host_name, None)
             .await
             .map_err(|e| e.into_mcp())?;
-        let local = PathBuf::from(shellexpand::tilde(&args.local).into_owned());
+        self.guard_resolved(&host_name, "up", &session, &args.remote, true)
+            .await?;
+        // The local side is the operator's own box: without this, `up` is an
+        // exfiltration primitive pointed at ~/.ssh or a browser cookie store.
+        let local = guards::resolve_local_path(&args.local);
+        if let Err(e) = guards::check_local_read(&local) {
+            self.audit.write(
+                &host_name,
+                "up",
+                Some(&args.local),
+                None,
+                None,
+                None,
+                None,
+                Some(&e.to_string()),
+                Some(e.to_string()),
+            );
+            return Err(e.into_mcp());
+        }
         let r = sftp::upload(&session, &local, &args.remote)
             .await
             .map_err(|e| e.into_mcp())?;
@@ -224,10 +242,27 @@ impl SshServer {
             .get_or_connect(&host_name, None)
             .await
             .map_err(|e| e.into_mcp())?;
-        let local_path = args
-            .local
-            .as_deref()
-            .map(|s| PathBuf::from(shellexpand::tilde(s).into_owned()));
+        self.guard_resolved(&host_name, "dn", &session, &args.remote, false)
+            .await?;
+        // Remote-controlled bytes landing on the operator's own filesystem:
+        // a `dn` into ~/.bashrc or an autostart folder is code execution here.
+        let local_path = args.local.as_deref().map(guards::resolve_local_path);
+        if let Some(p) = local_path.as_deref()
+            && let Err(e) = guards::check_local_write(p)
+        {
+            self.audit.write(
+                &host_name,
+                "dn",
+                args.local.as_deref(),
+                None,
+                None,
+                None,
+                None,
+                Some(&e.to_string()),
+                Some(e.to_string()),
+            );
+            return Err(e.into_mcp());
+        }
         let (r, content) = sftp::download(
             &session,
             &args.remote,
@@ -308,6 +343,8 @@ impl SshServer {
             .get_or_connect(&host_name, None)
             .await
             .map_err(|e| e.into_mcp())?;
+        self.guard_resolved(&host_name, "ls", &session, &args.path, false)
+            .await?;
         let mut entries = sftp::list_dir(&session, &args.path)
             .await
             .map_err(|e| e.into_mcp())?;
@@ -407,6 +444,8 @@ impl SshServer {
             .get_or_connect(&host_name, None)
             .await
             .map_err(|e| e.into_mcp())?;
+        self.guard_resolved(&host_name, "wr", &session, &args.remote, true)
+            .await?;
         let r = sftp::write_inline(&session, &args.remote, args.content.as_bytes(), args.mode)
             .await
             .map_err(|e| e.into_mcp())?;
@@ -470,6 +509,8 @@ impl SshServer {
             .get_or_connect(&host_name, None)
             .await
             .map_err(|e| e.into_mcp())?;
+        self.guard_resolved(&host_name, "mkdir", &session, &args.path, true)
+            .await?;
         sftp::mkdir(&session, &args.path, args.parents.unwrap_or(false))
             .await
             .map_err(|e| e.into_mcp())?;
@@ -547,6 +588,8 @@ impl SshServer {
             .get_or_connect(&host_name, None)
             .await
             .map_err(|e| e.into_mcp())?;
+        self.guard_resolved(&host_name, "rm", &session, &args.path, true)
+            .await?;
         let removed = sftp::remove(&session, &args.path, recursive)
             .await
             .map_err(|e| e.into_mcp())?;
@@ -606,6 +649,8 @@ impl SshServer {
             .get_or_connect(&host_name, None)
             .await
             .map_err(|e| e.into_mcp())?;
+        self.guard_resolved(&host_name, "stat", &session, &args.path, false)
+            .await?;
         let s = sftp::stat(&session, &args.path)
             .await
             .map_err(|e| e.into_mcp())?;

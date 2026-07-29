@@ -340,7 +340,7 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Err(SshError::Config(format!(
-                "config not found at {} — see examples/hosts.toml",
+                "config not found at {} — see hosts.example.toml",
                 path.display()
             )));
         }

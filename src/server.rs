@@ -197,7 +197,8 @@ impl SshServer {
         // this map without limit. Oldest-first eviction is not worth a heap
         // here; a full map simply stops remembering and prompts again.
         if self.confirmations.len() >= MAX_REMEMBERED_CONFIRMATIONS {
-            self.confirmations.retain(|_, at| at.elapsed() < self.cfg().defaults.confirm_ttl.0);
+            self.confirmations
+                .retain(|_, at| at.elapsed() < self.cfg().defaults.confirm_ttl.0);
             if self.confirmations.len() >= MAX_REMEMBERED_CONFIRMATIONS {
                 return;
             }

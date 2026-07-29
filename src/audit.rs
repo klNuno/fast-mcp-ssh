@@ -62,7 +62,7 @@ pub struct AuditLog {
 }
 
 impl AuditLog {
-    pub fn new(path: Option<PathBuf>) -> Result<Self> {
+    pub fn new(path: Option<PathBuf>, rotation: AuditRotation) -> Result<Self> {
         let Some(path) = path else {
             return Ok(Self {
                 tx: None,
@@ -108,6 +108,9 @@ impl AuditLog {
                     }
                 }
             };
+            // Track the size ourselves instead of stat-ing per batch: the file
+            // is append-only and this task is its only writer.
+            let mut written = file.metadata().await.map(|m| m.len()).unwrap_or(0);
             let mut buf = String::with_capacity(8192);
             let mut batch: Vec<AuditEntryOwned> = Vec::with_capacity(AUDIT_BATCH);
             'outer: loop {
@@ -137,6 +140,24 @@ impl AuditLog {
                         serialize_batch(&batch, &mut buf);
                         if let Err(e) = file.write_all(buf.as_bytes()).await {
                             tracing::error!(?e, "audit write failed");
+                        } else {
+                            written += buf.len() as u64;
+                        }
+                        // Rotate on the writer task, between batches, so a tool
+                        // call never waits on a rename + reopen.
+                        if rotation.max_bytes > 0 && written >= rotation.max_bytes {
+                            match rotate(&path_for_task, rotation.keep_files, &mut file).await {
+                                Ok(new_file) => {
+                                    file = new_file;
+                                    written = 0;
+                                }
+                                Err(e) => {
+                                    tracing::error!(?e, "audit rotate failed; continuing on the current file");
+                                    // Don't retry every batch on a permanently
+                                    // failing rotate (read-only dir, locked file).
+                                    written = 0;
+                                }
+                            }
                         }
                     }
                 }
@@ -210,6 +231,43 @@ impl AuditLog {
             }
         }
     }
+}
+
+/// Flush the live file, shift `audit.log.N` down by one, move the live file to
+/// `.1`, and reopen a fresh one. `keep == 0` drops the old content instead of
+/// archiving it. All of it runs on a blocking thread: renames are synchronous
+/// filesystem work and this task also owns the write path.
+async fn rotate(
+    path: &std::path::Path,
+    keep: usize,
+    file: &mut tokio::fs::File,
+) -> std::io::Result<tokio::fs::File> {
+    file.flush().await?;
+    file.sync_data().await?;
+    let owned = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let gen_path = |n: usize| {
+            let mut s = owned.clone().into_os_string();
+            s.push(format!(".{n}"));
+            PathBuf::from(s)
+        };
+        if keep == 0 {
+            std::fs::remove_file(&owned)?;
+            return Ok::<(), std::io::Error>(());
+        }
+        // Oldest first, so nothing is overwritten before it moves.
+        let _ = std::fs::remove_file(gen_path(keep));
+        for n in (1..keep).rev() {
+            let from = gen_path(n);
+            if from.exists() {
+                let _ = std::fs::rename(&from, gen_path(n + 1));
+            }
+        }
+        std::fs::rename(&owned, gen_path(1))
+    })
+    .await
+    .map_err(|e| std::io::Error::other(format!("audit rotate join: {e}")))??;
+    open_audit_file(path).await
 }
 
 async fn open_audit_file(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {

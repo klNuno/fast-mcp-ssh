@@ -18,12 +18,6 @@ const PARALLEL_DOWNLOAD_MIN: u64 = 4 * 1024 * 1024;
 const PARALLEL_DOWNLOAD_WORKERS: u64 = 6;
 /// Max in-flight SFTP delete requests during a recursive remove.
 const RM_CONCURRENCY: usize = 16;
-/// Blast-radius preview bounds. Past either the walk stops and the reported
-/// counts become lower bounds — the confirmation must not itself take minutes.
-const PREVIEW_MAX_ENTRIES: u64 = 10_000;
-const PREVIEW_MAX_TIME: Duration = Duration::from_secs(2);
-/// Largest entries surfaced in the recursive-`rm` prompt.
-const PREVIEW_TOP_N: usize = 5;
 
 pub struct SftpResult {
     pub bytes: usize,
@@ -38,15 +32,6 @@ pub struct ListEntry {
     pub mtime: u64,
 }
 
-/// One page of a directory listing plus enough context to paginate.
-pub struct DirPage {
-    pub entries: Vec<ListEntry>,
-    /// Entries the server reported. Exact — counting retains no allocation.
-    pub total: usize,
-    /// True when entries exist past the returned page.
-    pub more: bool,
-}
-
 pub struct StatEntry {
     pub kind: &'static str,
     pub size: u64,
@@ -57,17 +42,6 @@ pub struct StatEntry {
     /// Resolved target when `kind == "link"`. `None` for everything else, or
     /// when the link dangles.
     pub target: Option<String>,
-}
-
-/// Bounded summary of what a recursive delete would destroy.
-pub struct TreePreview {
-    pub files: u64,
-    pub dirs: u64,
-    pub total_bytes: u64,
-    /// `(path, bytes)`, largest first, at most `PREVIEW_TOP_N`.
-    pub largest: Vec<(String, u64)>,
-    /// Walk hit a bound or an unreadable subdirectory: counts are lower bounds.
-    pub partial: bool,
 }
 
 async fn with_timeout<T, F>(label: &'static str, secs: u64, fut: F) -> Result<T>

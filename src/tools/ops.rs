@@ -305,6 +305,16 @@ impl SshServer {
                     .to_string()
             }
             SysView::Net => {
+                // Alpine ships without iproute2, and `ss` missing looks exactly
+                // like "nothing is listening" once stderr is swallowed. Say so
+                // instead of returning an empty table.
+                if !self.host_facts(&host_name, false).await?.has("ss") {
+                    return Err(SshError::Config(format!(
+                        "`ss` is not installed on '{host_name}', so the net view has no source \
+                         (Alpine: apk add iproute2). Use exec with netstat if that is all the host has."
+                    ))
+                    .into_mcp());
+                }
                 "{ ss -ltnpH 2>/dev/null; ss -lunpH 2>/dev/null; } | head -n 200".to_string()
             }
             SysView::Du => {
@@ -552,9 +562,14 @@ async fn unit_active_state(
         "systemctl show {} --property=ActiveState --value 2>/dev/null",
         shell_quote(unit)
     );
-    let r = exec::exec(session, &cmd, std::time::Duration::from_secs(15), max_capture)
-        .await
-        .ok()?;
+    let r = exec::exec(
+        session,
+        &cmd,
+        std::time::Duration::from_secs(15),
+        max_capture,
+    )
+    .await
+    .ok()?;
     let s = r.stdout.trim();
     if s.is_empty() {
         None
@@ -604,7 +619,11 @@ fn parse_ss(out: &str) -> Vec<Vec<String>> {
         .filter_map(|line| {
             let f: Vec<&str> = line.split_whitespace().collect();
             let local = f.get(3)?;
-            let proto = if line.contains("UNCONN") { "udp" } else { "tcp" };
+            let proto = if line.contains("UNCONN") {
+                "udp"
+            } else {
+                "tcp"
+            };
             let process = f
                 .get(5)
                 .copied()
@@ -690,10 +709,12 @@ impl SshServer {
     /// Returns the cached profile for `host`, probing once when absent or
     /// when `refresh` is set. Shared by every tool that has to choose a
     /// backend.
-    pub(crate) async fn host_facts(&self, host: &str, refresh: bool) -> Result<HostFacts, McpError> {
-        if !refresh
-            && let Some(f) = self.facts_cache.get(host)
-        {
+    pub(crate) async fn host_facts(
+        &self,
+        host: &str,
+        refresh: bool,
+    ) -> Result<HostFacts, McpError> {
+        if !refresh && let Some(f) = self.facts_cache.get(host) {
             return Ok(f.clone());
         }
         let session = self

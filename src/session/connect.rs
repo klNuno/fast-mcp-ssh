@@ -244,13 +244,13 @@ pub async fn open(
         )
         .await
         {
-            Ok(r) => r.map_err(SshError::from)?,
+            Ok(r) => r.map_err(|e| handshake_error(host_name, &rejection, e))?,
             Err(_) => return Err(SshError::Timeout(connect_timeout.as_millis() as u64)),
         }
     } else {
         let addr = (host.addr.as_str(), host.port);
         match tokio::time::timeout(connect_timeout, client::connect(ssh_cfg, addr, handler)).await {
-            Ok(r) => r.map_err(SshError::from)?,
+            Ok(r) => r.map_err(|e| handshake_error(host_name, &rejection, e))?,
             Err(_) => return Err(SshError::Timeout(connect_timeout.as_millis() as u64)),
         }
     };

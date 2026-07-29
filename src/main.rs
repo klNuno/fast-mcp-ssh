@@ -99,15 +99,22 @@ async fn async_main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let audit_path = {
+    let (audit_path, audit_rotation) = {
         let cfg = cfg_swap.load();
-        if cfg.defaults.audit_log {
+        let path = if cfg.defaults.audit_log {
             Some(cfg.defaults.audit_log_path.clone())
         } else {
             None
-        }
+        };
+        (
+            path,
+            audit::AuditRotation {
+                max_bytes: cfg.defaults.audit_max_bytes,
+                keep_files: cfg.defaults.audit_keep_files,
+            },
+        )
     };
-    let audit = Arc::new(AuditLog::new(audit_path)?);
+    let audit = Arc::new(AuditLog::new(audit_path, audit_rotation)?);
     let pool = SessionPool::new(cfg_swap.clone())?;
     let guards_swap = Arc::new(ArcSwap::from_pointee(GuardCache::build(&cfg_swap.load())?));
 

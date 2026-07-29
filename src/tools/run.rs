@@ -100,10 +100,7 @@ impl SshServer {
         let host_name = self.resolve_host(args.host)?;
         let password = args.password.map(zeroize::Zeroizing::new);
 
-        if let Err(e) = self
-            .run_guards(&host_name, &args.cmd, &ctx)
-            .await
-        {
+        if let Err(e) = self.run_guards(&host_name, &args.cmd, &ctx).await {
             let err_msg = e.to_string();
             self.audit.write(
                 &host_name,
@@ -228,8 +225,7 @@ impl SshServer {
                     pattern,
                 }),
                 GuardCheck::Confirm { pattern_name } => {
-                    if confirmed.contains(&pattern_name)
-                        || self.confirm_remembered(&host_name, cmd)
+                    if confirmed.contains(&pattern_name) || self.confirm_remembered(&host_name, cmd)
                     {
                         None
                     } else {
@@ -382,10 +378,7 @@ impl SshServer {
         let host_name = self.resolve_host(args.host)?;
         let password = args.password.map(zeroize::Zeroizing::new);
 
-        if let Err(e) = self
-            .run_guards(&host_name, &args.cmd, &ctx)
-            .await
-        {
+        if let Err(e) = self.run_guards(&host_name, &args.cmd, &ctx).await {
             let err_msg = e.to_string();
             self.audit.write(
                 &host_name,

@@ -25,7 +25,9 @@ struct Entry {
 
 pub enum KnownHostMatch {
     Ok,
-    Mismatch { expected: String },
+    Mismatch {
+        expected: String,
+    },
     Unknown,
     /// The store could not be consulted. Distinct from `Unknown` on purpose:
     /// under `tofu`, `Unknown` means "pin whatever the server just sent", so
