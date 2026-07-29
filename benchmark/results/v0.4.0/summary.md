@@ -1,8 +1,8 @@
 # Benchmark
 
 - iterations per scenario: **50**
-- target: target (x86_64 Linux, gigabit LAN), bench client on Windows 11
-- bench client: 
+- target host alias: target (x86_64 Linux, gigabit LAN)
+- bench client: workstation (Windows 11)
 
 ## Tool surface (paid once per session, before any work)
 
