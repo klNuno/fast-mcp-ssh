@@ -1,8 +1,8 @@
 # Benchmark — fast-mcp-ssh vs mcp-ssh-manager
 
 - iterations per scenario: **20**
-- target host alias: mininist1
-- bench host: 
+- target host alias: target
+- bench host: workstation (Windows 11, gigabit LAN to target)
 
 ## Cold start (process spawn → first response)
 
