@@ -106,6 +106,9 @@ impl SshServer {
         // the new config too (shared ArcSwap).
         self.cfg_swap.store(Arc::new(new_cfg));
         self.guards_swap.store(Arc::new(new_guards));
+        // Approvals were granted against the previous guard set and the
+        // previous host list. Neither is in force any more.
+        self.forget_confirmations();
         let dropped = self.pool.prune_against(&old_cfg).await;
 
         let new = self.cfg();

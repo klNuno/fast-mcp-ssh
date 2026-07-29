@@ -20,13 +20,26 @@ pub enum SshError {
     #[error("command timed out after {0}ms")]
     Timeout(u64),
 
-    #[allow(dead_code)] // reserved for explicit fingerprint surfacing in a future change
-    #[error("server fingerprint mismatch for '{host}': expected {expected}, got {actual}")]
+    #[error(
+        "server fingerprint mismatch for '{host}': expected {expected}, got {actual}. \
+         Refusing to connect — this is what a man-in-the-middle looks like. \
+         If the key changed for a legitimate reason (host rebuild, key rotation), verify \
+         the new fingerprint out-of-band, then delete the '{host}' entry from \
+         ~/.fast-mcp-ssh/known_hosts.toml (or set known_host_fingerprint for the host in \
+         hosts.toml) and reconnect."
+    )]
     FingerprintMismatch {
         host: String,
         expected: String,
         actual: String,
     },
+
+    #[error(
+        "no free SSH channel slot after {waited_ms}ms: all {limit} slots for this host are in \
+         use. Raise [defaults] max_channels_per_host, or release slots with `unforward` / \
+         `disconnect`."
+    )]
+    ChannelLimit { limit: usize, waited_ms: u64 },
 
     #[error("config error: {0}")]
     Config(String),
@@ -64,6 +77,7 @@ const CODE_CONFIRMATION_DENIED: i32 = -32002;
 const CODE_TIMEOUT: i32 = -32003;
 const CODE_FINGERPRINT_MISMATCH: i32 = -32004;
 const CODE_AUTH_FAILED: i32 = -32005;
+const CODE_CHANNEL_LIMIT: i32 = -32006;
 
 /// Recovery hint surfaced in error `data.recovery` so an LLM can pick a retry
 /// strategy without re-asking the user. Stable string contract; do not rename.
@@ -76,6 +90,7 @@ fn recovery_for(err: &SshError) -> &'static str {
         SshError::BlockedByGuard { .. } | SshError::ConfirmationDenied => "ask_user",
         SshError::AuthFailed { .. } => "ask_user",
         SshError::FingerprintMismatch { .. } => "unrecoverable",
+        SshError::ChannelLimit { .. } => "retry_later",
         SshError::Io(_) | SshError::Russh(_) | SshError::Sftp(_) => "retry_later",
         SshError::Regex(_) | SshError::Toml(_) => "check_input",
         SshError::Other(_) => "retry_later",
@@ -131,6 +146,16 @@ impl SshError {
                     "host": host,
                     "expected": expected,
                     "actual": actual,
+                    "recovery": recovery,
+                })),
+            ),
+            SshError::ChannelLimit { limit, waited_ms } => rmcp::ErrorData::new(
+                ErrorCode(CODE_CHANNEL_LIMIT),
+                msg,
+                Some(json!({
+                    "kind": "channel_limit",
+                    "limit": limit,
+                    "waited_ms": waited_ms,
                     "recovery": recovery,
                 })),
             ),
@@ -191,5 +216,46 @@ fn map_russh_error(e: russh::Error, msg: String) -> rmcp::ErrorData {
             msg,
             Some(json!({ "kind": "internal", "recovery": "retry_later" })),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fingerprint_mismatch_is_unrecoverable_and_names_both_keys() {
+        let err = SshError::FingerprintMismatch {
+            host: "box1".into(),
+            expected: "SHA256:aaa".into(),
+            actual: "SHA256:bbb".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("SHA256:aaa"), "expected fingerprint missing");
+        assert!(msg.contains("SHA256:bbb"), "actual fingerprint missing");
+        assert!(msg.contains("known_hosts.toml"), "no remediation path");
+
+        let mcp = err.into_mcp();
+        assert_eq!(mcp.code.0, CODE_FINGERPRINT_MISMATCH);
+        let data = mcp.data.unwrap_or_default();
+        assert_eq!(data["kind"], "fingerprint_mismatch");
+        assert_eq!(data["recovery"], "unrecoverable");
+        assert_eq!(data["expected"], "SHA256:aaa");
+        assert_eq!(data["actual"], "SHA256:bbb");
+    }
+
+    #[test]
+    fn channel_limit_carries_the_budget_and_a_retry_hint() {
+        let mcp = SshError::ChannelLimit {
+            limit: 8,
+            waited_ms: 15_000,
+        }
+        .into_mcp();
+        assert_eq!(mcp.code.0, CODE_CHANNEL_LIMIT);
+        let data = mcp.data.unwrap_or_default();
+        assert_eq!(data["kind"], "channel_limit");
+        assert_eq!(data["limit"], 8);
+        assert_eq!(data["recovery"], "retry_later");
+        assert!(mcp.message.contains("max_channels_per_host"));
     }
 }

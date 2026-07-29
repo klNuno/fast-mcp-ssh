@@ -629,6 +629,9 @@ impl SshServer {
             .field("mtime", s.mtime)
             .field("uid", s.uid as u64)
             .field("gid", s.gid as u64);
+        if let Some(link_target) = &s.target {
+            t.field("target", link_target);
+        }
         Ok(text(t.into_string()))
     }
 

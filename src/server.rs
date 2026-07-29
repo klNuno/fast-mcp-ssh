@@ -1,5 +1,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
+
+/// Cap on the remembered-approval map. Reached only by a pathological caller.
+const MAX_REMEMBERED_CONFIRMATIONS: usize = 512;
 
 use arc_swap::ArcSwap;
 use rmcp::{
@@ -30,6 +34,15 @@ pub struct SshServer {
     pub config_path: PathBuf,
     /// Active local→remote port forwards keyed by local port.
     pub forwards: Arc<dashmap::DashMap<u16, ForwardHandle>>,
+    /// Commands the user approved through an elicitation, keyed by
+    /// `(host, exact command)` and stamped with the approval instant. Only
+    /// the server writes here; a caller-supplied "already confirmed" flag
+    /// would let the model waive its own confirmation prompts.
+    confirmations: Arc<dashmap::DashMap<(String, String), Instant>>,
+    /// Per-host profile from the `facts` probe. Read by every tool that has to
+    /// pick a backend, so the probe runs once per host per session instead of
+    /// once per decision.
+    pub(crate) facts_cache: Arc<dashmap::DashMap<String, crate::tools::ops::HostFacts>>,
     /// Built once in `new()` and read by the `#[tool_handler]` router
     /// expression. Rebuilding it per `tools/list` walked every tool's schema
     /// on a hot path for nothing.
@@ -59,6 +72,8 @@ impl SshServer {
             guards_swap,
             config_path,
             forwards: Arc::new(dashmap::DashMap::new()),
+            confirmations: Arc::new(dashmap::DashMap::new()),
+            facts_cache: Arc::new(dashmap::DashMap::new()),
             tool_router: Self::build_tool_router(),
         }
     }
@@ -120,7 +135,6 @@ impl SshServer {
         &self,
         host: &str,
         cmd: &str,
-        bypass_confirm: bool,
         ctx: &RequestContext<RoleServer>,
     ) -> Result<(), SshError> {
         let guards = self.guards().for_host(host);
@@ -134,14 +148,17 @@ impl SshServer {
                 pattern,
             }),
             GuardCheck::Confirm { pattern_name } => {
-                if bypass_confirm {
+                if self.confirm_remembered(host, cmd) {
                     return Ok(());
                 }
                 let prompt = format!(
                     "fast-mcp-ssh wants to run a sensitive command on '{host}' (matches '{pattern_name}'):\n\n{cmd}\n\nReply 'yes' to proceed."
                 );
                 match elicit_confirmation(ctx, &prompt).await {
-                    Ok(true) => Ok(()),
+                    Ok(true) => {
+                        self.remember_confirm(host, cmd);
+                        Ok(())
+                    }
                     Ok(false) => Err(SshError::ConfirmationDenied),
                     Err(e) => {
                         tracing::warn!(?e, "elicitation failed; defaulting to deny (fail-closed)");
@@ -150,6 +167,49 @@ impl SshServer {
                 }
             }
         }
+    }
+
+    /// True when this exact command was approved on this host inside
+    /// `[defaults] confirm_ttl`. Keyed on the full command string, not on the
+    /// pattern name: approving `systemctl stop nginx` must not silently
+    /// approve `systemctl stop firewalld`.
+    pub(crate) fn confirm_remembered(&self, host: &str, cmd: &str) -> bool {
+        let ttl = self.cfg().defaults.confirm_ttl.0;
+        if ttl.is_zero() {
+            return false;
+        }
+        let key = (host.to_string(), cmd.to_string());
+        match self.confirmations.get(&key) {
+            Some(at) if at.elapsed() < ttl => true,
+            Some(_) => {
+                drop(self.confirmations.remove(&key));
+                false
+            }
+            None => false,
+        }
+    }
+
+    pub(crate) fn remember_confirm(&self, host: &str, cmd: &str) {
+        if self.cfg().defaults.confirm_ttl.0.is_zero() {
+            return;
+        }
+        // Bounded so a long-lived server driven by a chatty model cannot grow
+        // this map without limit. Oldest-first eviction is not worth a heap
+        // here; a full map simply stops remembering and prompts again.
+        if self.confirmations.len() >= MAX_REMEMBERED_CONFIRMATIONS {
+            self.confirmations.retain(|_, at| at.elapsed() < self.cfg().defaults.confirm_ttl.0);
+            if self.confirmations.len() >= MAX_REMEMBERED_CONFIRMATIONS {
+                return;
+            }
+        }
+        self.confirmations
+            .insert((host.to_string(), cmd.to_string()), Instant::now());
+    }
+
+    /// Drops every remembered approval. Called by `reload`, since the guard
+    /// set the approvals were granted against no longer exists.
+    pub(crate) fn forget_confirmations(&self) {
+        self.confirmations.clear();
     }
 
     /// Singleflight: the slot mutex is held across `PtyState::open` so two

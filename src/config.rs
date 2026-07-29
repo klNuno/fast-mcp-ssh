@@ -59,7 +59,10 @@ pub struct Config {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Defaults {
-    #[serde(default = "default_true")]
+    /// Off by default: every non-wildcard alias in `~/.ssh/config` would
+    /// otherwise become a host the model can reach without it ever appearing
+    /// in `hosts.toml`. Opt in when you want that inventory.
+    #[serde(default)]
     pub import_ssh_config: bool,
     #[serde(default = "default_output")]
     pub output: OutputFmt,
@@ -69,6 +72,14 @@ pub struct Defaults {
     pub audit_log: bool,
     #[serde(default = "default_audit_path")]
     pub audit_log_path: PathBuf,
+    /// Rotate the audit log once it crosses this size. `0` disables rotation
+    /// and lets the file grow until the disk does.
+    #[serde(default = "default_audit_max_bytes")]
+    pub audit_max_bytes: u64,
+    /// How many rotated `audit.log.1 … .N` generations to keep. `0` throws the
+    /// old content away instead of archiving it.
+    #[serde(default = "default_audit_keep_files")]
+    pub audit_keep_files: usize,
     #[serde(default)]
     pub guards: Guards,
     #[serde(default = "default_keepalive")]
@@ -83,6 +94,12 @@ pub struct Defaults {
     pub max_channels_per_host: usize,
     #[serde(default)]
     pub strict_host_key_checking: StrictHostKey,
+    /// How long an approved `confirm_patterns` command stays approved, keyed
+    /// on the exact command string and host. A repeat of the identical
+    /// command inside the window runs without a second prompt; anything else
+    /// prompts again. Set `0s` to prompt every single time.
+    #[serde(default = "default_confirm_ttl")]
+    pub confirm_ttl: HumanDuration,
     /// Optional default host alias used when a tool call omits `host`.
     #[serde(default)]
     pub default_host: Option<String>,
@@ -91,11 +108,13 @@ pub struct Defaults {
 impl Default for Defaults {
     fn default() -> Self {
         Self {
-            import_ssh_config: true,
+            import_ssh_config: false,
             output: OutputFmt::Toon,
             session_idle_timeout: default_idle(),
             audit_log: true,
             audit_log_path: default_audit_path(),
+            audit_max_bytes: default_audit_max_bytes(),
+            audit_keep_files: default_audit_keep_files(),
             guards: Guards::default(),
             keepalive: default_keepalive(),
             connect_timeout: default_connect_timeout(),
@@ -103,6 +122,7 @@ impl Default for Defaults {
             max_capture_bytes: default_max_capture(),
             max_channels_per_host: default_max_channels(),
             strict_host_key_checking: StrictHostKey::default(),
+            confirm_ttl: default_confirm_ttl(),
             default_host: None,
         }
     }
@@ -254,7 +274,12 @@ fn parse_duration(s: &str) -> std::result::Result<Duration, String> {
     if mult == 0 {
         Ok(Duration::from_millis(n))
     } else {
-        Ok(Duration::from_secs(n * mult))
+        // `overflow-checks` is off in release, so an unchecked multiply would
+        // wrap a nonsense value into a plausible-looking short timeout.
+        let secs = n
+            .checked_mul(mult)
+            .ok_or_else(|| format!("duration '{s}' overflows"))?;
+        Ok(Duration::from_secs(secs))
     }
 }
 
@@ -285,6 +310,15 @@ fn default_max_capture() -> usize {
 fn default_max_channels() -> usize {
     8
 }
+fn default_confirm_ttl() -> HumanDuration {
+    HumanDuration(Duration::from_secs(900))
+}
+fn default_audit_max_bytes() -> u64 {
+    16 * 1024 * 1024
+}
+fn default_audit_keep_files() -> usize {
+    5
+}
 fn default_audit_path() -> PathBuf {
     config_dir().join("audit.log")
 }
@@ -310,6 +344,7 @@ impl Config {
                 path.display()
             )));
         }
+        warn_if_world_readable(path, "hosts.toml");
         let raw = std::fs::read_to_string(path)?;
         let mut cfg: Config = toml::from_str(&raw)?;
         if cfg.defaults.import_ssh_config {
@@ -329,6 +364,11 @@ impl Config {
     /// * `auth = "key"` with no `key` and no `keys[]`
     /// * `auth = "password"` is fine — password is supplied per-call
     /// * `auth = "agent"` is fine — no key path needed
+    /// * a configured key path that is missing or is not a regular file
+    /// * a `known_host_fingerprint` that is not `SHA256:<base64>`
+    ///
+    /// A key readable by group or other only warns, matching OpenSSH, which
+    /// refuses but has a `chmod` to offer; we do not own the file.
     pub fn validate(&self) -> Result<()> {
         if let Some(dh) = &self.defaults.default_host
             && !self.hosts.contains_key(dh)
@@ -348,6 +388,14 @@ impl Config {
             }
             if h.user.trim().is_empty() {
                 return Err(SshError::Config(format!("host '{name}': user is empty")));
+            }
+            if matches!(h.auth, AuthMethod::Key) {
+                for k in h.all_keys() {
+                    check_key_file(name, &k)?;
+                }
+            }
+            if let Some(fp) = &h.known_host_fingerprint {
+                check_fingerprint(name, fp)?;
             }
             if let Some(pj) = &h.proxy_jump {
                 if !self.hosts.contains_key(pj) {
@@ -448,7 +496,19 @@ impl Config {
             };
             let user = resolved.user.clone().unwrap_or_else(|| "root".into());
             let port = resolved.port.unwrap_or(22);
-            let key = resolved.identity_files.first().map(PathBuf::from);
+            // OpenSSH tolerates an `IdentityFile` that does not exist; it just
+            // skips it. Keep only a key we can actually read so `validate`'s
+            // stat check never fails the whole config over a side file we
+            // imported on the user's behalf.
+            let key = resolved
+                .identity_files
+                .iter()
+                .filter_map(|f| {
+                    shellexpand::full(f)
+                        .ok()
+                        .map(|e| PathBuf::from(e.into_owned()))
+                })
+                .find(|p| p.is_file());
             if let Some(pj) = resolved.proxy_jump.as_deref().and_then(jump_alias) {
                 jumps.push((alias.clone(), pj));
             }
@@ -500,6 +560,85 @@ impl Config {
             }
         }
         true
+    }
+}
+
+/// Stat a configured private key so a typo surfaces as a config error at
+/// startup instead of an opaque `AuthFailed` on the first call.
+fn check_key_file(host: &str, path: &Path) -> Result<()> {
+    let meta = std::fs::metadata(path).map_err(|e| {
+        SshError::Config(format!(
+            "host '{host}': key '{}' is unreadable: {e}",
+            path.display()
+        ))
+    })?;
+    if !meta.is_file() {
+        return Err(SshError::Config(format!(
+            "host '{host}': key '{}' is not a regular file",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o077;
+        if mode != 0 {
+            tracing::warn!(
+                host = %host,
+                path = %path.display(),
+                mode = format!("{:04o}", meta.permissions().mode() & 0o7777),
+                "private key is group- or world-accessible; chmod 600 it"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A pasted `ssh-keygen -l` line ("256 SHA256:abc… user@host (ED25519)") or an
+/// MD5 fingerprint would never match and reads like a MITM at connect time.
+/// Reject the shape here, where the message can say what was expected.
+fn check_fingerprint(host: &str, fp: &str) -> Result<()> {
+    const SHAPE: &str = "expected 'SHA256:<43 base64 chars>' — \
+                         the bare second field of `ssh-keygen -lf <key>`, no bits, no comment";
+    let Some(body) = fp.strip_prefix("SHA256:") else {
+        return Err(SshError::Config(format!(
+            "host '{host}': known_host_fingerprint '{fp}' has no SHA256: prefix — {SHAPE}"
+        )));
+    };
+    let body = body.trim_end_matches('=');
+    let ok = body.len() == 43
+        && body
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/');
+    if !ok {
+        return Err(SshError::Config(format!(
+            "host '{host}': known_host_fingerprint '{fp}' is not a base64 SHA-256 digest — {SHAPE}"
+        )));
+    }
+    Ok(())
+}
+
+/// `hosts.toml` carries the host inventory and private key paths. The `0700`
+/// on the config dir only happens when the audit log is enabled, so check the
+/// file itself. Warn rather than refuse: the user may have deliberate ACLs.
+fn warn_if_world_readable(path: &Path, label: &str) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mode = meta.permissions().mode();
+            if mode & 0o077 != 0 {
+                tracing::warn!(
+                    path = %path.display(),
+                    mode = format!("{:04o}", mode & 0o7777),
+                    "{label} is group- or world-readable; chmod 600 it"
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, label);
     }
 }
 
@@ -600,19 +739,138 @@ mod tests {
         assert!(err.to_string().contains("auth"), "got: {err}");
     }
 
-    #[test]
-    fn validate_accepts_multi_keys() {
-        let raw = r#"
+    /// Writes two throwaway key files and returns a config referencing them.
+    fn cfg_with_keys(dir: &tempfile::TempDir) -> Config {
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::write(&a, "k").unwrap();
+        std::fs::write(&b, "k").unwrap();
+        let raw = format!(
+            r#"
             [host.k]
             addr = "1.2.3.4"
             user = "root"
             auth = "key"
-            keys = ["~/a", "~/b"]
-        "#;
-        let c: Config = toml::from_str(raw).unwrap();
+            keys = [{:?}, {:?}]
+        "#,
+            a.to_string_lossy(),
+            b.to_string_lossy()
+        );
+        toml::from_str(&raw).unwrap()
+    }
+
+    #[test]
+    fn validate_accepts_multi_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = cfg_with_keys(&dir);
         c.validate().expect("ok");
         let h = &c.hosts["k"];
         assert_eq!(h.all_keys().len(), 2);
+    }
+
+    #[test]
+    fn validate_rejects_missing_key_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope");
+        let raw = format!(
+            r#"
+            [host.k]
+            addr = "1.2.3.4"
+            user = "root"
+            auth = "key"
+            key = {:?}
+        "#,
+            missing.to_string_lossy()
+        );
+        let c: Config = toml::from_str(&raw).unwrap();
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("unreadable"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_key_that_is_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = format!(
+            r#"
+            [host.k]
+            addr = "1.2.3.4"
+            user = "root"
+            auth = "key"
+            key = {:?}
+        "#,
+            dir.path().to_string_lossy()
+        );
+        let c: Config = toml::from_str(&raw).unwrap();
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("regular file"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_ignores_key_path_for_agent_auth() {
+        let raw = r#"
+            [host.k]
+            addr = "1.2.3.4"
+            user = "root"
+            auth = "agent"
+            key = "/definitely/not/here"
+        "#;
+        let c: Config = toml::from_str(raw).unwrap();
+        c.validate().expect("agent auth never reads the key path");
+    }
+
+    fn cfg_with_fingerprint(fp: &str) -> Config {
+        let raw = format!(
+            r#"
+            [host.k]
+            addr = "1.2.3.4"
+            user = "root"
+            auth = "agent"
+            known_host_fingerprint = "{fp}"
+        "#
+        );
+        toml::from_str(&raw).unwrap()
+    }
+
+    #[test]
+    fn validate_accepts_well_formed_fingerprint() {
+        let fp = format!("SHA256:{}", "A".repeat(43));
+        cfg_with_fingerprint(&fp).validate().expect("ok");
+    }
+
+    #[test]
+    fn validate_rejects_md5_fingerprint() {
+        let c = cfg_with_fingerprint("MD5:aa:bb:cc:dd");
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("SHA256:"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_fingerprint_with_comment() {
+        let fp = format!("SHA256:{} user@host (ED25519)", "A".repeat(43));
+        let c = cfg_with_fingerprint(&fp);
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("base64"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_duration_rejects_overflow() {
+        assert!(parse_duration("999999999999999999d").is_err());
+        assert!(parse_duration("18446744073709551615h").is_err());
+        assert_eq!(parse_duration("1d").unwrap(), Duration::from_secs(86400));
+    }
+
+    #[test]
+    fn import_ssh_config_is_opt_in() {
+        let c: Config = toml::from_str("").unwrap();
+        assert!(!c.defaults.import_ssh_config);
+        assert!(!Defaults::default().import_ssh_config);
+    }
+
+    #[test]
+    fn audit_rotation_defaults() {
+        let c: Config = toml::from_str("").unwrap();
+        assert_eq!(c.defaults.audit_max_bytes, 16 * 1024 * 1024);
+        assert_eq!(c.defaults.audit_keep_files, 5);
     }
 
     #[test]

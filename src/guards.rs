@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -180,7 +181,11 @@ fn sensitive_read_path_re() -> &'static Regex {
             |
             (?:^|/)\.docker/config\.json$
             |
-            (?:^|/)\.config/gcloud/(?:application_default_credentials|credentials)\.json$
+            (?:^|/)\.config/gcloud/.+$
+            |
+            (?:^|/)\.azure/.+$
+            |
+            (?:^|/)\.git-credentials$
             |
             (?:^|/)\.netrc$
             |
@@ -206,7 +211,10 @@ fn sensitive_write_path_re() -> &'static Regex {
             r#"(?ix)
             (?:^|/)
             (?:
-                \.ssh/(?:authorized_keys|known_hosts|id_[a-z0-9]+)
+                # authorized_keys2 is still in sshd's default AuthorizedKeysFile,
+                # and ~/.ssh/rc is executed by sshd on every login — both were
+                # reachable past the old `authorized_keys|known_hosts|id_*` list.
+                \.ssh/(?:authorized_keys2?|known_hosts2?|id_[a-z0-9]+|rc|config|environment)
               | sudoers
               | shadow | gshadow | passwd | group
               | crontab
@@ -215,14 +223,193 @@ fn sensitive_write_path_re() -> &'static Regex {
             |
             (?:^|/)
             (?:
-                etc/(?:sudoers\.d|cron\.(?:d|hourly|daily|weekly|monthly)|init\.d|systemd/system|pam\.d|ssh)/.*
-              | etc/(?:fstab|hosts|resolv\.conf|nsswitch\.conf|environment)
+                etc/(?:sudoers\.d|cron\.(?:d|hourly|daily|weekly|monthly)|init\.d|systemd/system|pam\.d|ssh|profile\.d)/.*
+              | etc/(?:fstab|hosts|resolv\.conf|nsswitch\.conf|environment|profile|ld\.so\.preload|ld\.so\.conf)
+              | etc/ld\.so\.conf\.d/.*
+              | (?:usr/)?lib/systemd/(?:system|user)/.*
+              | var/spool/cron/.*
+              | root/\.ssh/.*
               | boot/.*
             )
             $"#,
         )
         .expect("sensitive_write_path_re valid")
     })
+}
+
+// ---------------------------------------------------------------------------
+// Local filesystem guards.
+//
+// `dn local=<path>` writes remote-controlled bytes onto the operator's own
+// machine and `up local=<path>` ships the operator's own bytes to a remote
+// host. Neither is host-scoped, so these are free functions rather than
+// `CompiledGuards` methods — a per-host config can't loosen them.
+// ---------------------------------------------------------------------------
+
+/// Expand `~`, make absolute, then resolve the parent through the real
+/// filesystem. Matching the raw string would let `~/x/../.bashrc` or a
+/// symlinked directory land on a protected file the argument never named.
+/// The parent may not exist yet (`dn` creates it), so fall back to a lexical
+/// resolve rather than skipping the guard.
+pub fn resolve_local_path(raw: &str) -> PathBuf {
+    let mut p = PathBuf::from(shellexpand::tilde(raw).into_owned());
+    if p.is_relative()
+        && let Ok(cwd) = std::env::current_dir()
+    {
+        p = cwd.join(p);
+    }
+    if let (Some(parent), Some(name)) = (p.parent(), p.file_name())
+        && let Ok(real) = parent.canonicalize()
+    {
+        return lexical_normalize(&real.join(name));
+    }
+    lexical_normalize(&p)
+}
+
+/// Refuse a local write that would land on shell startup files, SSH material,
+/// credential stores or an autostart directory. A `dn` of attacker-chosen
+/// remote content into `~/.bashrc` is code execution on the operator's box.
+pub fn check_local_write(resolved: &Path) -> Result<()> {
+    let s = slashed(resolved);
+    if local_write_path_re().is_match(&s) || is_home_dotrc(resolved) {
+        return Err(SshError::BlockedByGuard {
+            name: "local-write".into(),
+            pattern: "write to sensitive local path blocked".into(),
+        });
+    }
+    Ok(())
+}
+
+/// Refuse a local read of private keys, credential files, browser cookie
+/// stores or `.env` files. Without it `up` is an exfiltration primitive.
+pub fn check_local_read(resolved: &Path) -> Result<()> {
+    if local_read_path_re().is_match(&slashed(resolved)) {
+        return Err(SshError::BlockedByGuard {
+            name: "local-read".into(),
+            pattern: "read of sensitive local path blocked".into(),
+        });
+    }
+    Ok(())
+}
+
+fn local_write_path_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?ix)
+            # Shell startup files — sourced by the next interactive shell.
+            (?:^|/)\.(?:bashrc|bash_profile|bash_login|bash_logout|profile
+                      |zshrc|zshenv|zprofile|zlogin|zlogout|kshrc|cshrc|tcshrc)$
+            |
+            (?:^|/)\.config/fish/(?:config\.fish|conf\.d/.+|functions/.+)$
+            |
+            # Anything under .ssh/ — keys, config (ProxyCommand), known_hosts.
+            (?:^|/)\.ssh/.+$
+            |
+            (?:^|/)\.(?:gitconfig|npmrc|pypirc|netrc|pgpass|curlrc|wgetrc)$
+            |
+            (?:^|/)\.aws/.+$
+            |
+            (?:^|/)\.config/gcloud/.+$
+            |
+            (?:^|/)\.kube/.+$
+            |
+            (?:^|/)\.docker/.+$
+            |
+            # Crontab spools, both Debian and RedHat layouts.
+            (?:^|/)(?:var/spool/cron|etc/cron\.d|etc/cron\.(?:hourly|daily|weekly|monthly))/.+$
+            |
+            (?:^|/)\.config/(?:autostart|systemd/user)/.+$
+            |
+            # Windows autostart: a dropped file runs at next logon.
+            # `\x20`, not a literal space: `(?x)` strips whitespace inside
+            # character classes too, so `[ ]` would parse as an unclosed class.
+            (?:^|/)start\x20menu/programs/startup/.+$
+            "#,
+        )
+        .expect("local_write_path_re valid")
+    })
+}
+
+fn local_read_path_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?ix)
+            # Private keys. The char class excludes `.` so `id_rsa.pub` — which
+            # is meant to be copied around — stays readable.
+            (?:^|/)\.ssh/id_[a-z0-9_-]+$
+            |
+            \.(?:pem|key|pfx|p12)$
+            |
+            (?:^|/)\.aws/credentials$
+            |
+            (?:^|/)\.config/gcloud/.+$
+            |
+            (?:^|/)\.kube/config$
+            |
+            (?:^|/)\.docker/config\.json$
+            |
+            (?:^|/)\.(?:netrc|npmrc|pypirc|pgpass|git-credentials)$
+            |
+            # Browser cookie / saved-password stores: session-token theft.
+            (?:^|/)(?:cookies\.sqlite|cookies|login\x20data|key[34]\.db|logins\.json)$
+            |
+            (?:^|/)\.env(?:\.[a-z0-9_.-]+)?$
+            "#,
+        )
+        .expect("local_read_path_re valid")
+    })
+}
+
+/// Catch-all for dotfiles the explicit list misses: any `.<something>rc`
+/// directly under the operator's home is a startup file for *some* tool.
+/// Scoped to home so an unrelated `./.foorc` in a scratch dir stays writable.
+fn is_home_dotrc(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if name.len() < 4 || !name.starts_with('.') || !name.to_ascii_lowercase().ends_with("rc") {
+        return false;
+    }
+    let home = shellexpand::tilde("~");
+    if home.as_ref() == "~" {
+        return false;
+    }
+    let h = slashed(Path::new(home.as_ref()))
+        .trim_end_matches('/')
+        .to_ascii_lowercase();
+    if h.is_empty() {
+        return false;
+    }
+    let p = slashed(path).to_ascii_lowercase();
+    p.len() > h.len() && p.starts_with(&h) && p.as_bytes().get(h.len()) == Some(&b'/')
+}
+
+/// Forward-slash view of a path, with the Windows `\\?\` verbatim prefix that
+/// `canonicalize` adds stripped, so one regex covers both platforms.
+fn slashed(p: &Path) -> String {
+    let s = p.to_string_lossy().replace('\\', "/");
+    match s.strip_prefix("//?/") {
+        Some(rest) => rest.to_string(),
+        None => s,
+    }
+}
+
+/// Resolve `.` and `..` without touching the filesystem. Used for the tail of
+/// a path whose parent does not exist yet.
+fn lexical_normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// Pre-compiled guard cache keyed by host name. The `default` slot holds
@@ -685,5 +872,186 @@ mod tests {
         ] {
             assert!(g.check_sftp_read(path).is_ok(), "should allow: {path}");
         }
+    }
+
+    #[test]
+    fn sftp_read_blocks_added_paths() {
+        let g = CompiledGuards::compile(&Guards::default()).unwrap();
+        for path in [
+            "/proc/1/environ",
+            "/etc/sudoers",
+            "/home/alice/.config/gcloud/access_tokens.db",
+            "/home/alice/.azure/msal_token_cache.json",
+            "/home/alice/.git-credentials",
+        ] {
+            assert!(g.check_sftp_read(path).is_err(), "should block: {path}");
+        }
+        for path in ["/home/alice/.config/nvim/init.lua", "/proc/cpuinfo"] {
+            assert!(g.check_sftp_read(path).is_ok(), "should allow: {path}");
+        }
+    }
+
+    #[test]
+    fn sftp_write_blocks_sensitive_paths() {
+        let g = CompiledGuards::compile(&Guards::default()).unwrap();
+        for path in [
+            // The two bypasses the old `.ssh/(authorized_keys|known_hosts|id_*)`
+            // list left open.
+            "/home/alice/.ssh/authorized_keys2",
+            "/home/alice/.ssh/rc",
+            "/home/alice/.ssh/config",
+            "/etc/ld.so.preload",
+            "/etc/ld.so.conf.d/local.conf",
+            "/var/spool/cron/crontabs/root",
+            "/etc/cron.d/backup",
+            "/etc/sudoers",
+            "/etc/sudoers.d/90-cloud",
+            "/lib/systemd/system/ssh.service",
+            "/usr/lib/systemd/system/ssh.service",
+            "/etc/systemd/system/evil.service",
+            "/etc/profile.d/evil.sh",
+            "/etc/pam.d/sshd",
+            "/root/.ssh/authorized_keys",
+        ] {
+            assert!(g.check_sftp_write(path).is_err(), "should block: {path}");
+        }
+    }
+
+    #[test]
+    fn sftp_write_allows_safe_paths() {
+        let g = CompiledGuards::compile(&Guards::default()).unwrap();
+        for path in [
+            "/tmp/deploy.sh",
+            "/home/alice/project/src/main.rs",
+            "/var/spooled/notes.txt",
+            "/opt/app/config.yaml",
+            "/home/alice/.ssh_backup_notes",
+        ] {
+            assert!(g.check_sftp_write(path).is_ok(), "should allow: {path}");
+        }
+    }
+
+    #[test]
+    fn local_write_blocks_startup_and_credential_paths() {
+        for path in [
+            "/home/alice/.bashrc",
+            "/home/alice/.bash_profile",
+            "/home/alice/.profile",
+            "/home/alice/.zshrc",
+            "/home/alice/.zshenv",
+            "/home/alice/.zprofile",
+            "/home/alice/.config/fish/config.fish",
+            "/home/alice/.ssh/authorized_keys",
+            "/home/alice/.ssh/config",
+            "/home/alice/.gitconfig",
+            "/home/alice/.npmrc",
+            "/home/alice/.pypirc",
+            "/home/alice/.netrc",
+            "/home/alice/.aws/credentials",
+            "/home/alice/.config/gcloud/settings.json",
+            "/home/alice/.kube/config",
+            "/home/alice/.docker/config.json",
+            "/var/spool/cron/crontabs/alice",
+            "/etc/cron.d/job",
+            "C:/Users/alice/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup/x.bat",
+        ] {
+            assert!(
+                check_local_write(Path::new(path)).is_err(),
+                "should block: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_write_allows_ordinary_paths() {
+        for path in [
+            "/home/alice/downloads/report.pdf",
+            "/tmp/out.log",
+            "/home/alice/project/.env.example.txt",
+            "C:/Users/alice/Downloads/build.zip",
+        ] {
+            assert!(
+                check_local_write(Path::new(path)).is_ok(),
+                "should allow: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_write_blocks_parent_traversal() {
+        // `..` in the argument must not dodge the match. The middle component
+        // is deliberately non-existent so the lexical fallback is exercised on
+        // every platform.
+        let raw = "~/fast-mcp-ssh-no-such-dir/../.bashrc";
+        let resolved = resolve_local_path(raw);
+        assert!(
+            check_local_write(&resolved).is_err(),
+            "traversal should still hit the guard: {}",
+            resolved.display()
+        );
+    }
+
+    #[test]
+    fn local_write_blocks_home_dotrc_catchall() {
+        let home = PathBuf::from(shellexpand::tilde("~").into_owned());
+        assert!(check_local_write(&home.join(".vimrc")).is_err());
+        assert!(check_local_write(&home.join(".inputrc")).is_err());
+        // Same name outside home is nobody's startup file.
+        assert!(check_local_write(Path::new("/tmp/scratch/.vimrc")).is_ok());
+        // Not an rc file.
+        assert!(check_local_write(&home.join(".vimrc.bak")).is_ok());
+    }
+
+    #[test]
+    fn local_read_blocks_secrets() {
+        for path in [
+            "/home/alice/.ssh/id_rsa",
+            "/home/alice/.ssh/id_ed25519",
+            "/home/alice/keys/server.pem",
+            "/home/alice/keys/server.key",
+            "/home/alice/.aws/credentials",
+            "/home/alice/.config/gcloud/credentials.db",
+            "/home/alice/.kube/config",
+            "/home/alice/.docker/config.json",
+            "/home/alice/.netrc",
+            "/home/alice/.npmrc",
+            "/home/alice/.pypirc",
+            "/home/alice/.mozilla/firefox/p/cookies.sqlite",
+            "C:/Users/alice/AppData/Local/Google/Chrome/User Data/Default/Login Data",
+            "C:/Users/alice/AppData/Local/Google/Chrome/User Data/Default/Cookies",
+            "/home/alice/app/.env",
+            "/home/alice/app/.env.production",
+        ] {
+            assert!(
+                check_local_read(Path::new(path)).is_err(),
+                "should block: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_read_allows_ordinary_paths() {
+        for path in [
+            "/home/alice/.ssh/id_rsa.pub",
+            "/home/alice/.ssh/known_hosts",
+            "/home/alice/project/main.rs",
+            "/home/alice/project/env.example",
+            "/tmp/build.tar.gz",
+        ] {
+            assert!(
+                check_local_read(Path::new(path)).is_ok(),
+                "should allow: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn lexical_normalize_drops_traversal() {
+        assert_eq!(
+            slashed(&lexical_normalize(Path::new("/a/b/../c/./d"))),
+            "/a/c/d"
+        );
+        // Popping past the root stays at the root rather than escaping.
+        assert_eq!(slashed(&lexical_normalize(Path::new("/../../etc"))), "/etc");
     }
 }
