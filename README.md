@@ -11,7 +11,8 @@
 
 An MCP server that gives a model real SSH access: one connection per host kept
 alive across calls, a PTY shell that remembers `cd` and `export`, SFTP instead
-of `cat > file`, regex guards before anything leaves your machine, and an
+of `cat > file`, host-to-host copies that never touch your disk, a screenshot
+of the remote desktop, regex guards before anything leaves your machine, and an
 append-only audit log. Answers come back as TOON, roughly 40 percent fewer
 tokens than JSON on tabular data.
 
@@ -55,7 +56,8 @@ In the [MCP registry](https://registry.modelcontextprotocol.io) it is
 | Group | Tools | |
 |---|---|---|
 | Run | `exec` `exec_batch` `sh` `interrupt` | One-shot, parallel fan-out, persistent PTY, Ctrl-C |
-| Files | `ls` `stat` `dn` `up` `wr` `mkdir` `rm` `tail` | SFTP, plus `tail -n` / `tail -F` in a bounded window |
+| Files | `ls` `stat` `dn` `up` `cp` `wr` `mkdir` `rm` `tail` | SFTP, plus `tail -n` / `tail -F` in a bounded window |
+| Visual | `shot` | Screenshots the remote desktop, downscaled before it reaches the model |
 | Ops | `facts` `sys` `svc` | Cached host profile, parsed `ps`/`df`/`mem`/`net`, systemd units |
 | Session | `hosts` `ping` `disconnect` `disconnect_all` `reload` | Discovery and lifecycle; `reload` swaps config without a restart |
 | Network | `forward` `unforward` `forwards` | Local TCP forwards over the same connection |

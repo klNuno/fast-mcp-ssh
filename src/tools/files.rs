@@ -1,4 +1,4 @@
-//! Filesystem tools: `ls`, `stat`, `dn`, `up`, `wr`, `mkdir`, `rm`, `tail`.
+//! Filesystem tools: `ls`, `stat`, `dn`, `up`, `cp`, `wr`, `mkdir`, `rm`, `tail`.
 
 use std::time::Duration;
 
@@ -40,6 +40,24 @@ pub struct DownloadArgs {
     /// Local destination path. Omit to receive content inline (text < 256 KB; binary base64).
     #[serde(default)]
     pub local: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CopyArgs {
+    /// Source host alias.
+    pub from_host: String,
+    /// Source path on `from_host`.
+    pub from: String,
+    /// Destination host alias. May be the same as `from_host`.
+    pub to_host: String,
+    /// Destination path on `to_host`. Parent dir must exist.
+    pub to: String,
+    /// Compare sha256 on both hosts after the copy. Default true.
+    #[serde(default)]
+    pub verify: Option<bool>,
+    /// Octal mode at create time (e.g. 420 = 0o644). Default: the source mode.
+    #[serde(default)]
+    pub mode: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -305,6 +323,124 @@ impl SshServer {
             // was transferred (`bytes` reports the remote size).
             t.field("content", "(too large for inline; rerun with local=<path>)");
         }
+        Ok(text(t.into_string()))
+    }
+
+    #[tool(
+        description = "Copy a file host→host over SFTP without touching local disk. Use when both hosts are configured, even if they cannot reach each other. Not for local↔remote — use up/dn.",
+        annotations(
+            title = "Cp",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn cp(&self, Parameters(args): Parameters<CopyArgs>) -> Result<CallToolResult, McpError> {
+        let from_host = self.resolve_host(Some(args.from_host))?;
+        let to_host = self.resolve_host(Some(args.to_host))?;
+        // Both ends are guarded by the host they belong to: reading
+        // /etc/shadow is refused by the source's bank, and landing a payload
+        // in the destination's authorized_keys by the destination's.
+        if let Err(e) = self
+            .guards()
+            .for_host(&from_host)
+            .check_sftp_read(&args.from)
+        {
+            self.audit.write(
+                &from_host,
+                "cp",
+                Some(&args.from),
+                None,
+                None,
+                None,
+                None,
+                Some(&e.to_string()),
+                Some(e.to_string()),
+            );
+            return Err(e.into_mcp());
+        }
+        if let Err(e) = self.guards().for_host(&to_host).check_sftp_write(&args.to) {
+            self.audit.write(
+                &to_host,
+                "cp",
+                Some(&args.to),
+                None,
+                None,
+                None,
+                None,
+                Some(&e.to_string()),
+                Some(e.to_string()),
+            );
+            return Err(e.into_mcp());
+        }
+        let (src, dst) = tokio::try_join!(
+            self.pool.get_or_connect(&from_host, None),
+            self.pool.get_or_connect(&to_host, None),
+        )
+        .map_err(|e| e.into_mcp())?;
+        self.guard_resolved(&from_host, "cp", &src, &args.from, false)
+            .await?;
+        self.guard_resolved(&to_host, "cp", &dst, &args.to, true)
+            .await?;
+
+        let r = sftp::copy_between(&src, &args.from, &dst, &args.to, args.mode)
+            .await
+            .map_err(|e| e.into_mcp())?;
+
+        let mut t = Toon::new();
+        t.field("from", format!("{from_host}:{}", args.from))
+            .field("to", format!("{to_host}:{}", args.to))
+            .field("bytes", r.bytes)
+            .field("ms", r.duration_ms as u64);
+        if r.duration_ms > 0 {
+            let mbps = (r.bytes as f64 / 1_048_576.0) / (r.duration_ms as f64 / 1000.0);
+            t.field("mbps", format!("{mbps:.1}"));
+        }
+        // Hashing on both hosts rather than on the bytes in flight: those came
+        // out of one buffer, so they can only prove the buffer agrees with
+        // itself. This catches a short write at the destination.
+        if args.verify.unwrap_or(true) {
+            match self
+                .sha256_pair(&from_host, &src, &args.from, &to_host, &dst, &args.to)
+                .await
+            {
+                Ok((a, b)) if a == b => {
+                    t.field("verified", true).field("sha256", &a);
+                }
+                Ok((a, b)) => {
+                    let msg = format!("sha256 mismatch: {from_host} {a}, {to_host} {b}");
+                    self.audit.write(
+                        &to_host,
+                        "cp",
+                        Some(&args.to),
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(&msg),
+                        Some(msg.clone()),
+                    );
+                    return Err(SshError::Other(msg).into_mcp());
+                }
+                // A missing `sha256sum` is not a reason to fail a copy that
+                // otherwise succeeded, but it must not silently read as verified.
+                Err(why) => {
+                    t.field("verified", false).field("verify_skipped", &why);
+                }
+            }
+        }
+        self.audit.write(
+            &to_host,
+            "cp",
+            Some(&format!("{from_host}:{} -> {}", args.from, args.to)),
+            None,
+            Some(r.duration_ms),
+            Some(r.bytes),
+            None,
+            None,
+            None,
+        );
         Ok(text(t.into_string()))
     }
 
@@ -730,5 +866,76 @@ impl SshServer {
         }
         t.block("content", &display);
         Ok(text(t.into_string()))
+    }
+}
+
+/// Wrap a remote path for `sh -c`. Single quotes stop every metacharacter, and
+/// the only thing they cannot carry is a single quote, which is spliced.
+pub(crate) fn shell_quote(path: &str) -> String {
+    format!("'{}'", path.replace('\'', r"'\''"))
+}
+
+impl SshServer {
+    /// sha256 of both files, computed by the hosts themselves and in parallel.
+    /// `Err(reason)` means the digest could not be taken at all, which the
+    /// caller reports as unverified rather than as a failed copy.
+    async fn sha256_pair(
+        &self,
+        from_host: &str,
+        src: &crate::session::Session,
+        from: &str,
+        to_host: &str,
+        dst: &crate::session::Session,
+        to: &str,
+    ) -> Result<(String, String), String> {
+        let timeout = Duration::from_secs(120);
+        let cap = self.cfg().defaults.max_capture_bytes;
+        // `shasum` is the macOS spelling; the fallback costs nothing when the
+        // first one exists.
+        let cmd = |path: &str| {
+            let q = shell_quote(path);
+            format!("sha256sum -- {q} 2>/dev/null || shasum -a 256 -- {q}")
+        };
+        let (cmd_from, cmd_to) = (cmd(from), cmd(to));
+        let (a, b) = tokio::join!(
+            crate::session::exec::exec(src, &cmd_from, timeout, cap),
+            crate::session::exec::exec(dst, &cmd_to, timeout, cap),
+        );
+        let parse = |r: crate::errors::Result<crate::session::exec::ExecResult>| {
+            let r = r.map_err(|e| e.to_string())?;
+            if r.exit_code != 0 {
+                return Err(format!("sha256sum unavailable (exit {})", r.exit_code));
+            }
+            r.stdout
+                .split_whitespace()
+                .next()
+                .filter(|h| h.len() == 64)
+                .map(str::to_string)
+                .ok_or_else(|| "unparseable sha256sum output".to_string())
+        };
+        match (parse(a), parse(b)) {
+            (Ok(a), Ok(b)) => Ok((a, b)),
+            (Err(e), _) => Err(format!("{from_host}: {e}")),
+            (_, Err(e)) => Err(format!("{to_host}: {e}")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shell_quote;
+
+    #[test]
+    fn quoting_neutralises_metacharacters() {
+        assert_eq!(shell_quote("/tmp/a b"), "'/tmp/a b'");
+        assert_eq!(shell_quote("/tmp/$(id)"), "'/tmp/$(id)'");
+        assert_eq!(shell_quote("/tmp/x;rm -rf /"), "'/tmp/x;rm -rf /'");
+    }
+
+    #[test]
+    fn a_single_quote_is_spliced_not_escaped() {
+        // sh has no escape inside single quotes: the run has to be closed,
+        // the quote passed literally, and a new run opened.
+        assert_eq!(shell_quote("/tmp/it's"), r"'/tmp/it'\''s'");
     }
 }

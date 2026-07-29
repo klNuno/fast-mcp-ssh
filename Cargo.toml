@@ -1,6 +1,6 @@
 [package]
 name = "fast-mcp-ssh"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 rust-version = "1.89"
 description = "Fast MCP SSH server with persistent PTY sessions, SFTP, and AI-first tool surface"
@@ -48,6 +48,10 @@ zeroize = { version = "1", features = ["derive"] }
 memchr = "2"
 getrandom = "0.4"
 base64 = "0.23"
+# Decode + downscale + re-encode a remote screenshot before it reaches the
+# model. Default features pull in every format decoder; `shot` only ever sees
+# what the remote capture tool wrote, which is PNG or JPEG.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 time = { version = "0.3", default-features = false, features = ["std", "formatting"] }
 
 [dev-dependencies]

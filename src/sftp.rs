@@ -18,6 +18,10 @@ const PARALLEL_DOWNLOAD_MIN: u64 = 4 * 1024 * 1024;
 const PARALLEL_DOWNLOAD_WORKERS: u64 = 6;
 /// Max in-flight SFTP delete requests during a recursive remove.
 const RM_CONCURRENCY: usize = 16;
+/// A host-to-host copy pays a read *and* a write round-trip per chunk, so it
+/// stripes earlier and wider than a download: both sides pipeline.
+const PARALLEL_COPY_MIN: u64 = 1024 * 1024;
+const PARALLEL_COPY_WORKERS: u64 = 4;
 
 pub struct SftpResult {
     pub bytes: usize,
@@ -331,6 +335,160 @@ async fn download_striped(
     let mut total = 0usize;
     while let Some(joined) = set.join_next().await {
         total += joined.map_err(|e| SshError::Other(format!("download worker: {e}")))??;
+    }
+    Ok(total)
+}
+
+/// Copy `src_path` on one host to `dst_path` on another, splicing the two SFTP
+/// sessions directly. The bytes cross this process but never touch its disk and
+/// never enter the model's context, and the two hosts do not need to reach each
+/// other: the usual alternative is `dn` to a local file followed by `up`, which
+/// writes the whole payload to the operator's disk and pays for the round-trip
+/// twice.
+///
+/// Large files stripe the same way `download_striped` does, except each worker
+/// owns a read handle on the source *and* a write handle on the destination.
+/// One handle can only keep a single request in flight per side, so a plain
+/// read-then-write loop spends every round-trip waiting; N pairs pipeline.
+pub async fn copy_between(
+    src: &Session,
+    src_path: &str,
+    dst: &Session,
+    dst_path: &str,
+    mode: Option<u32>,
+) -> Result<SftpResult> {
+    let start = Instant::now();
+    let src_sftp = src.sftp().await?;
+    let dst_sftp = dst.sftp().await?;
+
+    let mut reader = src_sftp
+        .open_with_flags(src_path, OpenFlags::READ)
+        .await
+        .map_err(SshError::from)?;
+    let meta = reader.metadata().await.ok();
+    let size = meta.as_ref().and_then(|m| m.size);
+    // Preserve the source mode unless the caller pinned one: a copied script
+    // that lost its exec bit is a silent failure at the far end.
+    let attrs = FileAttributes {
+        permissions: Some(
+            mode.or_else(|| meta.as_ref().and_then(|m| m.permissions))
+                .unwrap_or(0o644),
+        ),
+        ..Default::default()
+    };
+
+    // Same `.partial` + rename discipline as `upload`, so a blip mid-copy
+    // cannot leave a truncated file at the destination path.
+    let partial = format!("{dst_path}.partial");
+    let mut writer = dst_sftp
+        .open_with_flags_and_attributes(
+            &partial,
+            OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE,
+            attrs,
+        )
+        .await
+        .map_err(SshError::from)?;
+
+    let striped = size.is_some_and(|s| s >= PARALLEL_COPY_MIN);
+    let copied: Result<usize> = if striped {
+        drop(reader);
+        writer.shutdown().await?;
+        drop(writer);
+        copy_striped(&src_sftp, src_path, &dst_sftp, &partial, size.unwrap_or(0)).await
+    } else {
+        async {
+            let mut buf = vec![0u8; TRANSFER_CHUNK];
+            let mut total = 0usize;
+            loop {
+                let n = reader.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                writer.write_all(&buf[..n]).await?;
+                total += n;
+            }
+            writer.shutdown().await?;
+            Ok(total)
+        }
+        .await
+    };
+
+    let total = match copied {
+        Ok(n) => n,
+        Err(e) => {
+            let _ = dst_sftp.remove_file(&partial).await;
+            return Err(e);
+        }
+    };
+    dst_sftp
+        .rename(&partial, dst_path)
+        .await
+        .map_err(SshError::from)?;
+    src.touch();
+    dst.touch();
+    Ok(SftpResult {
+        bytes: total,
+        duration_ms: start.elapsed().as_millis(),
+    })
+}
+
+/// Stripe a copy across `PARALLEL_COPY_WORKERS` read/write handle pairs. The
+/// destination file already exists and is truncated; each worker seeks both
+/// sides to its own offset, so the stripes never overlap.
+async fn copy_striped(
+    src_sftp: &std::sync::Arc<russh_sftp::client::SftpSession>,
+    src_path: &str,
+    dst_sftp: &std::sync::Arc<russh_sftp::client::SftpSession>,
+    dst_path: &str,
+    size: u64,
+) -> Result<usize> {
+    let workers = PARALLEL_COPY_WORKERS
+        .min(size.div_ceil(PARALLEL_COPY_MIN))
+        .max(1);
+    let stripe = size.div_ceil(workers);
+    let mut set = tokio::task::JoinSet::new();
+    for w in 0..workers {
+        let offset = w * stripe;
+        let len = stripe.min(size - offset);
+        if len == 0 {
+            break;
+        }
+        let src_sftp = std::sync::Arc::clone(src_sftp);
+        let dst_sftp = std::sync::Arc::clone(dst_sftp);
+        let src_path = src_path.to_string();
+        let dst_path = dst_path.to_string();
+        set.spawn(async move {
+            let mut rf = src_sftp
+                .open_with_flags(src_path, OpenFlags::READ)
+                .await
+                .map_err(SshError::from)?;
+            rf.seek(std::io::SeekFrom::Start(offset)).await?;
+            let mut wf = dst_sftp
+                .open_with_flags(dst_path, OpenFlags::WRITE)
+                .await
+                .map_err(SshError::from)?;
+            wf.seek(std::io::SeekFrom::Start(offset)).await?;
+            let mut buf = vec![0u8; TRANSFER_CHUNK];
+            let mut left = len as usize;
+            while left > 0 {
+                let want = left.min(TRANSFER_CHUNK);
+                let n = rf.read(&mut buf[..want]).await?;
+                if n == 0 {
+                    return Err(SshError::Other(format!(
+                        "sftp copy: short read at offset {}",
+                        offset + (len as usize - left) as u64
+                    )));
+                }
+                wf.write_all(&buf[..n]).await?;
+                left -= n;
+            }
+            wf.shutdown().await?;
+            Ok::<usize, SshError>(len as usize)
+        });
+    }
+    let mut total = 0usize;
+    while let Some(joined) = set.join_next().await {
+        total += joined.map_err(|e| SshError::Other(format!("copy worker: {e}")))??;
     }
     Ok(total)
 }
