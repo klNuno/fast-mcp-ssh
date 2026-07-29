@@ -59,7 +59,7 @@ jobs:
           (Get-FileHash fast-mcp-ssh-${{ matrix.target }}.zip -Algorithm SHA256).Hash `
             | Out-File fast-mcp-ssh-${{ matrix.target }}.zip.sha256
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: |
             fast-mcp-ssh-${{ matrix.target }}.tar.gz
