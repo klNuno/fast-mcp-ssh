@@ -6,6 +6,43 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-29
+
+### Added
+- `facts`, `sys` and `svc` tools. `facts` probes a host once and caches the
+  profile; `sys` returns parsed `ps`/`df`/`mem`/`net`/`du`/`who`/`load`; `svc`
+  drives systemd units through validated unit names and machine-readable
+  `systemctl show` / `journalctl -o json` output.
+- Local path guards: `dn` refuses to write into shell startup files, SSH
+  material, credential stores and autostart directories on the operator's own
+  machine, and `up` refuses to read them.
+- Remote paths are re-checked after `FXP_REALPATH` resolution, so a symlink
+  cannot launder a blocked path past the guard.
+- Audit log rotation (`audit_max_bytes`, `audit_keep_files`) on the writer
+  task, plus a `confirm_ttl` window that remembers an approved command.
+- Config validation rejects a missing or unreadable key path and a fingerprint
+  that is not `SHA256:<43 base64 chars>`, and warns on world-readable keys.
+- `ChannelLimit` and `FingerprintMismatch` errors now reach the caller with a
+  recovery hint instead of a generic russh failure.
+
+### Changed
+- `rm` stats with `FXP_LSTAT`, so a symlink entry point can no longer walk into
+  the target's tree; recursive delete of a symlink is refused outright. `stat`
+  reports the link itself and resolves its target separately.
+- `import_ssh_config` is opt-in.
+- Waiting for a channel slot is bounded at 15 s and reports which limit was hit.
+- Benchmark harness takes a JSON server list and compares any number of MCP
+  servers in one run.
+
+### Fixed
+- Two guard regexes never compiled: `[ ]` inside an `(?x)` pattern is an
+  unclosed character class because extended mode also strips whitespace inside
+  character classes. Both banks panicked at first use.
+
+### Removed
+- `CONTRIBUTING.md` (its content lives in the repo's agent instructions) and the
+  one-file `examples/` directory, now `hosts.example.toml` at the root.
+
 ## [0.3.0] - 2026-07-09
 
 ### Added

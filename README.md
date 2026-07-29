@@ -1,21 +1,32 @@
-# fast-mcp-ssh
+<h1 align="center">fast-mcp-ssh</h1>
+<p align="center">SSH, SFTP and persistent shells for AI agents. One Rust binary, no runtime.</p>
 
-MCP server in Rust that exposes SSH over stdio. Persistent connection per host, PTY shell sessions, SFTP, regex guards, NDJSON audit log. Single binary, ~10 MB resident, ~50 ms start.
+<p align="center">
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License" /></a>
+  <img src="https://img.shields.io/badge/rust-1.89%2B-b7410e?logo=rust" alt="Rust 1.89+" />
+  <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-0078D6" alt="Platform" />
+  <img src="https://img.shields.io/badge/MCP-stdio-8A2BE2" alt="MCP stdio" />
+</p>
+
+An MCP server that gives a model real SSH access: one connection per host kept
+alive across calls, a PTY shell that remembers `cd` and `export`, SFTP instead
+of `cat > file`, regex guards before anything leaves your machine, and an
+append-only audit log. Answers come back as TOON, roughly 40 percent fewer
+tokens than JSON on tabular data.
 
 ## Install
 
 ```bash
-cargo install --path .
-# or
-cargo build --release
-# binary: target/release/fast-mcp-ssh
+cargo install --path .          # or: cargo build --release
 ```
 
-Config goes in `~/.fast-mcp-ssh/hosts.toml` (template at `examples/hosts.toml`). Keys live in `~/.fast-mcp-ssh/keys/<name>`.
+Copy [`hosts.example.toml`](./hosts.example.toml) to `~/.fast-mcp-ssh/hosts.toml`
+and fill in your hosts. Keys go in `~/.fast-mcp-ssh/keys/<name>`; `auth` is
+`key`, `agent` or `password`.
 
-## Wire into Claude Code or Claude Desktop
+## Wire it up
 
-`.mcp.json` or `claude_desktop_config.json`:
+`.mcp.json`, or `claude_desktop_config.json` for Claude Desktop:
 
 ```json
 {
@@ -28,168 +39,79 @@ Config goes in `~/.fast-mcp-ssh/hosts.toml` (template at `examples/hosts.toml`).
 }
 ```
 
-Optional `--config <path>`. Default is `$FAST_MCP_SSH_HOME/hosts.toml`, falling back to `~/.fast-mcp-ssh/hosts.toml`.
-
 ## Tools
 
-| Tool    | Args                                 | Notes |
-|---------|--------------------------------------|-------|
-| `hosts`     | none                                                  | List configured hosts and their session state. |
-| `ping`      | `host?`, `password?`                                  | Health check. With no arg, probes all hosts in parallel (password ignored in that case). |
-| `exec`      | `host?`, `cmd`, `timeout?`, `password?`, `confirm?`     | One-shot command on a fresh exec channel. Stateless, parallel-safe. |
-| `exec_batch`| `host?`, `cmds[]`, `timeout?`, `password?`, `confirm?`, `verbose?` | Run N commands in parallel on one host in one round-trip. `verbose=true` widens success preview to 200 chars; failures always show 200. |
-| `sh`        | `host?`, `cmd`, `timeout?`, `password?`, `confirm?`, `cols?`, `rows?`, `shell?` | Persistent PTY shell. `cd` / `export` survive between calls. `shell=<name>` opens an independent named PTY. |
-| `disconnect`| `host?`                                                | Close the persistent session. Reopens automatically on next call. |
-| `interrupt` | `host?`                                                | Send Ctrl-C to every PTY on the host and abort every in-flight `exec`/`exec_batch` on it. |
-| `disconnect_all` | none                                              | Close every live session in one shot. |
-| `reload`    | none                                                   | Re-read `hosts.toml`. Validates, atomically swaps guards, drops sessions for removed/changed hosts. |
-| `forward`   | `host?`, `local_port`, `remote_host`, `remote_port`    | Local TCP forward `127.0.0.1:local_port` → `remote_host:remote_port` via SSH direct-tcpip. |
-| `unforward` | `local_port`                                           | Release a forward. |
-| `forwards`  | none                                                   | List active forwards. |
-| `up`        | `host?`, `local`, `remote`                              | SFTP upload (streamed, 256 KB chunks). |
-| `dn`        | `host?`, `remote`, `local?`                             | SFTP download. With no `local`, returns content inline (text under 256 KB; binary returned base64-encoded) — files over the cap are refused after a stat, nothing is transferred. With `local`, files ≥ 4 MB are striped across 6 concurrent SFTP handles. Refuses sensitive paths (shadow, ssh privkeys, cloud creds…). |
-| `ls`        | `host?`, `path`, `limit?`, `offset?`                    | SFTP directory listing. Paginated (default 1000 per page). |
-| `wr`        | `host?`, `remote`, `content`, `mode?`                   | Write a file inline. Optional octal mode applied at create time. Hard cap 8 MB; larger files via `up`. |
-| `mkdir`     | `host?`, `path`, `parents?`                             | SFTP create directory. `parents=true` for `mkdir -p`. |
-| `rm`        | `host?`, `path`, `recursive?`                           | SFTP remove file. `recursive=true` for directories — always elicits confirmation; deletes are pipelined 16 at a time. |
-| `stat`      | `host?`, `path`                                         | SFTP stat: kind, size, mode, mtime, uid, gid. |
-| `tail`      | `host?`, `path`, `lines?`, `follow?`, `seconds?`         | `tail -n` (default) or `timeout N tail -F` piped through `head -c`: returns at end of window, or immediately once the 256 KB capture cap fills. |
+`host` is optional on every tool once `[defaults] default_host` is set.
 
-`host` is optional on every tool when `[defaults] default_host = "<alias>"` is set in `hosts.toml`.
+| Group | Tools | |
+|---|---|---|
+| Run | `exec` `exec_batch` `sh` `interrupt` | One-shot, parallel fan-out, persistent PTY, Ctrl-C |
+| Files | `ls` `stat` `dn` `up` `wr` `mkdir` `rm` `tail` | SFTP, plus `tail -n` / `tail -F` in a bounded window |
+| Ops | `facts` `sys` `svc` | Cached host profile, parsed `ps`/`df`/`mem`/`net`, systemd units |
+| Session | `hosts` `ping` `disconnect` `disconnect_all` `reload` | Discovery and lifecycle; `reload` swaps config without a restart |
+| Network | `forward` `unforward` `forwards` | Local TCP forwards over the same connection |
 
-All tools carry MCP tool annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) so MCP-aware clients can gate destructive calls automatically.
-
-Tool names are short because the MCP client prefixes them with the server name; an additional `ssh_` prefix is dead weight in every tool description.
-
-## Auth
-
-- `auth = "key"` with `key = "~/path/to/private_key"`. Ed25519, RSA, ECDSA.
-- `auth = "agent"`. Uses ssh-agent. Windows: OpenSSH service named pipe. Unix: `$SSH_AUTH_SOCK`.
-- `auth = "password"`. The agent passes the password per call (`exec password=...`). Cached in process memory only, never written to disk.
-
-## Output format
-
-Output uses TOON, a denser text format. Same information as JSON, about 40 percent fewer tokens for tabular data.
-
-```
-hosts(3):
-  name addr user port auth session
-  bastion 203.0.113.5 ops 22 agent live
-  box1 10.0.0.1 root 22 key idle
-  prod-db db.internal deploy 22 key idle
-hint: exec host=<name> cmd=<...>  |  sh host=<name> cmd=<...>  |  ping
-```
-
-JSON for the same data:
-
-```json
-{"hosts":[{"name":"bastion","addr":"203.0.113.5","user":"ops","port":22,"auth":"agent","session":"live"},{"name":"box1","addr":"10.0.0.1","user":"root","port":22,"auth":"key","session":"idle"},{"name":"prod-db","addr":"db.internal","user":"deploy","port":22,"auth":"key","session":"idle"}]}
-```
+Every tool carries MCP annotations (`readOnlyHint`, `destructiveHint`,
+`idempotentHint`, `openWorldHint`) so a client can gate destructive calls.
 
 ## Security
 
-Three checks run per call before any SSH packet leaves the box.
+- **Guards run before any SSH packet.** `deny_patterns` refuse outright,
+  `confirm_patterns` trigger an MCP elicitation, and a client that cannot
+  elicit is denied. `read_only = true` blocks anything that looks like a write.
+- **Paths are checked on both sides.** Remote reads of keys, shadow files and
+  cloud credentials are refused, and so are local writes that would land in
+  your `~/.bashrc` or an autostart folder. Paths are re-checked after the
+  server resolves them, so a symlink cannot launder a blocked target.
+- **Host keys are pinned** (TOFU by default, `strict` and per-host fingerprints
+  available). Every call is appended to `~/.fast-mcp-ssh/audit.log` as NDJSON,
+  with credentials scrubbed.
 
-1. `deny_patterns`. Regex match means the call returns an error, gets logged, and never opens a channel. Defaults block `rm -rf /<top-level>`, `dd of=/dev/sd*`, `mkfs`, fork bombs, redirects to a disk device, recursive root chmod.
-2. `confirm_patterns`. Match triggers an MCP elicitation request: the user gets a yes/no prompt in the host UI. Reply must be literally `yes` to proceed. If the client doesn't support elicitation the call is denied. Defaults match `shutdown`, `reboot`, `DROP TABLE`, `systemctl stop`, `docker rm`.
-3. `read_only = true` on a host blocks anything that looks like a write (`>`, `rm`, `mv`, `chmod`, `systemctl restart`, `docker run`, package installs).
+Guards are a speed bump against accidents, not a boundary against an adversary
+who controls the model. Scope the remote account accordingly: full threat model
+in [SECURITY.md](./SECURITY.md).
 
-Audit log at `~/.fast-mcp-ssh/audit.log`. Append-only NDJSON, one record per call, with timestamp, host, tool, command, exit code, duration, byte counts, blocking reason. Writes are batched on a dedicated tokio task so they never block tool calls.
+## Benchmark
 
-Server fingerprints are pinned via TOFU by default. The first time fast-mcp-ssh connects to a host, the SHA-256 fingerprint of its public key is recorded in `~/.fast-mcp-ssh/known_hosts.toml`. On every subsequent connection the fingerprint must match — a mismatch aborts the handshake with `fingerprint_mismatch`. Override globally via `[defaults] strict_host_key_checking = "tofu" | "strict" | "off"`, or pin a specific value per host with `known_host_fingerprint = "..."`.
+50 iterations per scenario against the same Linux host over the same LAN, same
+SSH key, bench client on Windows 11. Medians, lower is better. Reproduce with
+[`benchmark/`](./benchmark); raw runs in
+[`benchmark/results/`](./benchmark/results).
 
-## Tests
-
-```bash
-cargo test                    # 41 unit tests
-./scripts/test-sh.ps1         # end-to-end smoke against real hosts (Windows)
-```
-
-## Benchmark vs `mcp-ssh-manager`
-
-50 iterations per scenario. Identical SSH key for both servers, identical target. Per-version
-runs live under [`benchmark/results/v<version>/`](benchmark/results/) (one folder each).
-The numbers below are from the **v0.1.2** run: bench client on a Windows workstation,
-target an x86_64 Linux host on the same gigabit LAN. Reproducible via [`benchmark/`](benchmark/).
-
-### Summary (v0.1.2, median)
-
-| Metric | `fast-mcp-ssh` | `mcp-ssh-manager` | Ratio |
+| | `fast-mcp-ssh` | [`mcp-ssh-manager`][mgr] | [`ssh-mcp-server`][fj] |
 |---|---:|---:|---:|
-| Cold start | 26 ms | 217 ms | 8× faster |
-| Warm `exec` `echo ok` | 2.5 ms | 90 ms | 36× |
-| Warm `exec` `seq 1 5000` (~12 KB) | 9 ms | 90 ms | 10× |
-| Write 1 KB file | 2.4 ms | 90 ms | 38× |
-| Read 1 KB file | 2.8 ms | 90 ms | 32× |
-| Tokens, small command response (v0.1.1) | 35 | 49 | −29% |
-| Tokens, write-status response (v0.1.1) | 31 | 202 | −85% |
+| Cold start | **41 ms** | 289 ms | 279 ms |
+| `exec echo ok` | **1.5 ms** | 89.9 ms | 45.1 ms |
+| `exec uname -a; whoami; pwd` | **2.4 ms** | 89.0 ms | 46.1 ms |
+| `exec seq 1 5000` (~29 KB) | **18.7 ms** | 90.5 ms [^1] | 46.3 ms |
+| Write a 1 KB file | **1.4 ms** | 90.9 ms | 45.7 ms |
+| Read a 1 KB file | **2.1 ms** | 90.8 ms | 45.8 ms |
+| Tool surface, sent every session | 23 tools, 17.6 KB | 37 tools, 39.9 KB | **4 tools, 1.7 KB** |
 
-The exec gap widened a lot in 0.1.2 — `nodelay = true` (TCP_NODELAY) on the russh client
-config alone shaved ~40 ms off every small-command round-trip on LAN.
+Both alternatives are Node processes, so ~250 ms of their cold start is the
+runtime booting. The steady-state gap is the connection: `fast-mcp-ssh` keeps
+one SSH session per host and spawns a channel per call, while the other two
+reconnect. Writes go over SFTP here and through a `cat > file` heredoc there.
 
-0.3.0 attacks the remaining fixed costs: PTY init is now deterministic (no settle
-delay, 2 fewer round-trips), `dn` inline refuses oversized files after a stat instead
-of downloading and discarding them (50 MB probe: 575 ms → 3 ms), `tail follow` returns
-as soon as the capture cap fills instead of sitting out the full window (busy log,
-10 s window: 10 004 ms → 31 ms), large downloads stripe across 6 SFTP handles,
-recursive deletes pipeline 16 requests deep, and every channel (PTY, SFTP, forwards,
-ProxyJump) now counts against `max_channels_per_host` so bursts can't trip sshd
-`MaxSessions`.
+[^1]: `mcp-ssh-manager` truncates that response to 12 KB, so it is not
+returning the same output. `ssh-mcp-server` returns raw stdout with no exit
+code, which is why its replies are the shortest and why a failed command looks
+like a successful one.
 
-### Warm latency, median ms (lower is better)
+[mgr]: https://www.npmjs.com/package/mcp-ssh-manager
+[fj]: https://www.npmjs.com/package/@fangjunjie/ssh-mcp-server
 
-| Scenario | `fast-mcp-ssh` | `mcp-ssh-manager` | Ratio |
-|----------|---:|---:|---:|
-| `exec` `echo ok`                  | 2.5 |  90 | 36× |
-| `exec` `uname -a; whoami; pwd`     | 4.0 |  91 | 23× |
-| `exec` `seq 1 5000` (~12 KB)      | 9.0 |  90 | 10× |
-| `exec` `ls -la /etc \| head -100` | 7.1 |  91 | 13× |
-| `exec` `ls /nonexistent` (stderr) | 3.7 |  90 | 24× |
-| `exec` `cat /etc/passwd \| wc -l` | 4.4 |  91 | 21× |
-| Write 1 KB file                   | 2.4 |  90 | 38× |
-| Read 1 KB file                    | 2.8 |  90 | 32× |
-
-The write gap is structural. `fast-mcp-ssh` writes via SFTP. `mcp-ssh-manager` has no inline write tool, so the bench uses `ssh_execute "cat > path <<EOF…"`, which costs a full shell exec round-trip.
-
-### Token cost (from v0.1.1, OpenRouter `deepseek/deepseek-chat`)
-
-| Scenario | `fast-mcp-ssh` | `mcp-ssh-manager` | fast / mgr |
-|----------|---:|---:|---:|
-| `exec` `echo ok`                |   35 |   49 | −29% |
-| `exec` `uname …`                |   94 |  114 | −18% |
-| `exec` `cat … \| wc -l`         |   35 |   58 | −40% |
-| `exec` `ls -la /etc \| head`    | 2438 | 2413 | +1% |
-| `exec` `seq 1 5000`             | 6513 | 5725 | +14% |
-| `exec` `ls /nonexistent`        |   64 |   65 | 0% |
-| Write 1 KB status               |   31 |  202 | −85% |
-| Read 1 KB inline                |  167 |  186 | −10% |
-
-`fast-mcp-ssh` is cheaper on small structured responses. On large raw stdout the savings disappear because the actual command output dominates the payload and TOON's per-call metadata costs a few percent.
-
-In 0.1.2 the per-`tools/list` token cost dropped further — every tool's description was rewritten to 8-12 words and the global `instructions` blob is now a single line.
-
-### Reproducing
+## Development
 
 ```bash
-# 1. Provision a benchmark host. Installs rust + npm + mcp-ssh-manager,
-#    builds fast-mcp-ssh, sets up SSH keys to the target. Idempotent,
-#    about 3 minutes on first run.
-python benchmark/provision.py
-
-# 2. Run the bench from the bench host. Set OPENROUTER_API_KEY for token
-#    counting, otherwise that section is skipped.
-ssh bench-host 'cd ~/bench && \
-    FAST_BIN=$HOME/bench/fast-mcp-ssh/target/release/fast-mcp-ssh \
-    MGR_BIN=$HOME/.npm-global/bin/mcp-ssh-manager \
-    OPENROUTER_API_KEY=sk-or-... \
-    python3 bench.py --iterations 50 --output results'
+cargo test                    # unit tests
+cargo clippy --all-targets    # no warnings allowed in CI
+./scripts/test-sh.ps1         # end-to-end against a real host (Windows)
 ```
 
-Results land in `<bench-host>:~/bench/results/`:
-- `runs.csv`: every individual call (server, scenario, iter, ms, chars, error).
-- `summary.md`: markdown tables (cold start, p50 and p95 latency, char counts, token counts).
-
-A full N=50 run takes about 2.5 minutes wall time (140 seconds observed). Token sampling is 16 calls to the OpenRouter chat-completions endpoint with `max_tokens=1`. Total cost well under one US cent at current `deepseek/deepseek-chat` pricing. Override the model via `OPENROUTER_MODEL=<provider/model>`.
+Never write to stdout outside the MCP transport: a stray `println!` corrupts
+the JSON-RPC stream and the client disconnects without an error. `tracing`
+macros go to stderr and are safe.
 
 ## License
 

@@ -16,7 +16,7 @@ __pycache__/
 *~
 
 hosts.toml
-!examples/hosts.toml
+!hosts.example.toml
 audit.log
 
 # Benchmark local config (key paths, server IPs)

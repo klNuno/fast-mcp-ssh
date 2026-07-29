@@ -1,18 +1,31 @@
-"""Benchmark fast-mcp-ssh vs mcp-ssh-manager.
+"""Benchmark fast-mcp-ssh against other stdio SSH MCP servers.
 
-Runs a fixed set of scenarios against each MCP server N times, measures wall-clock
-latency and response payload size, and emits CSV + a markdown summary.
+Runs a fixed set of scenarios against each server N times, measures wall-clock
+latency and response payload size, and emits CSV + a markdown summary. Servers
+are declared in a JSON file so no host, key path or binary location is baked
+into the repo:
 
-Token counting via OpenRouter (deepseek by default) is applied to a representative
-sample of payloads at the end of the run, not per call (cost optimization).
+    [
+      {"name": "fast-mcp-ssh", "adapter": "fast", "target": "target",
+       "cmd": ["fast-mcp-ssh", "--config", "/path/to/bench-hosts.toml"]},
+      {"name": "mcp-ssh-manager", "adapter": "mgr", "target": "target",
+       "cmd": ["node", "/path/to/mcp-ssh-manager/src/index.js"],
+       "env": {"SSH_ENV_PATH": "/path/to/mgr.env"}},
+      {"name": "ssh-mcp-server", "adapter": "fangjunjie", "target": "",
+       "cmd": ["node", "/path/to/build/index.js", "--host", "10.0.0.1", "..."]}
+    ]
+
+`adapter` picks how a scenario maps onto that server's tool surface; add one to
+ADAPTERS to bench another server.
 
 Usage:
-    python bench.py --iterations 30 --output results/
+    python bench.py --servers servers.json --iterations 30 --output results/
 
 Environment:
-    OPENROUTER_API_KEY  required for token counting; if absent, char-based estimate is used
+    OPENROUTER_API_KEY  required for token counting; skipped when absent
     OPENROUTER_MODEL    default 'deepseek/deepseek-chat'
 """
+
 from __future__ import annotations
 
 import argparse
@@ -27,19 +40,30 @@ from pathlib import Path
 from typing import Callable
 
 sys.path.insert(0, str(Path(__file__).parent))
-from client import McpStdio, CallResult
+from client import McpStdio
+
+HEREDOC = "__EOF_BENCH__"
+
+
+@dataclass
+class Adapter:
+    """Maps the three scenario kinds onto one server's tool surface."""
+
+    exec_call: Callable[[str, str, int], tuple[str, dict] | None]
+    write_call: Callable[[str, str, str], tuple[str, dict] | None]
+    read_call: Callable[[str, str], tuple[str, dict] | None]
 
 
 @dataclass
 class ServerSpec:
     name: str
     cmd: list[str]
+    adapter: Adapter
+    target: str
     env: dict[str, str] | None = None
-    # Tool name + args builder for each scenario. Returns None if unsupported.
-    exec_call: Callable[[str, str, int], tuple[str, dict] | None] = None  # type: ignore
-    write_call: Callable[[str, str, str], tuple[str, dict] | None] = None  # type: ignore
-    read_call: Callable[[str, str], tuple[str, dict] | None] = None  # type: ignore
-    list_tools_after_init: bool = True
+
+
+# --- fast-mcp-ssh: purpose-built tools for each kind ------------------------
 
 
 def fast_exec(host: str, cmd: str, timeout: int):
@@ -54,18 +78,21 @@ def fast_dn(host: str, remote: str):
     return ("dn", {"host": host, "remote": remote})
 
 
+# --- mcp-ssh-manager: one exec tool, no inline write ------------------------
+
+
 def mgr_exec(server: str, cmd: str, timeout: int):
-    # mcp-ssh-manager schema (per Proxmox usage notes): ssh_execute(server, command, timeout)
     return ("ssh_execute", {"server": server, "command": cmd, "timeout": timeout})
 
 
 def mgr_wr(server: str, remote: str, content: str):
-    # mcp-ssh-manager has no inline write tool; we fall back to ssh_execute "echo ... > path".
+    # No inline write tool: ssh_upload takes a local path, so a write costs a
+    # full shell round-trip through a heredoc.
     return (
         "ssh_execute",
         {
             "server": server,
-            "command": f"cat > {remote} <<'__EOF_BENCH__'\n{content}\n__EOF_BENCH__",
+            "command": f"cat > {remote} <<'{HEREDOC}'\n{content}\n{HEREDOC}",
             "timeout": 10,
         },
     )
@@ -73,6 +100,31 @@ def mgr_wr(server: str, remote: str, content: str):
 
 def mgr_dn(server: str, remote: str):
     return ("ssh_execute", {"server": server, "command": f"cat {remote}", "timeout": 10})
+
+
+# --- @fangjunjie/ssh-mcp-server: a single execute-command tool --------------
+
+
+def fj_exec(_server: str, cmd: str, timeout: int):
+    return ("execute-command", {"cmdString": cmd, "timeout": timeout * 1000})
+
+
+def fj_wr(_server: str, remote: str, content: str):
+    return (
+        "execute-command",
+        {"cmdString": f"cat > {remote} <<'{HEREDOC}'\n{content}\n{HEREDOC}", "timeout": 10000},
+    )
+
+
+def fj_dn(_server: str, remote: str):
+    return ("execute-command", {"cmdString": f"cat {remote}", "timeout": 10000})
+
+
+ADAPTERS: dict[str, Adapter] = {
+    "fast": Adapter(fast_exec, fast_wr, fast_dn),
+    "mgr": Adapter(mgr_exec, mgr_wr, mgr_dn),
+    "fangjunjie": Adapter(fj_exec, fj_wr, fj_dn),
+}
 
 
 @dataclass
@@ -101,7 +153,11 @@ class ScenarioStats:
                 "ms_p95": -1,
                 "ms_min": -1,
                 "ms_max": -1,
+                "ms_mean": -1,
+                "ms_stdev": -1,
                 "chars_p50": -1,
+                "chars_p95": -1,
+                "chars_max": -1,
             }
         ms = sorted(r.ms for r in ok)
         chars = sorted(r.chars for r in ok)
@@ -121,7 +177,7 @@ class ScenarioStats:
 
 
 SCENARIOS = [
-    # (key, description, target_host_or_server, builder_kind, args)
+    # (key, description, kind, args)
     ("exec_trivial", "exec 'echo ok'", "exec", ("echo ok", 5)),
     ("exec_uname", "exec 'uname -a; whoami; pwd'", "exec", ("uname -a; whoami; pwd", 5)),
     ("exec_seq5000", "exec 'seq 1 5000' (~28 KB)", "exec", ("seq 1 5000", 10)),
@@ -133,62 +189,37 @@ SCENARIOS = [
 ]
 
 
-def run_scenario_against(
-    spec: ServerSpec,
-    target: str,
-    scenario_key: str,
-    iterations: int,
-) -> ScenarioStats:
-    stats = ScenarioStats(server=spec.name, scenario=scenario_key)
-    for i in range(iterations):
-        try:
-            result = invoke_scenario(spec, target, scenario_key, iteration=i)
-            stats.runs.append(result)
-        except Exception as e:
-            stats.runs.append(
-                ScenarioRun(
-                    server=spec.name,
-                    scenario=scenario_key,
-                    iter=i,
-                    ms=-1.0,
-                    chars=0,
-                    error=str(e),
-                )
-            )
-    return stats
+def bench_remote_path(spec: ServerSpec) -> str:
+    safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in spec.name)
+    return f"/tmp/bench-{safe}.txt"
 
 
-def invoke_scenario(spec: ServerSpec, target: str, key: str, iteration: int) -> ScenarioRun:
-    sc = next(s for s in SCENARIOS if s[0] == key)
-    _, _, kind, args = sc
-    mcp: McpStdio = spec._mcp  # type: ignore[attr-defined]
+def scenario_call(spec: ServerSpec, key: str) -> tuple[str, dict, int] | None:
+    """Build (tool, args, client_timeout_s) for one scenario against one server."""
+    _, _, kind, args = next(s for s in SCENARIOS if s[0] == key)
     if kind == "exec":
         cmd, timeout = args
-        builder_call = spec.exec_call(target, cmd, timeout)
-        if builder_call is None:
-            return ScenarioRun(spec.name, key, iteration, -1.0, 0, error="unsupported")
-        tool, tool_args = builder_call
-        res = mcp.call(tool, tool_args, timeout_s=timeout + 10)
-    elif kind == "write":
-        size = args[0]
-        content = "x" * (1024 if size == "1k" else 8192)
-        remote = f"/tmp/bench-{spec.name}.txt"
-        builder_call = spec.write_call(target, remote, content)
-        if builder_call is None:
-            return ScenarioRun(spec.name, key, iteration, -1.0, 0, error="unsupported")
-        tool, tool_args = builder_call
-        res = mcp.call(tool, tool_args, timeout_s=15)
-    elif kind == "read":
-        remote = f"/tmp/bench-{spec.name}.txt"
-        builder_call = spec.read_call(target, remote)
-        if builder_call is None:
-            return ScenarioRun(spec.name, key, iteration, -1.0, 0, error="unsupported")
-        tool, tool_args = builder_call
-        res = mcp.call(tool, tool_args, timeout_s=15)
-    else:
-        raise ValueError(f"unknown scenario kind {kind}")
-    err = res.text if res.is_error else None
-    return ScenarioRun(spec.name, key, iteration, res.elapsed_ms, res.chars, error=err)
+        built = spec.adapter.exec_call(spec.target, cmd, timeout)
+        return (*built, timeout + 10) if built else None
+    if kind == "write":
+        content = "x" * (1024 if args[0] == "1k" else 8192)
+        built = spec.adapter.write_call(spec.target, bench_remote_path(spec), content)
+        return (*built, 15) if built else None
+    if kind == "read":
+        built = spec.adapter.read_call(spec.target, bench_remote_path(spec))
+        return (*built, 15) if built else None
+    raise ValueError(f"unknown scenario kind {kind}")
+
+
+def invoke_scenario(spec: ServerSpec, mcp: McpStdio, key: str, iteration: int) -> ScenarioRun:
+    built = scenario_call(spec, key)
+    if built is None:
+        return ScenarioRun(spec.name, key, iteration, -1.0, 0, error="unsupported")
+    tool, tool_args, client_timeout = built
+    res = mcp.call(tool, tool_args, timeout_s=client_timeout)
+    return ScenarioRun(
+        spec.name, key, iteration, res.elapsed_ms, res.chars, error=res.text if res.is_error else None
+    )
 
 
 def cold_start(spec: ServerSpec) -> dict:
@@ -197,8 +228,7 @@ def cold_start(spec: ServerSpec) -> dict:
         t0 = time.perf_counter()
         mcp = McpStdio(spec.cmd, env=spec.env)
         mcp.initialize(client_name="bench-cold")
-        elapsed = (time.perf_counter() - t0) * 1000.0
-        samples.append(elapsed)
+        samples.append((time.perf_counter() - t0) * 1000.0)
         mcp.close()
     return {
         "server": spec.name,
@@ -208,13 +238,24 @@ def cold_start(spec: ServerSpec) -> dict:
     }
 
 
-def list_tools(spec: ServerSpec) -> list[str]:
+def tool_surface(spec: ServerSpec) -> dict:
+    """Tool count and raw size of the tools/list payload.
+
+    Every client pays this on each session, before any work happens, so it is
+    part of the cost of choosing a server.
+    """
     mcp = McpStdio(spec.cmd, env=spec.env)
     try:
         mcp.initialize(client_name="bench-discover")
         rid = mcp.send("tools/list", {})
-        msg = mcp.recv(rid, timeout_s=10)
-        return [t["name"] for t in msg.get("result", {}).get("tools", [])]
+        msg = mcp.recv(rid, timeout_s=15)
+        tools = msg.get("result", {}).get("tools", [])
+        return {
+            "server": spec.name,
+            "n_tools": len(tools),
+            "chars": len(json.dumps(tools, separators=(",", ":"))),
+            "names": [t["name"] for t in tools],
+        }
     finally:
         mcp.close()
 
@@ -233,25 +274,38 @@ def write_csv(out_dir: Path, all_runs: list[ScenarioRun]):
 def write_summary(
     out_dir: Path,
     cold: list[dict],
+    surfaces: list[dict],
     stats_by_pair: dict[tuple[str, str], ScenarioStats],
     iterations: int,
     extra: dict | None = None,
 ):
-    md = ["# Benchmark — fast-mcp-ssh vs mcp-ssh-manager", ""]
+    extra = extra or {}
+    md = ["# Benchmark", ""]
     md.append(f"- iterations per scenario: **{iterations}**")
-    md.append(f"- target host alias: {extra.get('target') if extra else 'target'}")
-    md.append(f"- bench host: {extra.get('bench_host') if extra else 'localhost'}")
+    md.append(f"- target: {extra.get('target', '?')}")
+    md.append(f"- bench client: {extra.get('bench_host', 'localhost')}")
     md.append("")
-    md.append("## Cold start (process spawn → first response)")
+
+    md.append("## Tool surface (paid once per session, before any work)")
+    md.append("")
+    md.append("| server | tools | tools/list chars |")
+    md.append("|---|---:|---:|")
+    for s in surfaces:
+        md.append(f"| {s['server']} | {s['n_tools']} | {s['chars']} |")
+    md.append("")
+
+    md.append("## Cold start (process spawn to first response)")
     md.append("")
     md.append("| server | min ms | median ms | max ms |")
     md.append("|---|---:|---:|---:|")
     for c in cold:
-        md.append(f"| {c['server']} | {c['cold_ms_min']:.0f} | {c['cold_ms_med']:.0f} | {c['cold_ms_max']:.0f} |")
+        md.append(
+            f"| {c['server']} | {c['cold_ms_min']:.0f} | {c['cold_ms_med']:.0f} | {c['cold_ms_max']:.0f} |"
+        )
     md.append("")
 
-    scenarios = sorted({k[1] for k in stats_by_pair.keys()})
-    servers = sorted({k[0] for k in stats_by_pair.keys()})
+    scenarios = [s[0] for s in SCENARIOS]
+    servers = sorted({k[0] for k in stats_by_pair})
 
     md.append("## Latency per scenario")
     md.append("")
@@ -282,7 +336,7 @@ def write_summary(
             md.append(f"| {sc} | {sv} | {s['chars_p50']} | {s['chars_p95']} | {s['chars_max']} |")
     md.append("")
 
-    if extra and extra.get("token_samples"):
+    if extra.get("token_samples"):
         md.append("## Token counts on representative payloads")
         md.append("")
         md.append(f"Counted via OpenRouter ({extra.get('token_model', '?')}).")
@@ -301,149 +355,125 @@ def write_summary(
     print(f"  wrote {summary}")
 
 
-def representative_samples(stats_by_pair: dict[tuple[str, str], ScenarioStats]) -> list[dict]:
-    """Pick one payload per (server, scenario) for token counting — the median-length one."""
-    out = []
-    for (server, scenario), st in stats_by_pair.items():
-        ok = [r for r in st.runs if r.error is None and r.chars > 0]
-        if not ok:
-            continue
-        ok.sort(key=lambda r: r.chars)
-        med_run = ok[len(ok) // 2]
-        out.append(
-            {"server": server, "scenario": scenario, "iter": med_run.iter, "chars": med_run.chars}
+def load_specs(path: Path) -> list[ServerSpec]:
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    specs = []
+    for entry in raw:
+        adapter = ADAPTERS.get(entry["adapter"])
+        if adapter is None:
+            raise SystemExit(f"unknown adapter '{entry['adapter']}' for {entry['name']}")
+        specs.append(
+            ServerSpec(
+                name=entry["name"],
+                cmd=entry["cmd"],
+                adapter=adapter,
+                target=entry.get("target", ""),
+                env=entry.get("env"),
+            )
         )
-    return out
+    return specs
+
+
+def sample_tokens(specs: list[ServerSpec], stats_by_pair, extra: dict):
+    try:
+        from token_count import count_tokens_for_payloads
+    except Exception as e:  # noqa: BLE001 - optional dependency path
+        print(f"  token_count import failed: {e}")
+        return
+    print("\n=== token sampling ===")
+    sample_data = []
+    for spec in specs:
+        mcp = McpStdio(spec.cmd, env=spec.env)
+        try:
+            mcp.initialize(client_name="bench-tok")
+            for key in (s[0] for s in SCENARIOS):
+                if (spec.name, key) not in stats_by_pair:
+                    continue
+                built = scenario_call(spec, key)
+                if built is None:
+                    continue
+                tool, tool_args, client_timeout = built
+                res = mcp.call(tool, tool_args, timeout_s=client_timeout)
+                sample_data.append({"server": spec.name, "scenario": key, "text": res.text})
+        except Exception as e:  # noqa: BLE001 - one server failing must not kill the run
+            print(f"  token sample failed for {spec.name}: {e}")
+        finally:
+            mcp.close()
+    extra["token_samples"] = count_tokens_for_payloads(sample_data)
+    extra["token_model"] = os.environ.get("OPENROUTER_MODEL", "deepseek/deepseek-chat")
 
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--servers", type=Path, required=True, help="JSON file describing the servers to bench")
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--output", type=Path, default=Path("results"))
-    parser.add_argument(
-        "--fast-target",
-        default="target",
-        help="hosts.toml alias for fast-mcp-ssh that points at the target host",
-    )
-    parser.add_argument(
-        "--mgr-target",
-        default="target",
-        help="server name in mcp-ssh-manager's .env that points at the target host",
-    )
-    parser.add_argument("--fast-bin", default=os.environ.get("FAST_BIN"))
-    parser.add_argument("--mgr-bin", default=os.environ.get("MGR_BIN"))
+    parser.add_argument("--label", default="", help="Target description written into the summary")
     parser.add_argument("--skip-tokens", action="store_true")
     args = parser.parse_args()
 
-    if not args.fast_bin or not args.mgr_bin:
-        print("missing --fast-bin or --mgr-bin (or env FAST_BIN / MGR_BIN)")
-        sys.exit(2)
-
-    fast_spec = ServerSpec(
-        name="fast-mcp-ssh",
-        cmd=[args.fast_bin],
-        exec_call=fast_exec,
-        write_call=fast_wr,
-        read_call=fast_dn,
-    )
-    mgr_spec = ServerSpec(
-        name="mcp-ssh-manager",
-        cmd=args.mgr_bin.split(),  # may be e.g. 'node /path/to/dist/index.js' or just one path
-        exec_call=mgr_exec,
-        write_call=mgr_wr,
-        read_call=mgr_dn,
-    )
-    targets = {"fast-mcp-ssh": args.fast_target, "mcp-ssh-manager": args.mgr_target}
-
+    specs = load_specs(args.servers)
     args.output.mkdir(parents=True, exist_ok=True)
 
-    print("=== tool discovery ===")
-    for spec in (fast_spec, mgr_spec):
+    print("=== tool surface ===")
+    surfaces = []
+    for spec in specs:
         try:
-            tools = list_tools(spec)
-            print(f"  {spec.name}: {tools}")
-        except Exception as e:
-            print(f"  {spec.name}: discovery FAILED — {e}")
+            s = tool_surface(spec)
+            print(f"  {spec.name}: {s['n_tools']} tools, {s['chars']} chars")
+            surfaces.append(s)
+        except Exception as e:  # noqa: BLE001
+            print(f"  {spec.name}: discovery FAILED - {e}")
 
     print("\n=== cold start ===")
     cold = []
-    for spec in (fast_spec, mgr_spec):
+    for spec in specs:
         try:
             c = cold_start(spec)
-            print(f"  {spec.name}: median {c['cold_ms_med']:.0f} ms (min {c['cold_ms_min']:.0f}, max {c['cold_ms_max']:.0f})")
+            print(
+                f"  {spec.name}: median {c['cold_ms_med']:.0f} ms "
+                f"(min {c['cold_ms_min']:.0f}, max {c['cold_ms_max']:.0f})"
+            )
             cold.append(c)
-        except Exception as e:
-            print(f"  {spec.name}: cold start FAILED — {e}")
+        except Exception as e:  # noqa: BLE001
+            print(f"  {spec.name}: cold start FAILED - {e}")
             cold.append({"server": spec.name, "cold_ms_min": -1, "cold_ms_med": -1, "cold_ms_max": -1})
 
     print(f"\n=== {args.iterations} iterations per scenario ===")
     all_runs: list[ScenarioRun] = []
     stats_by_pair: dict[tuple[str, str], ScenarioStats] = {}
-    for spec in (fast_spec, mgr_spec):
-        target = targets[spec.name]
-        print(f"\n--- {spec.name} (target={target}) ---")
-        spec._mcp = McpStdio(spec.cmd, env=spec.env)  # type: ignore[attr-defined]
+    for spec in specs:
+        print(f"\n--- {spec.name} (target={spec.target or 'from cmdline'}) ---")
+        mcp = McpStdio(spec.cmd, env=spec.env)
         try:
-            spec._mcp.initialize(client_name="bench")  # type: ignore[attr-defined]
-            for sc in SCENARIOS:
-                key = sc[0]
+            mcp.initialize(client_name="bench")
+            for key in (s[0] for s in SCENARIOS):
                 t0 = time.perf_counter()
-                stats = run_scenario_against(spec, target, key, args.iterations)
+                stats = ScenarioStats(server=spec.name, scenario=key)
+                for i in range(args.iterations):
+                    try:
+                        stats.runs.append(invoke_scenario(spec, mcp, key, i))
+                    except Exception as e:  # noqa: BLE001
+                        stats.runs.append(ScenarioRun(spec.name, key, i, -1.0, 0, error=str(e)))
                 elapsed = time.perf_counter() - t0
                 all_runs.extend(stats.runs)
                 stats_by_pair[(spec.name, key)] = stats
                 s = stats.stats()
                 print(
                     f"  {key:18s} n_ok={s['n_ok']:2d} n_err={s['n_err']:2d} "
-                    f"p50={s['ms_p50']:7.1f} p95={s['ms_p95']:7.1f}  chars_p50={s['chars_p50']}  ({elapsed:.1f}s)"
+                    f"p50={s['ms_p50']:7.1f} p95={s['ms_p95']:7.1f}  "
+                    f"chars_p50={s['chars_p50']}  ({elapsed:.1f}s)"
                 )
         finally:
-            spec._mcp.close()  # type: ignore[attr-defined]
+            mcp.close()
 
     write_csv(args.output, all_runs)
 
-    extra = {"target": args.fast_target, "bench_host": os.environ.get("BENCH_HOST", "")}
-
+    extra = {"target": args.label, "bench_host": os.environ.get("BENCH_HOST", "")}
     if not args.skip_tokens and os.environ.get("OPENROUTER_API_KEY"):
-        try:
-            from token_count import count_tokens_for_payloads
-        except Exception as e:
-            print(f"  token_count import failed: {e}")
-            count_tokens_for_payloads = None  # type: ignore
-        if count_tokens_for_payloads:
-            samples = representative_samples(stats_by_pair)
-            # we only have lengths recorded, not the actual payloads — recall once
-            print("\n=== token sampling ===")
-            sample_data = []
-            for s in samples:
-                spec = fast_spec if s["server"] == "fast-mcp-ssh" else mgr_spec
-                target = targets[spec.name]
-                spec._mcp = McpStdio(spec.cmd, env=spec.env)  # type: ignore[attr-defined]
-                try:
-                    spec._mcp.initialize(client_name="bench-tok")  # type: ignore[attr-defined]
-                    res_run = invoke_scenario(spec, target, s["scenario"], iteration=999)
-                    # we need actual text — re-invoke and grab .text; use the call helper:
-                    sc = next(x for x in SCENARIOS if x[0] == s["scenario"])
-                    _, _, kind, ar = sc
-                    if kind == "exec":
-                        cmd, timeout = ar
-                        tool, ta = spec.exec_call(target, cmd, timeout)
-                    elif kind == "write":
-                        content = "x" * 1024
-                        tool, ta = spec.write_call(target, f"/tmp/bench-{spec.name}.txt", content)
-                    else:
-                        tool, ta = spec.read_call(target, f"/tmp/bench-{spec.name}.txt")
-                    res = spec._mcp.call(tool, ta, timeout_s=20)  # type: ignore[attr-defined]
-                    sample_data.append({"server": s["server"], "scenario": s["scenario"], "text": res.text})
-                except Exception as e:
-                    print(f"  token sample fetch failed for {s}: {e}")
-                finally:
-                    spec._mcp.close()  # type: ignore[attr-defined]
-            tok = count_tokens_for_payloads(sample_data)
-            extra["token_samples"] = tok
-            extra["token_model"] = os.environ.get("OPENROUTER_MODEL", "deepseek/deepseek-chat")
+        sample_tokens(specs, stats_by_pair, extra)
 
-    write_summary(args.output, cold, stats_by_pair, args.iterations, extra)
+    write_summary(args.output, cold, surfaces, stats_by_pair, args.iterations, extra)
     print("\n[DONE]")
 
 

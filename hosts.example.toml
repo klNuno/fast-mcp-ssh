@@ -13,6 +13,12 @@ session_idle_timeout = "15m"
 
 # Append-only NDJSON record of every tool call. See ~/.fast-mcp-ssh/audit.log.
 audit_log = true
+# audit_log_path = "~/.fast-mcp-ssh/audit.log"
+
+# Rotate the audit log past this size, keeping audit.log.1 … .N.
+# 0 bytes disables rotation; 0 files discards instead of archiving.
+audit_max_bytes = 16777216
+audit_keep_files = 5
 
 # Sanity caps on output bytes returned per call. Anything over this is truncated with a hint.
 truncate_bytes = 32768
@@ -36,6 +42,11 @@ keepalive = "30s"
 #  off    — accept any server key (legacy 0.1.0 behavior)
 # Pinned fingerprints live at ~/.fast-mcp-ssh/known_hosts.toml.
 strict_host_key_checking = "tofu"
+
+# How long an approved confirm_patterns command stays approved. The exact same
+# command on the same host runs without a second prompt inside the window;
+# anything else prompts again. "0s" prompts every single time.
+confirm_ttl = "15m"
 
 # Default guard rules apply to all hosts unless a host has its own [host.<name>.guards] block.
 [defaults.guards]

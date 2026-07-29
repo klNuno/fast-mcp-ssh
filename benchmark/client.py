@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import threading
 import time
@@ -37,6 +38,10 @@ class McpStdio:
 
     def __init__(self, cmd: list[str], env: dict[str, str] | None = None):
         self.cmd = cmd
+        # Overlay, never replace: handing Popen a bare dict drops PATH and
+        # SystemRoot, and a node server then hangs before it ever speaks
+        # JSON-RPC, which reads as "the server is slow" in the results.
+        child_env = {**os.environ, **env} if env else None
         self.proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -44,7 +49,7 @@ class McpStdio:
             stderr=subprocess.PIPE,
             text=False,
             bufsize=0,
-            env=env,
+            env=child_env,
         )
         self._next_id = 0
         self._queue: Queue[dict[str, Any]] = Queue()

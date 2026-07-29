@@ -1,48 +1,22 @@
 # Benchmark results
 
-One folder per published version. Each holds the unmodified `runs.csv` from
-`bench.py` plus a sanitized `summary.md` (no host names, IPs, or operator paths).
+One folder per published version, each holding the raw `runs.csv` from
+`bench.py` and a `summary.md` with no host names, IPs or operator paths in it.
+The headline table lives in the repo README and is taken from the newest run;
+these folders are the receipts.
 
-## Layout
-
-```
-benchmark/results/
-├── README.md          # this file
-├── COMPARISON.md      # mgr vs fast v0.1.0 vs fast v0.1.2, normalized
-├── v0.1.0/
-│   ├── runs.csv
-│   └── summary.md
-└── v0.1.2/
-    ├── runs.csv
-    └── summary.md
-```
-
-> 0.1.1 had no published bench run. The folder previously named `v0.1.1/` was a
-> measurement from v0.1.0 time, renamed in 0.1.2 for accuracy.
+Runs before `v0.4.0` compare against `mcp-ssh-manager` only, and `v0.1.0` was
+measured from a Linux bench client instead of Windows, so absolute numbers are
+not comparable across folders. Compare within a single run.
 
 ## Reproducing
 
-See repo root `README.md` → "Reproducing" section. The bench needs:
-
-- a `~/.fast-mcp-ssh/hosts.toml` with an alias the bench can reach by SSH key
-- a `benchmark/.env` for `mcp-ssh-manager` (`SSH_SERVER_<NAME>_HOST`/`USER`/`PORT`/`KEYPATH`)
-- both `FAST_BIN` and `MGR_BIN` env vars pointing at the binaries
-
-Then:
-
 ```bash
 cd benchmark
-FAST_BIN=/path/to/fast-mcp-ssh \
-MGR_BIN="node /path/to/mcp-ssh-manager/src/index.js" \
-python bench.py --iterations 50 --output results/v<version> \
-  --fast-target <alias> --mgr-target <alias> --skip-tokens
+python bench.py --servers servers.json --iterations 50 --output results/v<version>
 ```
 
-## Comparing versions
-
-See [`COMPARISON.md`](COMPARISON.md) for the cross-version table. Normalizes the
-env shift (Linux→Windows bench host) by reporting `mgr / fast` ratios per scenario.
-
-> TODO when ≥ 3 published versions exist: publish a per-version benchmark
-> history page on the GitHub wiki and link it from the top-level README,
-> instead of letting `COMPARISON.md` grow another column each release.
+`servers.json` is yours to write and is deliberately not committed: it holds
+binary paths, a host address and a key path. See the docstring at the top of
+`bench.py` for the schema, and give each server the same target host and the
+same SSH key so the comparison means something.
