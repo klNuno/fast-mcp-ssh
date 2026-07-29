@@ -2,7 +2,7 @@
 
 - iterations per scenario: **20**
 - target host alias: target
-- bench host: 
+- bench host: workstation (Windows 11, gigabit LAN to target)
 
 ## Cold start (process spawn → first response)
 

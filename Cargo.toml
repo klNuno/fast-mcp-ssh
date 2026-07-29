@@ -5,6 +5,21 @@ edition = "2024"
 rust-version = "1.85"
 description = "Fast MCP SSH server with persistent PTY sessions, SFTP, and AI-first tool surface"
 license = "MIT"
+readme = "README.md"
+repository = "https://github.com/klNuno/fast-mcp-ssh"
+homepage = "https://github.com/klNuno/fast-mcp-ssh"
+documentation = "https://docs.rs/fast-mcp-ssh"
+keywords = ["mcp", "ssh", "sftp", "agent", "llm"]
+categories = ["command-line-utilities", "network-programming", "development-tools"]
+exclude = [
+    "/benchmark",
+    "/scripts",
+    "/docs",
+    "/.github",
+    "/target-*",
+    "/CHANGELOG.md",
+    "/CONTRIBUTING.md",
+]
 
 [[bin]]
 name = "fast-mcp-ssh"
