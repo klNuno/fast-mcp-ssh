@@ -46,6 +46,9 @@ and fill in your hosts. Keys go in `~/.fast-mcp-ssh/keys/<name>`; `auth` is
 }
 ```
 
+The same block works in Claude Code, Claude Desktop, Cursor, Windsurf, Zed,
+VS Code Copilot and anything else that speaks MCP over stdio.
+
 In the [MCP registry](https://registry.modelcontextprotocol.io) it is
 `mcp-name: io.github.klNuno/fast-mcp-ssh`.
 
@@ -64,6 +67,21 @@ In the [MCP registry](https://registry.modelcontextprotocol.io) it is
 
 Every tool carries MCP annotations (`readOnlyHint`, `destructiveHint`,
 `idempotentHint`, `openWorldHint`) so a client can gate destructive calls.
+
+### Host-to-host copy
+
+`cp` moves a file straight from one configured host to another. The bytes never
+land on your disk and never reach the model, and the server compares a sha256 on
+both ends before reporting success. Guards apply to the destination as well, so
+a read-only target still refuses the write.
+
+### Remote screenshots
+
+`shot` captures the remote desktop and hands the model an image instead of a
+wall of text. It probes the host for `grim`, `gnome-screenshot`, `spectacle`,
+ImageMagick `import` or `scrot` and uses whichever is installed, covering X11
+and wlroots Wayland. The capture is downscaled and re-encoded locally, so a 4K
+screen does not arrive as a multi-megabyte payload.
 
 ## Security
 
