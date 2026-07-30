@@ -1,21 +1,8 @@
 // Anything written to stdout outside of the rmcp transport corrupts the MCP
 // JSON-RPC framing — the client silently disconnects. These deny lints make
-// the build fail before that happens.
+// the build fail before that happens. Set on both targets: the lib carries its
+// own copy, a crate-level attribute does not cross the lib/bin boundary.
 #![deny(clippy::print_stdout, clippy::print_stderr)]
-
-mod audit;
-mod config;
-mod errors;
-mod forward;
-mod guards;
-mod known_hosts;
-mod output;
-mod server;
-mod session;
-mod sftp;
-mod ssh_config;
-mod tail;
-mod tools;
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -28,11 +15,11 @@ use rmcp::ServiceExt;
 use rmcp::transport::stdio;
 use tracing_subscriber::{EnvFilter, fmt};
 
-use crate::audit::AuditLog;
-use crate::config::{Config, default_config_path};
-use crate::guards::GuardCache;
-use crate::server::SshServer;
-use crate::session::SessionPool;
+use fast_mcp_ssh::audit::{self, AuditLog};
+use fast_mcp_ssh::config::{Config, default_config_path};
+use fast_mcp_ssh::guards::GuardCache;
+use fast_mcp_ssh::server::SshServer;
+use fast_mcp_ssh::session::SessionPool;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
