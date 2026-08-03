@@ -19,8 +19,6 @@ use crate::session::Session;
 
 pub struct ForwardHandle {
     pub host_alias: String,
-    #[allow(dead_code)]
-    pub local_port: u16,
     pub bound_addr: SocketAddr,
     pub remote_host: String,
     pub remote_port: u16,
@@ -109,7 +107,6 @@ pub async fn start(
 
     Ok(ForwardHandle {
         host_alias,
-        local_port,
         bound_addr,
         remote_host,
         remote_port,

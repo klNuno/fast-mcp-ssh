@@ -98,7 +98,7 @@ impl SshConfig {
 
     /// Parses config text with no filesystem access at all: `Include` lines
     /// are recognized and discarded rather than resolved.
-    #[allow(dead_code)] // used by the tests; production path goes through parse_file.
+    #[cfg(test)]
     pub fn parse_str(s: &str) -> SshConfig {
         let mut p = Parser::new(false);
         p.feed(s, None, 0);

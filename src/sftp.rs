@@ -63,30 +63,45 @@ where
 /// Resolve `path` server-side via FXP_REALPATH so a path guard can be re-run
 /// against what the path actually points at. SFTP follows symlinks, so
 /// `ln -s /etc/shadow /tmp/s` would otherwise launder a blocked read through a
-/// harmless-looking string. One round-trip; two only when the path does not
-/// exist yet (normal for `wr` / `up`), in which case the parent is resolved and
-/// the leaf re-joined so a symlinked parent directory can't dodge the guard
-/// either. Never returns Ok on total failure — a guard must not be skipped
-/// because a lookup errored.
+/// harmless-looking string.
+///
+/// One round-trip when the path exists. When it does not (normal for `wr`,
+/// `up`, and every component of a `mkdir parents=true`), walk up the ancestors
+/// until one resolves and re-join the missing tail, so a symlinked parent
+/// directory anywhere in the chain still can't dodge the guard.
+///
+/// Only a host that cannot even canonicalize `/` yields `Err`, and the caller
+/// treats that as fail-closed: a guard must never be skipped because a lookup
+/// errored.
 pub async fn resolve_path(session: &Session, path: &str) -> Result<String> {
     let sftp = session.sftp().await?;
-    let direct = with_timeout("realpath", 30, async {
-        sftp.canonicalize(path.to_string())
-            .await
-            .map_err(SshError::from)
-    })
-    .await;
-    if let Ok(p) = direct {
-        return Ok(p);
+    let mut missing: Vec<&str> = Vec::new();
+    let mut cursor = path;
+    loop {
+        let attempt = with_timeout("realpath", 30, async {
+            sftp.canonicalize(cursor.to_string())
+                .await
+                .map_err(SshError::from)
+        })
+        .await;
+        if let Ok(base) = attempt {
+            // Rejoin the components peeled off on the way up, outermost first.
+            let mut out = base;
+            for leaf in missing.iter().rev() {
+                out = join_remote(&out, leaf);
+            }
+            return Ok(out);
+        }
+        let (parent, leaf) = split_parent(cursor);
+        // `split_parent` is idempotent at the root, so this is the terminator.
+        if parent == cursor || leaf.is_empty() {
+            return Err(SshError::Other(format!(
+                "cannot resolve '{path}' or any of its parent directories"
+            )));
+        }
+        missing.push(leaf);
+        cursor = parent;
     }
-    let (parent, leaf) = split_parent(path);
-    let base = with_timeout("realpath", 30, async {
-        sftp.canonicalize(parent.to_string())
-            .await
-            .map_err(SshError::from)
-    })
-    .await?;
-    Ok(join_remote(&base, leaf))
 }
 
 /// Split a POSIX remote path into `(parent, leaf)`. Trailing slashes are
@@ -780,5 +795,43 @@ mod tests {
         assert!(looks_binary(&[0xff, 0xfe, 0xfd]));
         assert!(!looks_binary(b"hello world\n"));
         assert!(!looks_binary(b""));
+    }
+
+    #[test]
+    fn split_parent_peels_one_component() {
+        assert_eq!(split_parent("/tmp/a/b"), ("/tmp/a", "b"));
+        assert_eq!(split_parent("/tmp/d/"), ("/tmp", "d"));
+        assert_eq!(split_parent("/tmp"), ("/", "tmp"));
+        assert_eq!(split_parent("rel"), (".", "rel"));
+    }
+
+    #[test]
+    fn split_parent_terminates_at_the_root() {
+        // `resolve_path` walks up until parent == cursor; without this the
+        // fail-closed loop would spin forever on an unresolvable host.
+        assert_eq!(split_parent("/"), ("/", ""));
+        assert_eq!(split_parent(""), ("/", ""));
+    }
+
+    /// Mirrors the rejoin `resolve_path` does after walking up: components are
+    /// pushed innermost-first and reattached in reverse.
+    fn rejoin(base: &str, peeled: &[&str]) -> String {
+        let mut out = base.to_string();
+        for leaf in peeled.iter().rev() {
+            out = join_remote(&out, leaf);
+        }
+        out
+    }
+
+    #[test]
+    fn missing_components_are_reattached_in_order() {
+        // `mkdir -p /srv/new/deep/dir` on a host where /srv is a symlink to
+        // /mnt/srv: the resolved parent has to carry the missing tail back.
+        assert_eq!(
+            rejoin("/mnt/srv", &["dir", "deep", "new"]),
+            "/mnt/srv/new/deep/dir"
+        );
+        assert_eq!(rejoin("/", &["etc"]), "/etc");
+        assert_eq!(rejoin("/tmp", &[]), "/tmp");
     }
 }

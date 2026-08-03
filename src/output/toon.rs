@@ -142,11 +142,6 @@ impl ToonValue for &String {
         escape_scalar(self.as_str(), buf);
     }
 }
-impl ToonValue for u16 {
-    fn write_to(&self, buf: &mut String) {
-        let _ = write!(buf, "{self}");
-    }
-}
 impl ToonValue for u32 {
     fn write_to(&self, buf: &mut String) {
         let _ = write!(buf, "{self}");
@@ -175,11 +170,6 @@ impl ToonValue for usize {
 impl ToonValue for bool {
     fn write_to(&self, buf: &mut String) {
         buf.push_str(if *self { "true" } else { "false" });
-    }
-}
-impl ToonValue for f64 {
-    fn write_to(&self, buf: &mut String) {
-        let _ = write!(buf, "{self}");
     }
 }
 

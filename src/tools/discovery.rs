@@ -38,14 +38,10 @@ impl SshServer {
         let names = cfg.host_names();
         if names.is_empty() {
             t.field("hosts", "none configured");
-            t.hint(&format!(
-                "edit {} to add hosts",
-                cfg.defaults
-                    .audit_log_path
-                    .parent()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "~/.fast-mcp-ssh".into())
-            ));
+            // The config file the server actually read, not the audit log's
+            // directory: those are the same path only by default, and pointing
+            // someone at the wrong file is worse than pointing at none.
+            t.hint(&format!("edit {} to add hosts", self.config_path.display()));
             return Ok(text(t.into_string()));
         }
         let active = self.pool.list_active();

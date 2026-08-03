@@ -6,6 +6,7 @@ use rmcp::{
 };
 use serde::Deserialize;
 
+use crate::audit::AuditRecord;
 use crate::errors::SshError;
 use crate::forward;
 use crate::output::Toon;
@@ -76,16 +77,10 @@ impl SshServer {
         self.audit.write(
             &host_name,
             "forward",
-            Some(&format!(
+            AuditRecord::cmd(&format!(
                 "127.0.0.1:{} -> {}:{}",
                 args.local_port, args.remote_host, args.remote_port
             )),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
         );
         let mut t = Toon::new();
         t.field("host", &host_name)
@@ -121,13 +116,7 @@ impl SshServer {
                 self.audit.write(
                     &host,
                     "unforward",
-                    Some(&format!("port={}", args.local_port)),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
+                    AuditRecord::cmd(&format!("port={}", args.local_port)),
                 );
                 t.field("status", "stopped");
             }

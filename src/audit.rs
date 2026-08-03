@@ -31,6 +31,58 @@ struct AuditEntryOwned {
 const AUDIT_QUEUE_CAP: usize = 1024;
 const AUDIT_BATCH: usize = 32;
 
+/// One audit line, built field-by-field at the call site.
+///
+/// Replaces a nine-argument `write()` whose four adjacent `Option<usize>` /
+/// `Option<&str>` parameters could be swapped without the compiler noticing.
+/// Every field is optional, so call sites fill what they know and close with
+/// `..Default::default()`.
+#[derive(Debug, Default, Clone)]
+pub struct AuditRecord<'a> {
+    /// Command, path, or `from -> to` pair the tool acted on.
+    pub cmd: Option<&'a str>,
+    pub exit_code: Option<i32>,
+    pub duration_ms: Option<u128>,
+    /// Bytes sent to the remote host.
+    pub bytes_in: Option<usize>,
+    /// Bytes received from the remote host.
+    pub bytes_out: Option<usize>,
+    /// Guard name or reason the call never reached the host.
+    pub blocked: Option<&'a str>,
+    pub error: Option<String>,
+}
+
+impl<'a> AuditRecord<'a> {
+    /// The tool acted on `cmd` and nothing else is known yet.
+    pub fn cmd(cmd: &'a str) -> Self {
+        Self {
+            cmd: Some(cmd),
+            ..Default::default()
+        }
+    }
+
+    /// A guard, an elicitation denial or a validation error stopped the call
+    /// before it reached the host. `reason` lands in both `blocked` and
+    /// `error` because consumers grep for either.
+    pub fn blocked(cmd: &'a str, reason: &'a str) -> Self {
+        Self {
+            cmd: Some(cmd),
+            blocked: Some(reason),
+            error: Some(reason.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// The call reached the host and failed there.
+    pub fn failed(cmd: &'a str, error: String) -> Self {
+        Self {
+            cmd: Some(cmd),
+            error: Some(error),
+            ..Default::default()
+        }
+    }
+}
+
 /// Size-based rotation policy. Enforced on the writer task, never on a tool
 /// call: rotation renames and reopens files, which is exactly the disk I/O the
 /// channel exists to keep off the request path.
@@ -191,19 +243,7 @@ impl AuditLog {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn write(
-        &self,
-        host: &str,
-        tool: &'static str,
-        cmd: Option<&str>,
-        exit_code: Option<i32>,
-        duration_ms: Option<u128>,
-        bytes_in: Option<usize>,
-        bytes_out: Option<usize>,
-        blocked: Option<&str>,
-        error: Option<String>,
-    ) {
+    pub fn write(&self, host: &str, tool: &'static str, rec: AuditRecord<'_>) {
         let Some(tx) = &self.tx else { return };
         let ts = OffsetDateTime::now_utc()
             .format(&Rfc3339)
@@ -212,13 +252,13 @@ impl AuditLog {
             ts,
             host: Arc::from(host),
             tool,
-            cmd: cmd.map(|s| scrub_credentials(s).into_owned()),
-            exit_code,
-            duration_ms,
-            bytes_in,
-            bytes_out,
-            blocked: blocked.map(|s| s.to_string()),
-            error: error.map(|s| scrub_credentials(&s).into_owned()),
+            cmd: rec.cmd.map(|s| scrub_credentials(s).into_owned()),
+            exit_code: rec.exit_code,
+            duration_ms: rec.duration_ms,
+            bytes_in: rec.bytes_in,
+            bytes_out: rec.bytes_out,
+            blocked: rec.blocked.map(|s| s.to_string()),
+            error: rec.error.map(|s| scrub_credentials(&s).into_owned()),
         };
         if let Err(e) = tx.try_send(entry) {
             match e {
@@ -360,5 +400,43 @@ mod tests {
     fn passes_through_clean_commands() {
         let s = scrub_credentials("ls -la /etc");
         assert_eq!(s, "ls -la /etc");
+    }
+
+    #[test]
+    fn record_defaults_to_empty() {
+        let r = AuditRecord::default();
+        assert!(r.cmd.is_none());
+        assert!(r.bytes_in.is_none());
+        assert!(r.bytes_out.is_none());
+    }
+
+    #[test]
+    fn blocked_fills_both_reason_fields() {
+        // Consumers grep either `blocked` or `error`; a refusal has to show up
+        // in both or half the queries miss it.
+        let r = AuditRecord::blocked("rm -rf /", "blocked by guard 'rm-rf-root'");
+        assert_eq!(r.cmd, Some("rm -rf /"));
+        assert_eq!(r.blocked, Some("blocked by guard 'rm-rf-root'"));
+        assert_eq!(r.error.as_deref(), Some("blocked by guard 'rm-rf-root'"));
+    }
+
+    #[test]
+    fn failed_is_an_error_without_a_guard_verdict() {
+        let r = AuditRecord::failed("uptime", "connection reset".into());
+        assert!(r.blocked.is_none(), "nothing refused this, it just failed");
+        assert_eq!(r.error.as_deref(), Some("connection reset"));
+    }
+
+    #[test]
+    fn byte_directions_are_named_not_positional() {
+        // The whole point of the struct: `bytes_in` and `bytes_out` used to be
+        // two adjacent `Option<usize>` in a nine-argument call.
+        let r = AuditRecord {
+            cmd: Some("/tmp/f"),
+            bytes_in: Some(42),
+            ..Default::default()
+        };
+        assert_eq!(r.bytes_in, Some(42));
+        assert!(r.bytes_out.is_none());
     }
 }

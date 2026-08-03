@@ -1,17 +1,31 @@
-//! Session-lifecycle tools: `disconnect`, `disconnect_all`, `reload`.
+//! Session-lifecycle tools: `disconnect`, `disconnect_all`, `reload`, `shells`.
 
 use std::sync::Arc;
 
 use rmcp::{
-    ErrorData as McpError, handler::server::wrapper::Parameters, model::*, tool, tool_router,
+    ErrorData as McpError, handler::server::wrapper::Parameters, model::*, schemars, tool,
+    tool_router,
 };
+use serde::Deserialize;
 
+use crate::audit::AuditRecord;
 use crate::config::Config;
 use crate::errors::SshError;
 use crate::guards::GuardCache;
 use crate::output::Toon;
 use crate::server::SshServer;
-use crate::tools::{HostOnlyArgs, text};
+use crate::tools::{HostOnlyArgs, MAX_NAMED_PTYS, text};
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ShellsArgs {
+    /// Host alias. Omit if a default_host is configured.
+    #[serde(default)]
+    pub host: Option<String>,
+    /// Shell name to close. `*` closes every shell on the host, the default
+    /// one included. Omit to only list.
+    #[serde(default)]
+    pub close: Option<String>,
+}
 
 #[tool_router(router = session_router, vis = "pub")]
 impl SshServer {
@@ -44,17 +58,8 @@ impl SshServer {
                 .await;
         }
         self.pool.forget_password(&host_name);
-        self.audit.write(
-            &host_name,
-            "disconnect",
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+        self.audit
+            .write(&host_name, "disconnect", AuditRecord::default());
         let mut t = Toon::new();
         t.field("host", &host_name).field("status", "closed");
         Ok(text(t.into_string()))
@@ -90,13 +95,10 @@ impl SshServer {
                 self.audit.write(
                     "*",
                     "reload",
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(msg.clone()),
+                    AuditRecord {
+                        error: Some(msg.clone()),
+                        ..Default::default()
+                    },
                 );
                 return Err(e.into_mcp());
             }
@@ -112,8 +114,7 @@ impl SshServer {
         let dropped = self.pool.prune_against(&old_cfg).await;
 
         let new = self.cfg();
-        self.audit
-            .write("*", "reload", None, None, None, None, None, None, None);
+        self.audit.write("*", "reload", AuditRecord::default());
         let mut t = Toon::new();
         t.field("hosts_before", old_cfg.hosts.len());
         t.field("hosts_after", new.hosts.len());
@@ -147,22 +148,58 @@ impl SshServer {
                 closed += 1;
             }
         }
-        self.audit.write(
-            "*",
-            "disconnect_all",
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+        self.audit
+            .write("*", "disconnect_all", AuditRecord::default());
         let mut t = Toon::new();
         t.field("closed", closed);
         if !names.is_empty() {
             let joined = names.join(",");
             t.field("hosts", joined);
+        }
+        Ok(text(t.into_string()))
+    }
+
+    #[tool(
+        description = "List the persistent PTY shells open on a host, or close one with close=<name> (close=* closes all). Each shell holds an SSH channel slot until closed. Not for killing a running command — use interrupt.",
+        annotations(
+            title = "Shells",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn shells(
+        &self,
+        Parameters(args): Parameters<ShellsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let host_name = self.resolve_host(args.host)?;
+        let mut t = Toon::new();
+        t.field("host", &host_name);
+        let Some(session) = self.pool.get(&host_name) else {
+            t.field("status", "no active session");
+            return Ok(text(t.into_string()));
+        };
+
+        if let Some(target) = args.close.as_deref() {
+            let closed = if target == "*" {
+                session.close_all_ptys().await
+            } else {
+                usize::from(session.close_pty(Some(target)).await)
+            };
+            self.audit
+                .write(&host_name, "shells", AuditRecord::cmd(target));
+            t.field("closed", closed);
+            if closed == 0 {
+                t.hint("no shell by that name; `shells` with no argument lists them");
+            }
+        }
+
+        let named = session.named_shells().await;
+        t.field("named_count", named.len());
+        t.field("named_max", MAX_NAMED_PTYS);
+        if !named.is_empty() {
+            t.field("named", named.join(","));
         }
         Ok(text(t.into_string()))
     }
