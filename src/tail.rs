@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use crate::errors::Result;
 use crate::session::{Session, exec::exec};
+use crate::tools::shell_quote;
 
 pub struct TailChunk {
     pub content: String,
@@ -19,7 +20,7 @@ pub async fn tail(
     max_wait: Duration,
     max_capture: usize,
 ) -> Result<TailChunk> {
-    let path_q = shell_escape(path);
+    let path_q = shell_quote(path);
     let cmd = if follow {
         // Piping through `head -c` makes the call return as soon as the
         // capture cap is hit instead of sitting out the full `timeout` window
@@ -49,38 +50,16 @@ pub async fn tail(
     })
 }
 
-fn shell_escape(s: &str) -> String {
-    if s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
-    {
-        s.to_string()
-    } else {
-        let mut out = String::with_capacity(s.len() + 4);
-        out.push('\'');
-        for c in s.chars() {
-            if c == '\'' {
-                out.push_str("'\\''");
-            } else {
-                out.push(c);
-            }
-        }
-        out.push('\'');
-        out
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn escape_simple() {
-        assert_eq!(shell_escape("/var/log/syslog"), "/var/log/syslog");
-    }
-
-    #[test]
-    fn escape_complex() {
-        assert_eq!(shell_escape("/tmp/has space.log"), "'/tmp/has space.log'");
-        assert_eq!(shell_escape("o'brien.log"), "'o'\\''brien.log'");
+    fn paths_go_through_the_shared_quoter() {
+        // This module used to carry its own escaper with a "looks safe, skip
+        // the quotes" fast path. One quoter, one behaviour.
+        assert_eq!(shell_quote("/var/log/syslog"), "'/var/log/syslog'");
+        assert_eq!(shell_quote("/tmp/has space.log"), "'/tmp/has space.log'");
+        assert_eq!(shell_quote("o'brien.log"), "'o'\\''brien.log'");
     }
 }

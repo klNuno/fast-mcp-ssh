@@ -9,6 +9,7 @@ use rmcp::{
 };
 use serde::Deserialize;
 
+use crate::audit::AuditRecord;
 use crate::errors::SshError;
 use crate::guards;
 use crate::output::{Toon, truncate_with_hint};
@@ -16,7 +17,7 @@ use crate::server::{SshServer, elicit_confirmation};
 use crate::sftp;
 use crate::tail;
 use crate::tools::{
-    INLINE_MAX_BYTES, MAX_FOLLOW_SECS, MAX_LS_ENTRIES, MAX_WRITE_INLINE_BYTES, text,
+    INLINE_MAX_BYTES, MAX_FOLLOW_SECS, MAX_LS_ENTRIES, MAX_WRITE_INLINE_BYTES, shell_quote, text,
 };
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -165,13 +166,7 @@ impl SshServer {
             self.audit.write(
                 &host_name,
                 "up",
-                Some(&args.remote),
-                None,
-                None,
-                None,
-                None,
-                Some(&e.to_string()),
-                Some(e.to_string()),
+                AuditRecord::blocked(&args.remote, &e.to_string()),
             );
             return Err(e.into_mcp());
         }
@@ -189,13 +184,7 @@ impl SshServer {
             self.audit.write(
                 &host_name,
                 "up",
-                Some(&args.local),
-                None,
-                None,
-                None,
-                None,
-                Some(&e.to_string()),
-                Some(e.to_string()),
+                AuditRecord::blocked(&args.local, &e.to_string()),
             );
             return Err(e.into_mcp());
         }
@@ -205,13 +194,12 @@ impl SshServer {
         self.audit.write(
             &host_name,
             "up",
-            Some(&format!("{} -> {}", args.local, args.remote)),
-            None,
-            Some(r.duration_ms),
-            Some(r.bytes),
-            None,
-            None,
-            None,
+            AuditRecord {
+                cmd: Some(&format!("{} -> {}", args.local, args.remote)),
+                duration_ms: Some(r.duration_ms),
+                bytes_in: Some(r.bytes),
+                ..Default::default()
+            },
         );
         let mut t = Toon::new();
         t.field("host", &host_name)
@@ -245,13 +233,7 @@ impl SshServer {
             self.audit.write(
                 &host_name,
                 "dn",
-                Some(&args.remote),
-                None,
-                None,
-                None,
-                None,
-                Some(&e.to_string()),
-                Some(e.to_string()),
+                AuditRecord::blocked(&args.remote, &e.to_string()),
             );
             return Err(e.into_mcp());
         }
@@ -268,16 +250,16 @@ impl SshServer {
         if let Some(p) = local_path.as_deref()
             && let Err(e) = guards::check_local_write(p)
         {
+            let reason = e.to_string();
             self.audit.write(
                 &host_name,
                 "dn",
-                args.local.as_deref(),
-                None,
-                None,
-                None,
-                None,
-                Some(&e.to_string()),
-                Some(e.to_string()),
+                AuditRecord {
+                    cmd: args.local.as_deref(),
+                    blocked: Some(&reason),
+                    error: Some(reason.clone()),
+                    ..Default::default()
+                },
             );
             return Err(e.into_mcp());
         }
@@ -292,13 +274,12 @@ impl SshServer {
         self.audit.write(
             &host_name,
             "dn",
-            Some(&args.remote),
-            None,
-            Some(r.duration_ms),
-            None,
-            Some(r.bytes),
-            None,
-            None,
+            AuditRecord {
+                cmd: Some(&args.remote),
+                duration_ms: Some(r.duration_ms),
+                bytes_out: Some(r.bytes),
+                ..Default::default()
+            },
         );
 
         let mut t = Toon::new();
@@ -350,13 +331,7 @@ impl SshServer {
             self.audit.write(
                 &from_host,
                 "cp",
-                Some(&args.from),
-                None,
-                None,
-                None,
-                None,
-                Some(&e.to_string()),
-                Some(e.to_string()),
+                AuditRecord::blocked(&args.from, &e.to_string()),
             );
             return Err(e.into_mcp());
         }
@@ -364,13 +339,7 @@ impl SshServer {
             self.audit.write(
                 &to_host,
                 "cp",
-                Some(&args.to),
-                None,
-                None,
-                None,
-                None,
-                Some(&e.to_string()),
-                Some(e.to_string()),
+                AuditRecord::blocked(&args.to, &e.to_string()),
             );
             return Err(e.into_mcp());
         }
@@ -410,17 +379,8 @@ impl SshServer {
                 }
                 Ok((a, b)) => {
                     let msg = format!("sha256 mismatch: {from_host} {a}, {to_host} {b}");
-                    self.audit.write(
-                        &to_host,
-                        "cp",
-                        Some(&args.to),
-                        None,
-                        None,
-                        None,
-                        None,
-                        Some(&msg),
-                        Some(msg.clone()),
-                    );
+                    self.audit
+                        .write(&to_host, "cp", AuditRecord::blocked(&args.to, &msg));
                     return Err(SshError::Other(msg).into_mcp());
                 }
                 // A missing `sha256sum` is not a reason to fail a copy that
@@ -433,13 +393,12 @@ impl SshServer {
         self.audit.write(
             &to_host,
             "cp",
-            Some(&format!("{from_host}:{} -> {}", args.from, args.to)),
-            None,
-            Some(r.duration_ms),
-            Some(r.bytes),
-            None,
-            None,
-            None,
+            AuditRecord {
+                cmd: Some(&format!("{from_host}:{} -> {}", args.from, args.to)),
+                duration_ms: Some(r.duration_ms),
+                bytes_in: Some(r.bytes),
+                ..Default::default()
+            },
         );
         Ok(text(t.into_string()))
     }
@@ -464,13 +423,7 @@ impl SshServer {
             self.audit.write(
                 &host_name,
                 "ls",
-                Some(&args.path),
-                None,
-                None,
-                None,
-                None,
-                Some(&e.to_string()),
-                Some(e.to_string()),
+                AuditRecord::blocked(&args.path, &e.to_string()),
             );
             return Err(e.into_mcp());
         }
@@ -496,17 +449,8 @@ impl SshServer {
         } else {
             entries.drain(offset..).take(limit).collect()
         };
-        self.audit.write(
-            &host_name,
-            "ls",
-            Some(&args.path),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+        self.audit
+            .write(&host_name, "ls", AuditRecord::cmd(&args.path));
         let rows: Vec<Vec<String>> = page
             .iter()
             .map(|e| {
@@ -565,13 +509,7 @@ impl SshServer {
             self.audit.write(
                 &host_name,
                 "wr",
-                Some(&args.remote),
-                None,
-                None,
-                None,
-                None,
-                Some(&e.to_string()),
-                Some(e.to_string()),
+                AuditRecord::blocked(&args.remote, &e.to_string()),
             );
             return Err(e.into_mcp());
         }
@@ -588,13 +526,12 @@ impl SshServer {
         self.audit.write(
             &host_name,
             "wr",
-            Some(&args.remote),
-            None,
-            Some(r.duration_ms),
-            Some(r.bytes),
-            None,
-            None,
-            None,
+            AuditRecord {
+                cmd: Some(&args.remote),
+                duration_ms: Some(r.duration_ms),
+                bytes_in: Some(r.bytes),
+                ..Default::default()
+            },
         );
         let mut t = Toon::new();
         t.field("host", &host_name)
@@ -630,13 +567,7 @@ impl SshServer {
             self.audit.write(
                 &host_name,
                 "mkdir",
-                Some(&args.path),
-                None,
-                None,
-                None,
-                None,
-                Some(&e.to_string()),
-                Some(e.to_string()),
+                AuditRecord::blocked(&args.path, &e.to_string()),
             );
             return Err(e.into_mcp());
         }
@@ -650,17 +581,8 @@ impl SshServer {
         sftp::mkdir(&session, &args.path, args.parents.unwrap_or(false))
             .await
             .map_err(|e| e.into_mcp())?;
-        self.audit.write(
-            &host_name,
-            "mkdir",
-            Some(&args.path),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+        self.audit
+            .write(&host_name, "mkdir", AuditRecord::cmd(&args.path));
         let mut t = Toon::new();
         t.field("host", &host_name)
             .field("path", &args.path)
@@ -692,13 +614,7 @@ impl SshServer {
             self.audit.write(
                 &host_name,
                 "rm",
-                Some(&args.path),
-                None,
-                None,
-                None,
-                None,
-                Some(&e.to_string()),
-                Some(e.to_string()),
+                AuditRecord::blocked(&args.path, &e.to_string()),
             );
             return Err(e.into_mcp());
         }
@@ -729,17 +645,8 @@ impl SshServer {
         let removed = sftp::remove(&session, &args.path, recursive)
             .await
             .map_err(|e| e.into_mcp())?;
-        self.audit.write(
-            &host_name,
-            "rm",
-            Some(&args.path),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+        self.audit
+            .write(&host_name, "rm", AuditRecord::cmd(&args.path));
         let mut t = Toon::new();
         t.field("host", &host_name)
             .field("path", &args.path)
@@ -770,13 +677,7 @@ impl SshServer {
             self.audit.write(
                 &host_name,
                 "stat",
-                Some(&args.path),
-                None,
-                None,
-                None,
-                None,
-                Some(&e.to_string()),
-                Some(e.to_string()),
+                AuditRecord::blocked(&args.path, &e.to_string()),
             );
             return Err(e.into_mcp());
         }
@@ -790,17 +691,8 @@ impl SshServer {
         let s = sftp::stat(&session, &args.path)
             .await
             .map_err(|e| e.into_mcp())?;
-        self.audit.write(
-            &host_name,
-            "stat",
-            Some(&args.path),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+        self.audit
+            .write(&host_name, "stat", AuditRecord::cmd(&args.path));
         let mut t = Toon::new();
         t.field("host", &host_name)
             .field("path", &args.path)
@@ -831,11 +723,29 @@ impl SshServer {
         Parameters(args): Parameters<TailArgs>,
     ) -> Result<CallToolResult, McpError> {
         let host_name = self.resolve_host(args.host)?;
+        // `tail` reads a remote file just as much as `dn` does, and it shipped
+        // with no guard at all: `tail path=/etc/shadow lines=5000` walked
+        // straight past the sensitive-read list that every other read tool
+        // enforces. Same two checks as `dn`, string then resolved.
+        if let Err(e) = self
+            .guards()
+            .for_host(&host_name)
+            .check_sftp_read(&args.path)
+        {
+            self.audit.write(
+                &host_name,
+                "tail",
+                AuditRecord::blocked(&args.path, &e.to_string()),
+            );
+            return Err(e.into_mcp());
+        }
         let session = self
             .pool
             .get_or_connect(&host_name, None)
             .await
             .map_err(|e| e.into_mcp())?;
+        self.guard_resolved(&host_name, "tail", &session, &args.path, false)
+            .await?;
         let lines = args.lines.unwrap_or(100);
         let follow = args.follow.unwrap_or(false);
         let secs = Duration::from_secs(args.seconds.unwrap_or(5).clamp(1, MAX_FOLLOW_SECS));
@@ -846,13 +756,12 @@ impl SshServer {
         self.audit.write(
             &host_name,
             "tail",
-            Some(&args.path),
-            Some(chunk.exit_code),
-            None,
-            None,
-            Some(chunk.bytes),
-            None,
-            None,
+            AuditRecord {
+                cmd: Some(&args.path),
+                exit_code: Some(chunk.exit_code),
+                bytes_out: Some(chunk.bytes),
+                ..Default::default()
+            },
         );
         let mut t = Toon::new();
         t.field("host", &host_name)
@@ -867,12 +776,6 @@ impl SshServer {
         t.block("content", &display);
         Ok(text(t.into_string()))
     }
-}
-
-/// Wrap a remote path for `sh -c`. Single quotes stop every metacharacter, and
-/// the only thing they cannot carry is a single quote, which is spliced.
-pub(crate) fn shell_quote(path: &str) -> String {
-    format!("'{}'", path.replace('\'', r"'\''"))
 }
 
 impl SshServer {
@@ -918,24 +821,5 @@ impl SshServer {
             (Err(e), _) => Err(format!("{from_host}: {e}")),
             (_, Err(e)) => Err(format!("{to_host}: {e}")),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::shell_quote;
-
-    #[test]
-    fn quoting_neutralises_metacharacters() {
-        assert_eq!(shell_quote("/tmp/a b"), "'/tmp/a b'");
-        assert_eq!(shell_quote("/tmp/$(id)"), "'/tmp/$(id)'");
-        assert_eq!(shell_quote("/tmp/x;rm -rf /"), "'/tmp/x;rm -rf /'");
-    }
-
-    #[test]
-    fn a_single_quote_is_spliced_not_escaped() {
-        // sh has no escape inside single quotes: the run has to be closed,
-        // the quote passed literally, and a new run opened.
-        assert_eq!(shell_quote("/tmp/it's"), r"'/tmp/it'\''s'");
     }
 }

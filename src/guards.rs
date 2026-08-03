@@ -67,16 +67,6 @@ pub enum GuardCheck {
 }
 
 impl CompiledGuards {
-    #[allow(dead_code)] // kept for ad-hoc one-off compilation; production path uses GuardCache.
-    pub fn from_config(cfg: &Config, host_name: &str) -> Result<Self> {
-        let host_guards = cfg
-            .hosts
-            .get(host_name)
-            .and_then(|h| h.guards.clone())
-            .unwrap_or_else(|| cfg.defaults.guards.clone());
-        Self::compile(&host_guards)
-    }
-
     pub fn compile(g: &Guards) -> Result<Self> {
         let mut deny = Vec::new();
         let mut confirm = Vec::new();

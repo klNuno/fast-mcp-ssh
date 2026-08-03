@@ -18,13 +18,14 @@ use rmcp::{
 };
 use serde::Deserialize;
 
+use crate::audit::AuditRecord;
 use crate::errors::SshError;
 use crate::guards;
 use crate::output::Toon;
 use crate::server::SshServer;
 use crate::session::exec;
 use crate::sftp;
-use crate::tools::files::shell_quote;
+use crate::tools::shell_quote;
 
 /// Widest image handed back to the model unless the caller says otherwise.
 /// Image tokens scale with area, so halving this quarters the cost; 1024 is
@@ -105,16 +106,16 @@ impl SshServer {
         if let Some(p) = local_path.as_deref()
             && let Err(e) = guards::check_local_write(p)
         {
+            let reason = e.to_string();
             self.audit.write(
                 &host_name,
                 "shot",
-                args.local.as_deref(),
-                None,
-                None,
-                None,
-                None,
-                Some(&e.to_string()),
-                Some(e.to_string()),
+                AuditRecord {
+                    cmd: args.local.as_deref(),
+                    blocked: Some(&reason),
+                    error: Some(reason.clone()),
+                    ..Default::default()
+                },
             );
             return Err(e.into_mcp());
         }
@@ -200,13 +201,13 @@ impl SshServer {
             self.audit.write(
                 &host_name,
                 "shot",
-                Some(&remote),
-                Some(r.exit_code),
-                Some(transfer.duration_ms),
-                None,
-                Some(transfer.bytes),
-                None,
-                None,
+                AuditRecord {
+                    cmd: Some(&remote),
+                    exit_code: Some(r.exit_code),
+                    duration_ms: Some(transfer.duration_ms),
+                    bytes_out: Some(transfer.bytes),
+                    ..Default::default()
+                },
             );
             return Ok(crate::tools::text(t.into_string()));
         };
@@ -239,13 +240,13 @@ impl SshServer {
         self.audit.write(
             &host_name,
             "shot",
-            Some(&remote),
-            Some(r.exit_code),
-            Some(transfer.duration_ms),
-            None,
-            Some(transfer.bytes),
-            None,
-            None,
+            AuditRecord {
+                cmd: Some(&remote),
+                exit_code: Some(r.exit_code),
+                duration_ms: Some(transfer.duration_ms),
+                bytes_out: Some(transfer.bytes),
+                ..Default::default()
+            },
         );
         let mime = if format == ShotFormat::Png {
             "image/png"
@@ -378,6 +379,29 @@ mod tests {
             assert!(
                 template.starts_with(bin),
                 "{bin} template runs something else"
+            );
+        }
+    }
+
+    #[test]
+    fn every_backend_is_one_the_facts_probe_looks_for() {
+        // Backend selection is `facts.has(bin)`. A backend the probe never
+        // reports can never be chosen: `spectacle` sat in this list unusable,
+        // so a KDE host got "no screenshot backend" with spectacle installed.
+        let probe = crate::tools::ops::FACTS_PROBE;
+        let listed: Vec<&str> = probe
+            .lines()
+            .find(|l| l.trim_start().starts_with("for c in "))
+            .expect("probe has a `for c in` loop")
+            .trim()
+            .trim_start_matches("for c in ")
+            .trim_end_matches("; do")
+            .split_whitespace()
+            .collect();
+        for (bin, _, _) in BACKENDS {
+            assert!(
+                listed.contains(bin),
+                "{bin} is a backend the facts probe never reports (probed: {listed:?})"
             );
         }
     }

@@ -59,7 +59,7 @@ In the [MCP registry](https://registry.modelcontextprotocol.io) it is
 | Files | `ls` `stat` `dn` `up` `cp` `wr` `mkdir` `rm` `tail` | SFTP, plus `tail -n` / `tail -F` in a bounded window |
 | Visual | `shot` | Screenshots the remote desktop, downscaled before it reaches the model |
 | Ops | `facts` `sys` `svc` | Cached host profile, parsed `ps`/`df`/`mem`/`net`, systemd units |
-| Session | `hosts` `ping` `disconnect` `disconnect_all` `reload` | Discovery and lifecycle; `reload` swaps config without a restart |
+| Session | `hosts` `ping` `disconnect` `disconnect_all` `reload` `shells` | Discovery and lifecycle; `reload` swaps config without a restart, `shells` closes named PTYs |
 | Network | `forward` `unforward` `forwards` | Local TCP forwards over the same connection |
 
 Every tool carries MCP annotations (`readOnlyHint`, `destructiveHint`,
@@ -72,8 +72,10 @@ Every tool carries MCP annotations (`readOnlyHint`, `destructiveHint`,
   elicit is denied. `read_only = true` blocks anything that looks like a write.
 - **Paths are checked on both sides.** Remote reads of keys, shadow files and
   cloud credentials are refused, and so are local writes that would land in
-  your `~/.bashrc` or an autostart folder. Paths are re-checked after the
-  server resolves them, so a symlink cannot launder a blocked target.
+  your `~/.bashrc` or an autostart folder. Every path-taking tool runs both
+  checks, `tail` included. Paths are re-checked after the server resolves them,
+  so a symlink cannot launder a blocked target, and a resolution that fails
+  outright refuses the call rather than skipping the check.
 - **Host keys are pinned** (TOFU by default, `strict` and per-host fingerprints
   available). Every call is appended to `~/.fast-mcp-ssh/audit.log` as NDJSON,
   with credentials scrubbed.
@@ -97,7 +99,7 @@ SSH key, bench client on Windows 11. Medians, lower is better. Reproduce with
 | `exec seq 1 5000` (~29 KB) | **18.7 ms** | 90.5 ms [^1] | 46.3 ms |
 | Write a 1 KB file | **1.4 ms** | 90.9 ms | 45.7 ms |
 | Read a 1 KB file | **2.1 ms** | 90.8 ms | 45.8 ms |
-| Tool surface, sent every session | 23 tools, 17.6 KB | 37 tools, 39.9 KB | **4 tools, 1.7 KB** |
+| Tool surface, sent every session | 26 tools, 20.6 KB | 37 tools, 39.9 KB | **4 tools, 1.7 KB** |
 
 Both alternatives are Node processes, so ~250 ms of their cold start is the
 runtime booting. The steady-state gap is the connection: `fast-mcp-ssh` keeps

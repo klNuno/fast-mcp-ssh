@@ -30,6 +30,10 @@ const DEFAULT_POOL_TARGET: usize = 2;
 /// `ChannelLimit`. Long enough to ride out a burst of parallel `exec`s, short
 /// enough that a leaked slot surfaces as an actionable error.
 const CHANNEL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long the pool refill waits before re-checking for a free channel slot
+/// when every slot is busy. Only a warm-up path, so losing a round to a real
+/// call costs one `CHANNEL_OPEN` round-trip, never a failed call.
+const REFILL_BACKOFF: Duration = Duration::from_millis(250);
 
 /// A pre-opened SSH session channel held in the pool. Owns the semaphore
 /// permit so concurrency accounting stays correct when the channel is
@@ -87,11 +91,6 @@ pub struct Session {
 }
 
 impl Session {
-    #[allow(dead_code)]
-    pub fn new(handle: SshHandle, max_channels: usize) -> Self {
-        Self::new_with_parent(handle, max_channels, None, None)
-    }
-
     pub fn new_with_parent(
         handle: SshHandle,
         max_channels: usize,
@@ -132,11 +131,17 @@ impl Session {
 
     /// Notify every in-flight exec on this session. Returns the count of
     /// notifications fired.
+    ///
+    /// `notify_one`, not `notify_waiters`: the exec loop rebuilds its
+    /// `notified()` future on every `select!` iteration, so a `notify_waiters`
+    /// landing between two polls reached nobody and the interrupt was lost
+    /// while the tool still reported it fired. `notify_one` stores a permit,
+    /// which the next poll consumes.
     pub async fn cancel_all_execs(&self) -> usize {
         let map = self.exec_cancels.lock().await;
         let n = map.len();
-        for n in map.values() {
-            n.notify_waiters();
+        for notify in map.values() {
+            notify.notify_one();
         }
         n
     }
@@ -144,6 +149,39 @@ impl Session {
     pub fn touch(&self) {
         let elapsed = self.started.elapsed().as_millis() as u64;
         self.last_used_ms.store(elapsed, Ordering::Relaxed);
+    }
+
+    /// Configured channel budget for this host. `exec_batch` sizes its own
+    /// fan-out against it so a wide batch queues on a semaphore it owns
+    /// instead of racing for slots and timing out in `acquire_channel`.
+    pub fn max_channels(&self) -> usize {
+        self.max_channels
+    }
+
+    /// Drop the default PTY, or a named one, releasing its channel slot when
+    /// the last `Arc` goes. Returns true if a shell was actually dropped.
+    pub async fn close_pty(&self, name: Option<&str>) -> bool {
+        match name {
+            None => self.pty.lock().await.take().is_some(),
+            Some(n) => self.named_ptys.lock().await.remove(n).is_some(),
+        }
+    }
+
+    /// Names of the live named shells, sorted. The default shell is not in
+    /// here; `close_pty(None)` addresses it.
+    pub async fn named_shells(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.named_ptys.lock().await.keys().cloned().collect();
+        v.sort();
+        v
+    }
+
+    /// Drop every PTY on this session. Returns how many went.
+    pub async fn close_all_ptys(&self) -> usize {
+        let default_gone = usize::from(self.pty.lock().await.take().is_some());
+        let mut named = self.named_ptys.lock().await;
+        let n = named.len();
+        named.clear();
+        default_gone + n
     }
 
     fn idle_for(&self, now: Instant) -> Duration {
@@ -487,17 +525,27 @@ fn spawn_pool_refill(weak: std::sync::Weak<Session>) {
                 notify.notified().await;
                 continue;
             }
-            // Reserve a channel slot. Waiting on the semaphore (instead of
-            // try_acquire + sleep polling) means the refill starts its open
-            // the instant a slot frees after a burst, so the next exec finds
-            // a parked channel instead of re-paying the CHANNEL_OPEN RTT.
-            // Hold only the semaphore Arc across the wait so the session can
-            // still drop (and this task exit) while we're parked.
+            // Take a slot only if one is free right now. `acquire_owned`
+            // would queue, and the tokio semaphore is FIFO: under a burst the
+            // refill lands ahead of a real `exec` and takes the slot that call
+            // was waiting for, turning a warm-up optimization into spurious
+            // `ChannelLimit` errors. The pool is best-effort, so back off and
+            // retry instead.
             let sem = Arc::clone(&session.channel_limit);
+            let notify = Arc::clone(&session.refill_notify);
             drop(session);
-            let permit = match sem.acquire_owned().await {
+            let permit = match Arc::clone(&sem).try_acquire_owned() {
                 Ok(p) => p,
-                Err(_) => return,
+                Err(_) => {
+                    // Woken by the next channel handout, or by the timer if
+                    // slots free up silently (a permit dropping notifies
+                    // nobody).
+                    tokio::select! {
+                        _ = notify.notified() => {}
+                        _ = tokio::time::sleep(REFILL_BACKOFF) => {}
+                    }
+                    continue;
+                }
             };
             let Some(session) = weak.upgrade() else {
                 return;

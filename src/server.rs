@@ -115,11 +115,17 @@ impl ServerHandler for SshServer {
             ServerCapabilities::builder().enable_tools().build(),
         )
         .with_server_info(Implementation::from_build_env())
-        .with_protocol_version(ProtocolVersion::V_2024_11_05)
+        // rmcp echoes back whatever version the client asked for when it knows
+        // it, so this is only the fallback for an unrecognized one. It still
+        // has to be a version that has elicitation: pinned at 2024-11-05, a
+        // client landing on the fallback could not answer a confirm prompt and
+        // every `confirm_patterns` command failed closed.
+        .with_protocol_version(ProtocolVersion::LATEST)
         .with_instructions(
             "SSH MCP server.\n\
              - Discovery: run `hosts` first to list targets and session state. `ping` checks reachability.\n\
              - Tool selection: `exec` for stateless one-shot (parallel-safe). `sh` for stateful PTY (cd/export/source persist). `exec_batch` for fan-out parallel commands on one host.\n\
+             - Shells: `sh shell=<name>` opens an isolated PTY that holds a channel slot until closed. `shells` lists them, `shells close=<name>` releases one.\n\
              - Files: prefer SFTP — `ls`/`dn`/`up`/`wr` over equivalent shell tricks. Use `wr` instead of `echo > file` via exec.\n\
              - Logs: stream via `tail` with follow=true. Never run `tail -F` via `sh` (blocks the PTY).\n\
              - Long output: results auto-truncate at 32 KB. Pipe through `grep`/`awk`/`head` server-side to narrow.\n\
@@ -239,11 +245,38 @@ impl SshServer {
                 if let Some(state) = guard.get(name) {
                     return Ok(Arc::clone(state));
                 }
+                // Each named shell holds a channel slot until the session
+                // dies. Unbounded, eight `shell=` names exhaust the default
+                // `max_channels_per_host` and every later `exec` on the host
+                // times out with no hint about why.
+                if guard.len() >= crate::tools::MAX_NAMED_PTYS {
+                    return Err(SshError::Config(format!(
+                        "too many named shells on this host ({}/{}). Close one with \
+                         `shells close=<name>` before opening another.",
+                        guard.len(),
+                        crate::tools::MAX_NAMED_PTYS
+                    )));
+                }
                 let new_state = Arc::new(pty::PtyState::open(session, opts).await?);
                 guard.insert(name.to_string(), Arc::clone(&new_state));
                 Ok(new_state)
             }
         }
+    }
+
+    /// Drop a PTY whose `run()` failed. A timed-out or closed shell leaves
+    /// unread bytes in the channel that would be spliced onto the *next*
+    /// call's output, and every later `sh` on that shell inherits the mess
+    /// with no way out short of `disconnect`. Dropping it means the next call
+    /// pays one PTY open and gets a clean shell.
+    pub(crate) async fn evict_broken_pty(
+        &self,
+        session: &Arc<Session>,
+        shell: Option<&str>,
+        why: &SshError,
+    ) {
+        tracing::warn!(shell = ?shell, error = %why, "dropping PTY after a failed run");
+        session.close_pty(shell).await;
     }
 }
 

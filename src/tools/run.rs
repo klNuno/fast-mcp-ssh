@@ -8,8 +8,9 @@ use rmcp::{
 };
 use serde::Deserialize;
 
+use crate::audit::AuditRecord;
 use crate::errors::SshError;
-use crate::guards::GuardCheck;
+use crate::guards::{CompiledGuards, GuardCheck};
 use crate::output::{Toon, truncate_with_hint};
 use crate::server::{SshServer, elicit_confirmation};
 use crate::session::{exec, pty};
@@ -26,7 +27,7 @@ pub struct ExecArgs {
     pub host: Option<String>,
     /// Command for the remote login shell. Pipes/redirects supported.
     pub cmd: String,
-    /// Per-call timeout. Default 60s. Format: "30s", "5m", "2h", "500ms" or seconds as integer.
+    /// Per-call timeout in whole seconds. Default 60, max 600.
     #[serde(default)]
     pub timeout: Option<u64>,
     /// Password for password-auth hosts. Cached in memory after first call.
@@ -41,7 +42,7 @@ pub struct ExecBatchArgs {
     pub host: Option<String>,
     /// Commands run in parallel on fresh exec channels (capped by max_channels_per_host).
     pub cmds: Vec<String>,
-    /// Per-call timeout applied to each command. Default 60s.
+    /// Per-call timeout in whole seconds, applied to each command. Default 60, max 600.
     #[serde(default)]
     pub timeout: Option<u64>,
     /// Password for password-auth hosts. Cached after first call.
@@ -59,7 +60,7 @@ pub struct ShArgs {
     pub host: Option<String>,
     /// Command run inside the persistent PTY. cd/export/source persist across calls.
     pub cmd: String,
-    /// Per-call timeout. Default 60s.
+    /// Per-call timeout in whole seconds. Default 60, max 600.
     #[serde(default)]
     pub timeout: Option<u64>,
     /// Password for password-auth hosts. Cached after first call.
@@ -101,17 +102,10 @@ impl SshServer {
         let password = args.password.map(zeroize::Zeroizing::new);
 
         if let Err(e) = self.run_guards(&host_name, &args.cmd, &ctx).await {
-            let err_msg = e.to_string();
             self.audit.write(
                 &host_name,
                 "exec",
-                Some(&args.cmd),
-                None,
-                None,
-                None,
-                None,
-                Some(&err_msg),
-                Some(err_msg.clone()),
+                AuditRecord::blocked(&args.cmd, &e.to_string()),
             );
             return Err(e.into_mcp());
         }
@@ -123,13 +117,7 @@ impl SshServer {
                 self.audit.write(
                     &host_name,
                     "exec",
-                    Some(&args.cmd),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(e.to_string()),
+                    AuditRecord::failed(&args.cmd, e.to_string()),
                 );
                 e.into_mcp()
             })?;
@@ -144,13 +132,7 @@ impl SshServer {
                 self.audit.write(
                     &host_name,
                     "exec",
-                    Some(&args.cmd),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(e.to_string()),
+                    AuditRecord::failed(&args.cmd, e.to_string()),
                 );
                 e.into_mcp()
             })?;
@@ -158,13 +140,13 @@ impl SshServer {
         self.audit.write(
             &host_name,
             "exec",
-            Some(&args.cmd),
-            Some(result.exit_code),
-            Some(result.duration_ms),
-            None,
-            Some(result.stdout_bytes + result.stderr_bytes),
-            None,
-            None,
+            AuditRecord {
+                cmd: Some(&args.cmd),
+                exit_code: Some(result.exit_code),
+                duration_ms: Some(result.duration_ms),
+                bytes_out: Some(result.stdout_bytes + result.stderr_bytes),
+                ..Default::default()
+            },
         );
         Ok(text(format_exec(
             &result,
@@ -208,9 +190,12 @@ impl SshServer {
         let verbose = args.verbose.unwrap_or(false);
         let password = args.password.map(zeroize::Zeroizing::new);
 
-        // Guard the whole batch up front, deduplicating confirm elicitations
-        // by pattern name: one user confirmation covers every command in the
-        // batch matching the same pattern, instead of K serial prompts.
+        // Guard the whole batch up front. Confirm elicitations are still
+        // deduplicated by pattern name so a batch of twenty `systemctl stop`
+        // does not become twenty prompts, but the prompt now lists every
+        // command the approval covers. Showing one command and silently
+        // approving the rest is exactly what `confirm_remembered` refuses to
+        // do on the single-command path.
         let guards = self.guards().for_host(&host_name);
         let mut confirmed: std::collections::HashSet<String> = std::collections::HashSet::new();
         for cmd in &args.cmds {
@@ -229,12 +214,16 @@ impl SshServer {
                     {
                         None
                     } else {
-                        let prompt = format!(
-                            "fast-mcp-ssh wants to run a sensitive command on '{host_name}' (matches '{pattern_name}'):\n\n{cmd}\n\nConfirming covers every command in this batch matching '{pattern_name}'. Reply 'yes' to proceed."
-                        );
+                        let covered = covered_by_pattern(&guards, &args.cmds, &pattern_name);
+                        let prompt = confirm_batch_prompt(&host_name, &pattern_name, &covered);
                         match elicit_confirmation(&ctx, &prompt).await {
                             Ok(true) => {
-                                self.remember_confirm(&host_name, cmd);
+                                // Remember each covered command on its own key,
+                                // so the approval the user actually read is the
+                                // approval that gets replayed.
+                                for c in &covered {
+                                    self.remember_confirm(&host_name, c);
+                                }
                                 confirmed.insert(pattern_name);
                                 None
                             }
@@ -251,17 +240,10 @@ impl SshServer {
                 }
             };
             if let Some(e) = err {
-                let err_msg = e.to_string();
                 self.audit.write(
                     &host_name,
                     "exec_batch",
-                    Some(cmd),
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(&err_msg),
-                    Some(err_msg.clone()),
+                    AuditRecord::blocked(cmd, &e.to_string()),
                 );
                 return Err(e.into_mcp());
             }
@@ -277,6 +259,14 @@ impl SshServer {
         }
 
         let max_capture = self.cfg().defaults.max_capture_bytes;
+        // Bound the fan-out to the host's own channel budget. Spawning all 64
+        // allowed commands against a default `max_channels_per_host = 8` meant
+        // the overflow sat in `acquire_channel` and died at its 15s timeout
+        // with `ChannelLimit` — a queue reported as a failure. One slot is
+        // left for the session's SFTP subsystem and PTY.
+        let fanout = Arc::new(tokio::sync::Semaphore::new(
+            session.max_channels().saturating_sub(1).max(1),
+        ));
         // JoinSet aborts in-flight tasks when dropped, so a request cancelled
         // by the client doesn't leave commands running on the remote host.
         // Track cmd-by-task-id so a panicked task still gets audited against
@@ -287,8 +277,14 @@ impl SshServer {
         for cmd in args.cmds.into_iter() {
             let s = Arc::clone(&session);
             let cmd_for_task = cmd.clone();
-            let abort =
-                set.spawn(async move { exec::exec(&s, &cmd_for_task, timeout, max_capture).await });
+            let gate = Arc::clone(&fanout);
+            let abort = set.spawn(async move {
+                let _slot = gate
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| SshError::Other("batch fan-out semaphore closed".into()))?;
+                exec::exec(&s, &cmd_for_task, timeout, max_capture).await
+            });
             by_id.insert(abort.id(), cmd);
         }
 
@@ -303,13 +299,13 @@ impl SshServer {
                     self.audit.write(
                         &host_name,
                         "exec_batch",
-                        Some(&cmd),
-                        Some(r.exit_code),
-                        Some(r.duration_ms),
-                        None,
-                        Some(r.stdout_bytes),
-                        None,
-                        None,
+                        AuditRecord {
+                            cmd: Some(&cmd),
+                            exit_code: Some(r.exit_code),
+                            duration_ms: Some(r.duration_ms),
+                            bytes_out: Some(r.stdout_bytes),
+                            ..Default::default()
+                        },
                     );
                     rows.push(vec![
                         cmd,
@@ -325,13 +321,7 @@ impl SshServer {
                     self.audit.write(
                         &host_name,
                         "exec_batch",
-                        Some(&cmd),
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        Some(err_msg.clone()),
+                        AuditRecord::failed(&cmd, err_msg.clone()),
                     );
                     rows.push(vec![cmd, "-1".into(), "0".into(), "0".into(), err_msg]);
                 }
@@ -342,13 +332,7 @@ impl SshServer {
                     self.audit.write(
                         &host_name,
                         "exec_batch",
-                        Some(&cmd),
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        Some(err_msg.clone()),
+                        AuditRecord::failed(&cmd, err_msg.clone()),
                     );
                     rows.push(vec![cmd, "-1".into(), "0".into(), "0".into(), err_msg]);
                 }
@@ -379,17 +363,10 @@ impl SshServer {
         let password = args.password.map(zeroize::Zeroizing::new);
 
         if let Err(e) = self.run_guards(&host_name, &args.cmd, &ctx).await {
-            let err_msg = e.to_string();
             self.audit.write(
                 &host_name,
                 "sh",
-                Some(&args.cmd),
-                None,
-                None,
-                None,
-                None,
-                Some(&err_msg),
-                Some(err_msg.clone()),
+                AuditRecord::blocked(&args.cmd, &e.to_string()),
             );
             return Err(e.into_mcp());
         }
@@ -413,23 +390,34 @@ impl SshServer {
             .ensure_pty(&session, opts, args.shell.as_deref())
             .await
             .map_err(|e| e.into_mcp())?;
-        let (output, exit_code) = pty_state
-            .run(&args.cmd, timeout, max_capture)
-            .await
-            .map_err(|e| e.into_mcp())?;
+        let (output, exit_code) = match pty_state.run(&args.cmd, timeout, max_capture).await {
+            Ok(v) => v,
+            Err(e) => {
+                // A run that never saw its sentinel leaves unread bytes in the
+                // channel. Keeping the shell would splice them onto the next
+                // call's output; drop it so the next `sh` opens a clean one.
+                self.evict_broken_pty(&session, args.shell.as_deref(), &e)
+                    .await;
+                self.audit.write(
+                    &host_name,
+                    "sh",
+                    AuditRecord::failed(&args.cmd, e.to_string()),
+                );
+                return Err(e.into_mcp());
+            }
+        };
         session.touch();
 
         let bytes = output.len();
         self.audit.write(
             &host_name,
             "sh",
-            Some(&args.cmd),
-            Some(exit_code),
-            None,
-            None,
-            Some(bytes),
-            None,
-            None,
+            AuditRecord {
+                cmd: Some(&args.cmd),
+                exit_code: Some(exit_code),
+                bytes_out: Some(bytes),
+                ..Default::default()
+            },
         );
 
         let mut t = Toon::new();
@@ -486,17 +474,8 @@ impl SshServer {
             pty_acted = true;
         }
         let exec_aborted = session.cancel_all_execs().await;
-        self.audit.write(
-            &host_name,
-            "interrupt",
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+        self.audit
+            .write(&host_name, "interrupt", AuditRecord::default());
         t.field("pty_sigint", pty_acted);
         t.field("exec_aborted", exec_aborted as u64);
         if !pty_acted && exec_aborted == 0 {
@@ -506,6 +485,43 @@ impl SshServer {
         }
         Ok(text(t.into_string()))
     }
+}
+
+/// Every command in the batch that the same confirm pattern would stop, in
+/// submission order. This is the set one approval waives, so it is also the
+/// set the prompt has to show.
+fn covered_by_pattern(guards: &CompiledGuards, cmds: &[String], pattern_name: &str) -> Vec<String> {
+    cmds.iter()
+        .filter(|c| {
+            matches!(
+                guards.check(c),
+                GuardCheck::Confirm { pattern_name: ref p } if p == pattern_name
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+/// Elicitation text for a batch confirmation. Lists every command covered so
+/// the operator approves what they can actually see; a single-command batch
+/// reads like the single-command prompt.
+fn confirm_batch_prompt(host: &str, pattern_name: &str, covered: &[String]) -> String {
+    let listed = covered
+        .iter()
+        .map(|c| format!("  - {c}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if covered.len() == 1 {
+        return format!(
+            "fast-mcp-ssh wants to run a sensitive command on '{host}' (matches '{pattern_name}'):\n\n{}\n\nReply 'yes' to proceed.",
+            covered[0]
+        );
+    }
+    format!(
+        "fast-mcp-ssh wants to run {} sensitive commands on '{host}' (all match '{pattern_name}'):\n\n{listed}\n\nReplying 'yes' approves all {} of them. Reply 'yes' to proceed.",
+        covered.len(),
+        covered.len()
+    )
 }
 
 fn format_exec(r: &exec::ExecResult, truncate: usize) -> String {
@@ -542,4 +558,54 @@ fn format_exec(r: &exec::ExecResult, truncate: usize) -> String {
         t.hint("non-zero exit. inspect stderr.");
     }
     t.into_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Guards;
+
+    fn guards() -> CompiledGuards {
+        CompiledGuards::compile(&Guards::default()).expect("default guards compile")
+    }
+
+    #[test]
+    fn covered_set_is_every_command_the_pattern_stops() {
+        let cmds: Vec<String> = [
+            "systemctl stop nginx",
+            "ls -la /etc",
+            "systemctl stop firewalld",
+            "reboot",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let covered = covered_by_pattern(&guards(), &cmds, "systemctl-stop");
+        assert_eq!(
+            covered,
+            vec!["systemctl stop nginx", "systemctl stop firewalld"]
+        );
+    }
+
+    #[test]
+    fn batch_prompt_names_every_command_it_approves() {
+        // The whole point of the fix: approving `stop nginx` must not silently
+        // approve `stop firewalld` behind a prompt that never showed it.
+        let covered = vec![
+            "systemctl stop nginx".to_string(),
+            "systemctl stop firewalld".to_string(),
+        ];
+        let prompt = confirm_batch_prompt("box1", "systemctl-stop", &covered);
+        assert!(prompt.contains("systemctl stop nginx"), "got: {prompt}");
+        assert!(prompt.contains("systemctl stop firewalld"), "got: {prompt}");
+        assert!(prompt.contains("approves all 2"), "got: {prompt}");
+    }
+
+    #[test]
+    fn single_command_batch_reads_like_the_single_command_prompt() {
+        let covered = vec!["reboot".to_string()];
+        let prompt = confirm_batch_prompt("box1", "reboot", &covered);
+        assert!(prompt.contains("a sensitive command"), "got: {prompt}");
+        assert!(!prompt.contains("approves all"), "got: {prompt}");
+    }
 }

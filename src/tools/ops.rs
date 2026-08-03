@@ -14,16 +14,17 @@ use rmcp::{
 };
 use serde::Deserialize;
 
+use crate::audit::AuditRecord;
 use crate::errors::SshError;
 use crate::output::Toon;
 use crate::server::SshServer;
 use crate::session::exec;
-use crate::tools::{clamp_timeout, text};
+use crate::tools::{clamp_timeout, shell_quote, text};
 
 /// Probe script for `facts`. POSIX sh only: it has to run under dash, ash and
 /// busybox, not just bash. Emits `key=value` lines and never fails the call,
 /// so a missing tool yields an absent key rather than a non-zero exit.
-const FACTS_PROBE: &str = r#"
+pub(crate) const FACTS_PROBE: &str = r#"
 p() { printf '%s=%s\n' "$1" "$2"; }
 p os "$(uname -s 2>/dev/null)"
 p kernel "$(uname -r 2>/dev/null)"
@@ -56,7 +57,11 @@ else p container none
 fi
 if sudo -n true >/dev/null 2>&1; then p sudo_nopasswd yes; else p sudo_nopasswd no; fi
 h=
-for c in rg rsync tmux screen python3 node jq git docker podman systemctl curl wget tar zstd sha256sum grim scrot import gnome-screenshot; do
+# Every name another tool gates on has to be in this list, or that tool reads
+# the absence as "not installed" and refuses on a host that has it: `sys
+# what=net` did exactly that for `ss`, on every host, and `shot` never picked
+# `spectacle`.
+for c in rg rsync tmux screen python3 node jq git docker podman systemctl ss curl wget tar zstd sha256sum grim scrot import gnome-screenshot spectacle; do
   command -v "$c" >/dev/null 2>&1 && h="$h,$c"
 done
 p has "${h#,}"
@@ -235,11 +240,6 @@ fn validate_unit(unit: &str) -> Result<(), McpError> {
     Ok(())
 }
 
-/// Single-quotes a value for safe interpolation into a remote shell string.
-pub(crate) fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
-}
-
 #[tool_router(router = ops_router, vis = "pub")]
 impl SshServer {
     #[tool(
@@ -337,13 +337,12 @@ impl SshServer {
         self.audit.write(
             &host_name,
             "sys",
-            Some(&cmd),
-            Some(r.exit_code),
-            None,
-            None,
-            Some(r.stdout_bytes),
-            None,
-            None,
+            AuditRecord {
+                cmd: Some(&cmd),
+                exit_code: Some(r.exit_code),
+                bytes_out: Some(r.stdout_bytes),
+                ..Default::default()
+            },
         );
 
         let mut t = Toon::new();
@@ -454,13 +453,7 @@ impl SshServer {
             self.audit.write(
                 &host_name,
                 "svc",
-                Some(&cmd),
-                None,
-                None,
-                None,
-                None,
-                Some(&e.to_string()),
-                Some(e.to_string()),
+                AuditRecord::blocked(&cmd, &e.to_string()),
             );
             return Err(e.into_mcp());
         }
@@ -487,13 +480,12 @@ impl SshServer {
         self.audit.write(
             &host_name,
             "svc",
-            Some(&cmd),
-            Some(r.exit_code),
-            None,
-            None,
-            Some(r.stdout_bytes),
-            None,
-            None,
+            AuditRecord {
+                cmd: Some(&cmd),
+                exit_code: Some(r.exit_code),
+                bytes_out: Some(r.stdout_bytes),
+                ..Default::default()
+            },
         );
 
         let mut t = Toon::new();
@@ -828,11 +820,33 @@ mod tests {
         assert!(validate_unit("").is_err());
     }
 
+    /// Extract the binary names the probe actually looks for, so a test can
+    /// assert a gate and the probe agree.
+    fn probed_binaries() -> Vec<&'static str> {
+        FACTS_PROBE
+            .lines()
+            .find(|l| l.trim_start().starts_with("for c in "))
+            .expect("probe has a `for c in` loop")
+            .trim()
+            .trim_start_matches("for c in ")
+            .trim_end_matches("; do")
+            .split_whitespace()
+            .collect()
+    }
+
     #[test]
-    fn quotes_for_shell() {
-        assert_eq!(shell_quote("plain"), "'plain'");
-        assert_eq!(shell_quote("it's"), r"'it'\''s'");
-        assert_eq!(shell_quote("a b; c"), "'a b; c'");
+    fn every_gated_binary_is_actually_probed() {
+        // `sys what=net` gates on `has("ss")`. `ss` was missing from the probe,
+        // so the view refused on every host, installed or not.
+        let probed = probed_binaries();
+        assert!(probed.contains(&"ss"), "probed: {probed:?}");
+    }
+
+    #[test]
+    fn probe_reports_a_binary_it_looks_for() {
+        let f = HostFacts::parse("has=ss,jq\n");
+        assert!(f.has("ss"));
+        assert!(!f.has("spectacle"));
     }
 
     #[test]
