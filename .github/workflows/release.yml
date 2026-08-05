@@ -1,3 +1,7 @@
+# Builds a tag and opens the release as a DRAFT. Nothing is published from
+# here: `releases/latest` skips drafts, so no binary and no crate reaches
+# anyone until a human has looked at the assets and pressed Publish. That press
+# is what triggers `publish.yml`.
 name: Release
 
 on:
@@ -33,14 +37,16 @@ jobs:
             v[0-9]*.[0-9]*.[0-9]*) ;;
             *) echo "::error::tag $tag is not vMAJOR.MINOR.PATCH" && exit 1 ;;
           esac
-          crate=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          # `tr -d '\r'`: a manifest that reaches the runner with CRLF makes
+          # every comparison below fail against an identical-looking string.
+          crate=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1 | tr -d '\r')
           if [ "$crate" != "${tag#v}" ]; then
             echo "::error::Cargo.toml says $crate, the tag says ${tag#v}"
             exit 1
           fi
           # Two places in server.json, and the MCP registry refuses an entry
           # whose package version it cannot find on crates.io.
-          for v in $(jq -r '.version, .packages[].version' server.json); do
+          for v in $(jq -r '.version, .packages[].version' server.json | tr -d '\r'); do
             if [ "$v" != "${tag#v}" ]; then
               echo "::error::server.json says $v, the tag says ${tag#v}"
               exit 1
@@ -149,40 +155,11 @@ jobs:
           } > RELEASE_NOTES.md
           cat RELEASE_NOTES.md
 
+      # Draft on purpose. Publishing is a separate, human-triggered step; see
+      # the header comment and `publish.yml`.
       - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           body_path: RELEASE_NOTES.md
           files: dist/*
-
-  publish:
-    name: crates.io
-    needs: release
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch, pinned 2026-07-29
-      - run: cargo publish --locked
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-  # Runs after crates.io because the registry proves ownership of the package
-  # by reading the `mcp-name:` line out of the README it serves. OIDC, so there
-  # is no token to store and no device code to type.
-  registry:
-    name: MCP registry
-    needs: publish
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
-      - name: Install mcp-publisher
-        run: |
-          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" \
-            | tar xz mcp-publisher
-      - run: ./mcp-publisher login github-oidc
-      - run: ./mcp-publisher publish
+          draft: true

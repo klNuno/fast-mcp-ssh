@@ -1,0 +1,155 @@
+# Publishes the crate and the MCP registry entry for a release a human has
+# already looked at and pressed Publish on. `release.yml` builds the tag and
+# leaves the release in draft; this file is the other half.
+#
+# Ordering matters: crates.io goes last, after the GitHub release leaves draft.
+# A version on crates.io with no binary behind it is one somebody installs and
+# cannot update, or reads release notes for and cannot download.
+#
+# GitHub reads `on: release` workflows from the DEFAULT BRANCH, never from the
+# tag. Editing this file only takes effect once it is on `main`, whatever the
+# tag being published contains.
+name: Publish
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to publish (for retrying a failed run)
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CRATE: fast-mcp-ssh
+
+# Publishing the same release twice (edit, re-publish, manual retry) must not
+# race itself into two uploads.
+concurrency:
+  group: publish-${{ inputs.tag || github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  crate:
+    name: crates.io
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # mints the short-lived registry token, see `auth` below
+    outputs:
+      already: ${{ steps.guard.outputs.already }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          ref: ${{ inputs.tag || github.event.release.tag_name }}
+
+      # A crates.io version is permanent: it can be yanked, never replaced. So
+      # every disagreement is caught before anything is uploaded.
+      - name: Check the tag against the manifests
+        id: version
+        run: |
+          tag="${{ inputs.tag || github.event.release.tag_name }}"
+          case "$tag" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::tag $tag is not vMAJOR.MINOR.PATCH" && exit 1 ;;
+          esac
+          version="${tag#v}"
+          # `tr -d '\r'`: a manifest that reaches the runner with CRLF makes
+          # every comparison below fail against an identical-looking string.
+          crate=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1 | tr -d '\r')
+          if [ "$crate" != "$version" ]; then
+            echo "::error::Cargo.toml says $crate, the tag says $version"
+            exit 1
+          fi
+          for v in $(jq -r '.version, .packages[].version' server.json | tr -d '\r'); do
+            if [ "$v" != "$version" ]; then
+              echo "::error::server.json says $v, the tag says $version"
+              exit 1
+            fi
+          done
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # Before the authentication step on purpose: re-running a workflow over a
+      # release that already shipped then ends as a green skip instead of a
+      # failed run against a version crates.io will refuse anyway.
+      - name: Is this version already on crates.io
+        id: guard
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          found=$(curl -fsSL \
+            -H "User-Agent: ${CRATE}-release (github actions)" \
+            "https://crates.io/api/v1/crates/${CRATE}/versions" \
+            | jq -r --arg v "$version" '[.versions[] | select(.num == $v)] | length')
+          if [ "$found" != "0" ]; then
+            echo "::notice::crates.io already serves ${CRATE} $version, skipping the upload"
+            echo "already=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch, pinned 2026-07-29
+        if: steps.guard.outputs.already == 'false'
+
+      # Trusted publishing: mints a short-lived token from this run's OIDC
+      # identity, so no long-lived registry token sits in the repository
+      # secrets. crates.io has to know about it (crate Settings, Trusted
+      # Publishing, naming this repository and THIS FILE NAME), otherwise the
+      # run fails with `No Trusted Publishing config found`.
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        id: auth
+        if: steps.guard.outputs.already == 'false'
+
+      - run: cargo publish --locked
+        if: steps.guard.outputs.already == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  # Runs after crates.io because the registry proves ownership of the package
+  # by reading the `mcp-name:` line out of the README crates.io serves. OIDC,
+  # so there is no token to store and no device code to type.
+  registry:
+    name: MCP registry
+    needs: crate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          ref: ${{ inputs.tag || github.event.release.tag_name }}
+
+      # Same reasoning as the crates.io guard: a retry over an entry that is
+      # already live should be a skip, not a failure.
+      - name: Is this version already in the registry
+        id: guard
+        run: |
+          name=$(jq -r '.name' server.json)
+          version=$(jq -r '.version' server.json)
+          found=$(curl -fsSL \
+            -H "User-Agent: ${CRATE}-release (github actions)" \
+            "https://registry.modelcontextprotocol.io/v0/servers?search=${CRATE}" \
+            | jq -r --arg n "$name" --arg v "$version" \
+              '[.servers[]? | select(.server.name == $n and .server.version == $v)] | length')
+          if [ "$found" != "0" ]; then
+            echo "::notice::the registry already lists $name $version, skipping"
+            echo "already=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install mcp-publisher
+        if: steps.guard.outputs.already == 'false'
+        run: |
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" \
+            | tar xz mcp-publisher
+
+      - run: ./mcp-publisher login github-oidc
+        if: steps.guard.outputs.already == 'false'
+
+      - run: ./mcp-publisher publish
+        if: steps.guard.outputs.already == 'false'
