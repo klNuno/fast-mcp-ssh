@@ -1,6 +1,6 @@
 [package]
 name = "fast-mcp-ssh"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2024"
 rust-version = "1.89"
 description = "MCP server giving AI agents SSH, SFTP, persistent PTY shells, host-to-host copies and remote desktop screenshots. One Rust binary, no runtime."
