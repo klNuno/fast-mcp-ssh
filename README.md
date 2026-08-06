@@ -24,8 +24,8 @@ cargo install fast-mcp-ssh
 
 Or take a prebuilt binary from the
 [latest release](https://github.com/klNuno/fast-mcp-ssh/releases/latest) and
-check it against the matching `.sha256`. Linux and macOS ship x86_64 and
-aarch64, Windows ships x86_64.
+check it against `SHA256SUMS.txt`. Linux and macOS ship x86_64 and aarch64,
+Windows ships x86_64.
 
 Copy [`hosts.example.toml`](./hosts.example.toml) to `~/.fast-mcp-ssh/hosts.toml`
 and fill in your hosts. Keys go in `~/.fast-mcp-ssh/keys/<name>`; `auth` is
