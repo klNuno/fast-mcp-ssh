@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.klNuno/fast-mcp-ssh",
   "description": "SSH, SFTP, PTY shells, host-to-host copies and remote screenshots for AI agents. One Rust binary.",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "repository": {
     "url": "https://github.com/klNuno/fast-mcp-ssh",
     "source": "github"
@@ -12,7 +12,7 @@
       "registryType": "cargo",
       "registryBaseUrl": "https://crates.io",
       "identifier": "fast-mcp-ssh",
-      "version": "0.4.4",
+      "version": "0.4.5",
       "transport": {
         "type": "stdio"
       }
