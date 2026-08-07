@@ -52,6 +52,14 @@ jobs:
               exit 1
             fi
           done
+          # The registry caps the description at 100 characters and only says
+          # so at publish time, which is after the crate is already up and a
+          # version can no longer be corrected. v0.4.4 went out that way.
+          desc=$(jq -r '.description' server.json | tr -d '\r')
+          if [ "${#desc}" -gt 100 ]; then
+            echo "::error::server.json description is ${#desc} characters, the MCP registry caps it at 100"
+            exit 1
+          fi
 
   build:
     name: ${{ matrix.target }}
