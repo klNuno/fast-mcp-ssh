@@ -83,11 +83,27 @@ ImageMagick `import` or `scrot` and uses whichever is installed, covering X11
 and wlroots Wayland. The capture is downscaled and re-encoded locally, so a 4K
 screen does not arrive as a multi-megabyte payload.
 
+## Protocol
+
+Speaks every revision from `2024-11-05` to `2026-07-28` and adapts per peer.
+
+On `2026-07-28` a server may no longer open a request of its own, so a
+confirmation comes back as an `input_required` result the client answers and
+retries (SEP-2322). Older clients keep getting a plain `elicitation/create`.
+Persistent sessions are unaffected: a PTY has always been addressed by the
+`host` and `session` arguments of the call, which is exactly the explicit
+handle the stateless core asks for.
+
+Long operations use the Tasks extension (SEP-2663) when the client declares
+it: `exec` past the default 60s timeout and `tail` with `follow=true` return a
+task handle to poll instead of holding the call open. Every other client gets
+the blocking call it always got.
+
 ## Security
 
 - **Guards run before any SSH packet.** `deny_patterns` refuse outright,
-  `confirm_patterns` trigger an MCP elicitation, and a client that cannot
-  elicit is denied. `read_only = true` blocks anything that looks like a write.
+  `confirm_patterns` ask the user, and a client that cannot answer is denied.
+  `read_only = true` blocks anything that looks like a write.
 - **Paths are checked on both sides.** Remote reads of keys, shadow files and
   cloud credentials are refused, and so are local writes that would land in
   your `~/.bashrc` or an autostart folder. Every path-taking tool runs both
