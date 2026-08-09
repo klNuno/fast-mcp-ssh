@@ -9,15 +9,17 @@
 use std::collections::BTreeMap;
 
 use rmcp::{
-    ErrorData as McpError, RoleServer, handler::server::wrapper::Parameters, model::*, schemars,
-    service::RequestContext, tool, tool_router,
+    ErrorData as McpError, RoleServer, handler::server::tool::InputResponses as ClientAnswers,
+    handler::server::wrapper::Parameters, model::*, schemars, service::RequestContext, tool,
+    tool_router,
 };
 use serde::Deserialize;
 
 use crate::audit::AuditRecord;
+use crate::confirm::Confirm;
 use crate::errors::SshError;
 use crate::output::Toon;
-use crate::server::SshServer;
+use crate::server::{Guarded, SshServer};
 use crate::session::exec;
 use crate::tools::{clamp_timeout, shell_quote, text};
 
@@ -409,8 +411,9 @@ impl SshServer {
     async fn svc(
         &self,
         Parameters(args): Parameters<SvcArgs>,
+        ClientAnswers(answers): ClientAnswers,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
         let host_name = self.resolve_host(args.host)?;
         let action = args.action.unwrap_or(SvcAction::Status);
         let lines = args.lines.unwrap_or(50).clamp(1, 500);
@@ -447,15 +450,20 @@ impl SshServer {
 
         // Mutating actions go through the guard chain like any other command,
         // so `systemctl stop` still trips the default confirm pattern.
-        if action.is_mutating()
-            && let Err(e) = self.run_guards(&host_name, &cmd, &ctx).await
-        {
-            self.audit.write(
-                &host_name,
-                "svc",
-                AuditRecord::blocked(&cmd, &e.to_string()),
-            );
-            return Err(e.into_mcp());
+        if action.is_mutating() {
+            let mut confirm = Confirm::new(&ctx, answers);
+            match self.run_guards(&host_name, &cmd, &mut confirm).await {
+                Ok(Guarded::Passed) => {}
+                Ok(Guarded::Deferred) => return Ok(confirm.into_input_required().into()),
+                Err(e) => {
+                    self.audit.write(
+                        &host_name,
+                        "svc",
+                        AuditRecord::blocked(&cmd, &e.to_string()),
+                    );
+                    return Err(e.into_mcp());
+                }
+            }
         }
 
         let session = self
@@ -539,7 +547,7 @@ impl SshServer {
                 }
             }
         }
-        Ok(text(t.into_string()))
+        Ok(text(t.into_string()).into())
     }
 }
 

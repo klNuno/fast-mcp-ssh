@@ -4,16 +4,18 @@ use std::time::Duration;
 
 use base64::Engine;
 use rmcp::{
-    ErrorData as McpError, RoleServer, handler::server::wrapper::Parameters, model::*, schemars,
-    service::RequestContext, tool, tool_router,
+    ErrorData as McpError, RoleServer, handler::server::tool::InputResponses as ClientAnswers,
+    handler::server::wrapper::Parameters, model::*, schemars, service::RequestContext, tool,
+    tool_router,
 };
 use serde::Deserialize;
 
 use crate::audit::AuditRecord;
+use crate::confirm::{self, Answer, Confirm};
 use crate::errors::SshError;
 use crate::guards;
 use crate::output::{Toon, truncate_with_hint};
-use crate::server::{SshServer, elicit_confirmation};
+use crate::server::SshServer;
 use crate::sftp;
 use crate::tail;
 use crate::tools::{
@@ -603,8 +605,9 @@ impl SshServer {
     async fn rm(
         &self,
         Parameters(args): Parameters<RmArgs>,
+        ClientAnswers(answers): ClientAnswers,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
         let host_name = self.resolve_host(args.host)?;
         if let Err(e) = self
             .guards()
@@ -626,13 +629,12 @@ impl SshServer {
                 "fast-mcp-ssh wants to recursively delete '{}' on host '{host_name}'. Reply 'yes' to proceed.",
                 args.path
             );
-            match elicit_confirmation(&ctx, &prompt).await {
-                Ok(true) => {}
-                Ok(false) => return Err(SshError::ConfirmationDenied.into_mcp()),
-                Err(e) => {
-                    tracing::warn!(?e, "rm recursive elicit failed; deny");
-                    return Err(SshError::ConfirmationDenied.into_mcp());
-                }
+            let mut confirm = Confirm::new(&ctx, answers);
+            let key = confirm::key_for(&["rm-recursive", &host_name, &args.path]);
+            match confirm.ask(&key, &prompt).await {
+                Answer::Approved => {}
+                Answer::Denied => return Err(SshError::ConfirmationDenied.into_mcp()),
+                Answer::Deferred => return Ok(confirm.into_input_required().into()),
             }
         }
         let session = self
@@ -651,7 +653,7 @@ impl SshServer {
         t.field("host", &host_name)
             .field("path", &args.path)
             .field("removed", removed);
-        Ok(text(t.into_string()))
+        Ok(text(t.into_string()).into())
     }
 
     #[tool(

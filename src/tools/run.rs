@@ -3,16 +3,18 @@
 use std::sync::Arc;
 
 use rmcp::{
-    ErrorData as McpError, RoleServer, handler::server::wrapper::Parameters, model::*, schemars,
-    service::RequestContext, tool, tool_router,
+    ErrorData as McpError, RoleServer, handler::server::tool::InputResponses as ClientAnswers,
+    handler::server::wrapper::Parameters, model::*, schemars, service::RequestContext, tool,
+    tool_router,
 };
 use serde::Deserialize;
 
 use crate::audit::AuditRecord;
+use crate::confirm::{self, Answer, Confirm};
 use crate::errors::SshError;
 use crate::guards::{CompiledGuards, GuardCheck};
 use crate::output::{Toon, truncate_with_hint};
-use crate::server::{SshServer, elicit_confirmation};
+use crate::server::{Guarded, SshServer};
 use crate::session::{exec, pty};
 use crate::tools::{
     HostOnlyArgs, MAX_BATCH_CMDS, batch_preview, clamp_timeout, text, validate_cmd,
@@ -94,20 +96,26 @@ impl SshServer {
     async fn exec(
         &self,
         Parameters(args): Parameters<ExecArgs>,
+        ClientAnswers(answers): ClientAnswers,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
         validate_cmd(&args.cmd)?;
         let timeout = clamp_timeout(args.timeout);
         let host_name = self.resolve_host(args.host)?;
         let password = args.password.map(zeroize::Zeroizing::new);
 
-        if let Err(e) = self.run_guards(&host_name, &args.cmd, &ctx).await {
-            self.audit.write(
-                &host_name,
-                "exec",
-                AuditRecord::blocked(&args.cmd, &e.to_string()),
-            );
-            return Err(e.into_mcp());
+        let mut confirm = Confirm::new(&ctx, answers);
+        match self.run_guards(&host_name, &args.cmd, &mut confirm).await {
+            Ok(Guarded::Passed) => {}
+            Ok(Guarded::Deferred) => return Ok(confirm.into_input_required().into()),
+            Err(e) => {
+                self.audit.write(
+                    &host_name,
+                    "exec",
+                    AuditRecord::blocked(&args.cmd, &e.to_string()),
+                );
+                return Err(e.into_mcp());
+            }
         }
         let session = self
             .pool
@@ -148,10 +156,7 @@ impl SshServer {
                 ..Default::default()
             },
         );
-        Ok(text(format_exec(
-            &result,
-            self.cfg().defaults.truncate_bytes,
-        )))
+        Ok(text(format_exec(&result, self.cfg().defaults.truncate_bytes)).into())
     }
 
     #[tool(
@@ -167,8 +172,9 @@ impl SshServer {
     async fn exec_batch(
         &self,
         Parameters(args): Parameters<ExecBatchArgs>,
+        ClientAnswers(answers): ClientAnswers,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
         if args.cmds.is_empty() {
             return Err(
                 SshError::Config("cmds must contain at least one command".into()).into_mcp(),
@@ -195,8 +201,12 @@ impl SshServer {
         // does not become twenty prompts, but the prompt now lists every
         // command the approval covers. Showing one command and silently
         // approving the rest is exactly what `confirm_remembered` refuses to
-        // do on the single-command path.
+        // do on the single-command path. A deferred ask does not stop the
+        // walk, so a peer on the multi round-trip path is asked for every
+        // distinct pattern in the batch at once rather than one pattern per
+        // round trip.
         let guards = self.guards().for_host(&host_name);
+        let mut confirm = Confirm::new(&ctx, answers);
         let mut confirmed: std::collections::HashSet<String> = std::collections::HashSet::new();
         for cmd in &args.cmds {
             let check = guards.check(cmd);
@@ -216,8 +226,12 @@ impl SshServer {
                     } else {
                         let covered = covered_by_pattern(&guards, &args.cmds, &pattern_name);
                         let prompt = confirm_batch_prompt(&host_name, &pattern_name, &covered);
-                        match elicit_confirmation(&ctx, &prompt).await {
-                            Ok(true) => {
+                        // Keyed by pattern, not by command, so the answer
+                        // covers the batch the same way on a retry as it does
+                        // in place.
+                        let key = confirm::key_for(&[&host_name, &pattern_name]);
+                        match confirm.ask(&key, &prompt).await {
+                            Answer::Approved => {
                                 // Remember each covered command on its own key,
                                 // so the approval the user actually read is the
                                 // approval that gets replayed.
@@ -227,14 +241,8 @@ impl SshServer {
                                 confirmed.insert(pattern_name);
                                 None
                             }
-                            Ok(false) => Some(SshError::ConfirmationDenied),
-                            Err(e) => {
-                                tracing::warn!(
-                                    ?e,
-                                    "elicitation failed; defaulting to deny (fail-closed)"
-                                );
-                                Some(SshError::ConfirmationDenied)
-                            }
+                            Answer::Denied => Some(SshError::ConfirmationDenied),
+                            Answer::Deferred => None,
                         }
                     }
                 }
@@ -247,6 +255,12 @@ impl SshServer {
                 );
                 return Err(e.into_mcp());
             }
+        }
+        // A block wins over a pending confirmation: the loop above already
+        // returned for any denied command, so reaching here with asks queued
+        // means the rest of the batch is clear and only the human is missing.
+        if confirm.deferred() {
+            return Ok(confirm.into_input_required().into());
         }
 
         let session = self
@@ -339,7 +353,7 @@ impl SshServer {
             }
         }
         t.table_strs("results", &["cmd", "exit", "ms", "bytes", "preview"], &rows);
-        Ok(text(t.into_string()))
+        Ok(text(t.into_string()).into())
     }
 
     #[tool(
@@ -355,20 +369,26 @@ impl SshServer {
     async fn sh(
         &self,
         Parameters(args): Parameters<ShArgs>,
+        ClientAnswers(answers): ClientAnswers,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
         validate_cmd(&args.cmd)?;
         let timeout = clamp_timeout(args.timeout);
         let host_name = self.resolve_host(args.host)?;
         let password = args.password.map(zeroize::Zeroizing::new);
 
-        if let Err(e) = self.run_guards(&host_name, &args.cmd, &ctx).await {
-            self.audit.write(
-                &host_name,
-                "sh",
-                AuditRecord::blocked(&args.cmd, &e.to_string()),
-            );
-            return Err(e.into_mcp());
+        let mut confirm = Confirm::new(&ctx, answers);
+        match self.run_guards(&host_name, &args.cmd, &mut confirm).await {
+            Ok(Guarded::Passed) => {}
+            Ok(Guarded::Deferred) => return Ok(confirm.into_input_required().into()),
+            Err(e) => {
+                self.audit.write(
+                    &host_name,
+                    "sh",
+                    AuditRecord::blocked(&args.cmd, &e.to_string()),
+                );
+                return Err(e.into_mcp());
+            }
         }
 
         let session = self
@@ -432,7 +452,7 @@ impl SshServer {
         if exit_code != 0 {
             t.hint("non-zero exit. cd preserved across sh calls.");
         }
-        Ok(text(t.into_string()))
+        Ok(text(t.into_string()).into())
     }
 
     #[tool(

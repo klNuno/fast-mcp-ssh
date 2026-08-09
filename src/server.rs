@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::audit::AuditLog;
 use crate::config::Config;
+use crate::confirm::{self, Answer, Confirm};
 use crate::errors::SshError;
 use crate::forward::ForwardHandle;
 use crate::guards::{GuardCache, GuardCheck};
@@ -110,20 +111,6 @@ impl SshServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for SshServer {
-    /// The SDK would otherwise advertise every revision it knows, including
-    /// `2026-07-28`. That one forbids server-initiated requests, and the
-    /// confirmation path still opens an `elicitation/create`, so a peer that
-    /// negotiated it would be asked over a channel the spec has closed. Kept
-    /// capped until the confirmation path speaks multi round-trip requests.
-    fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
-        std::borrow::Cow::Borrowed(&[
-            ProtocolVersion::V_2024_11_05,
-            ProtocolVersion::V_2025_03_26,
-            ProtocolVersion::V_2025_06_18,
-            ProtocolVersion::V_2025_11_25,
-        ])
-    }
-
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
             ServerCapabilities::builder().enable_tools().build(),
@@ -150,16 +137,26 @@ impl ServerHandler for SshServer {
     }
 }
 
+/// Verdict of the guard chain when nothing was blocked.
+pub(crate) enum Guarded {
+    /// Cleared. The caller may proceed.
+    Passed,
+    /// A confirmation was queued for the client and no answer exists yet. The
+    /// caller must stop and return the interim result built by
+    /// [`Confirm::into_input_required`].
+    Deferred,
+}
+
 impl SshServer {
     pub(crate) async fn run_guards(
         &self,
         host: &str,
         cmd: &str,
-        ctx: &RequestContext<RoleServer>,
-    ) -> Result<(), SshError> {
+        confirm: &mut Confirm<'_>,
+    ) -> Result<Guarded, SshError> {
         let guards = self.guards().for_host(host);
         match guards.check(cmd) {
-            GuardCheck::Allow => Ok(()),
+            GuardCheck::Allow => Ok(Guarded::Passed),
             GuardCheck::Deny {
                 pattern_name,
                 pattern,
@@ -169,21 +166,19 @@ impl SshServer {
             }),
             GuardCheck::Confirm { pattern_name } => {
                 if self.confirm_remembered(host, cmd) {
-                    return Ok(());
+                    return Ok(Guarded::Passed);
                 }
                 let prompt = format!(
                     "fast-mcp-ssh wants to run a sensitive command on '{host}' (matches '{pattern_name}'):\n\n{cmd}\n\nReply 'yes' to proceed."
                 );
-                match elicit_confirmation(ctx, &prompt).await {
-                    Ok(true) => {
+                let key = confirm::key_for(&[host, cmd]);
+                match confirm.ask(&key, &prompt).await {
+                    Answer::Approved => {
                         self.remember_confirm(host, cmd);
-                        Ok(())
+                        Ok(Guarded::Passed)
                     }
-                    Ok(false) => Err(SshError::ConfirmationDenied),
-                    Err(e) => {
-                        tracing::warn!(?e, "elicitation failed; defaulting to deny (fail-closed)");
-                        Err(SshError::ConfirmationDenied)
-                    }
+                    Answer::Denied => Err(SshError::ConfirmationDenied),
+                    Answer::Deferred => Ok(Guarded::Deferred),
                 }
             }
         }
