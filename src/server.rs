@@ -110,6 +110,20 @@ impl SshServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for SshServer {
+    /// The SDK would otherwise advertise every revision it knows, including
+    /// `2026-07-28`. That one forbids server-initiated requests, and the
+    /// confirmation path still opens an `elicitation/create`, so a peer that
+    /// negotiated it would be asked over a channel the spec has closed. Kept
+    /// capped until the confirmation path speaks multi round-trip requests.
+    fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
+        std::borrow::Cow::Borrowed(&[
+            ProtocolVersion::V_2024_11_05,
+            ProtocolVersion::V_2025_03_26,
+            ProtocolVersion::V_2025_06_18,
+            ProtocolVersion::V_2025_11_25,
+        ])
+    }
+
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
             ServerCapabilities::builder().enable_tools().build(),
