@@ -1,6 +1,7 @@
 //! Command execution tools: `exec`, `exec_batch`, `sh`, `interrupt`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use rmcp::{
     ErrorData as McpError, RoleServer, handler::server::tool::InputResponses as ClientAnswers,
@@ -17,7 +18,7 @@ use crate::output::{Toon, truncate_with_hint};
 use crate::server::{Guarded, SshServer};
 use crate::session::{exec, pty};
 use crate::tools::{
-    HostOnlyArgs, MAX_BATCH_CMDS, batch_preview, clamp_timeout, text, validate_cmd,
+    DEFAULT_TIMEOUT, HostOnlyArgs, MAX_BATCH_CMDS, batch_preview, clamp_timeout, text, validate_cmd,
 };
 
 // Intentionally no `Debug` derive: the `password` field would otherwise leak
@@ -117,46 +118,61 @@ impl SshServer {
                 return Err(e.into_mcp());
             }
         }
-        let session = self
-            .pool
-            .get_or_connect(&host_name, password.clone())
-            .await
-            .map_err(|e| {
-                self.audit.write(
-                    &host_name,
-                    "exec",
-                    AuditRecord::failed(&args.cmd, e.to_string()),
-                );
-                e.into_mcp()
-            })?;
-        if let Some(pw) = password {
-            self.pool.cache_password(&host_name, pw);
-        }
+        // A caller that asked for more than the default timeout is telling us
+        // the command is slow. Hand it back as a task when the client can poll
+        // for one, so nothing sits on a blocked call for minutes.
+        let worth_a_task = timeout > Duration::from_secs(DEFAULT_TIMEOUT);
+        let server = self.clone();
+        let cmd = args.cmd.clone();
+        let host = host_name.clone();
+        self.task_or_inline(
+            &ctx,
+            worth_a_task,
+            format!("exec on {host_name}"),
+            timeout,
+            async move {
+                let session = server
+                    .pool
+                    .get_or_connect(&host, password.clone())
+                    .await
+                    .map_err(|e| {
+                        server
+                            .audit
+                            .write(&host, "exec", AuditRecord::failed(&cmd, e.to_string()));
+                        e.into_mcp()
+                    })?;
+                if let Some(pw) = password {
+                    server.pool.cache_password(&host, pw);
+                }
 
-        let max_capture = self.cfg().defaults.max_capture_bytes;
-        let result = exec::exec(&session, &args.cmd, timeout, max_capture)
-            .await
-            .map_err(|e| {
-                self.audit.write(
-                    &host_name,
-                    "exec",
-                    AuditRecord::failed(&args.cmd, e.to_string()),
-                );
-                e.into_mcp()
-            })?;
+                let max_capture = server.cfg().defaults.max_capture_bytes;
+                let result = exec::exec(&session, &cmd, timeout, max_capture)
+                    .await
+                    .map_err(|e| {
+                        server
+                            .audit
+                            .write(&host, "exec", AuditRecord::failed(&cmd, e.to_string()));
+                        e.into_mcp()
+                    })?;
 
-        self.audit.write(
-            &host_name,
-            "exec",
-            AuditRecord {
-                cmd: Some(&args.cmd),
-                exit_code: Some(result.exit_code),
-                duration_ms: Some(result.duration_ms),
-                bytes_out: Some(result.stdout_bytes + result.stderr_bytes),
-                ..Default::default()
+                server.audit.write(
+                    &host,
+                    "exec",
+                    AuditRecord {
+                        cmd: Some(&cmd),
+                        exit_code: Some(result.exit_code),
+                        duration_ms: Some(result.duration_ms),
+                        bytes_out: Some(result.stdout_bytes + result.stderr_bytes),
+                        ..Default::default()
+                    },
+                );
+                Ok(text(format_exec(
+                    &result,
+                    server.cfg().defaults.truncate_bytes,
+                )))
             },
-        );
-        Ok(text(format_exec(&result, self.cfg().defaults.truncate_bytes)).into())
+        )
+        .await
     }
 
     #[tool(
