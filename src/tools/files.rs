@@ -4,16 +4,18 @@ use std::time::Duration;
 
 use base64::Engine;
 use rmcp::{
-    ErrorData as McpError, RoleServer, handler::server::wrapper::Parameters, model::*, schemars,
-    service::RequestContext, tool, tool_router,
+    ErrorData as McpError, RoleServer, handler::server::tool::InputResponses as ClientAnswers,
+    handler::server::wrapper::Parameters, model::*, schemars, service::RequestContext, tool,
+    tool_router,
 };
 use serde::Deserialize;
 
 use crate::audit::AuditRecord;
+use crate::confirm::{self, Answer, Confirm};
 use crate::errors::SshError;
 use crate::guards;
 use crate::output::{Toon, truncate_with_hint};
-use crate::server::{SshServer, elicit_confirmation};
+use crate::server::SshServer;
 use crate::sftp;
 use crate::tail;
 use crate::tools::{
@@ -603,8 +605,9 @@ impl SshServer {
     async fn rm(
         &self,
         Parameters(args): Parameters<RmArgs>,
+        ClientAnswers(answers): ClientAnswers,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
         let host_name = self.resolve_host(args.host)?;
         if let Err(e) = self
             .guards()
@@ -626,13 +629,12 @@ impl SshServer {
                 "fast-mcp-ssh wants to recursively delete '{}' on host '{host_name}'. Reply 'yes' to proceed.",
                 args.path
             );
-            match elicit_confirmation(&ctx, &prompt).await {
-                Ok(true) => {}
-                Ok(false) => return Err(SshError::ConfirmationDenied.into_mcp()),
-                Err(e) => {
-                    tracing::warn!(?e, "rm recursive elicit failed; deny");
-                    return Err(SshError::ConfirmationDenied.into_mcp());
-                }
+            let mut confirm = Confirm::new(&ctx, answers);
+            let key = confirm::key_for(&["rm-recursive", &host_name, &args.path]);
+            match confirm.ask(&key, &prompt).await {
+                Answer::Approved => {}
+                Answer::Denied => return Err(SshError::ConfirmationDenied.into_mcp()),
+                Answer::Deferred => return Ok(confirm.into_input_required().into()),
             }
         }
         let session = self
@@ -651,7 +653,7 @@ impl SshServer {
         t.field("host", &host_name)
             .field("path", &args.path)
             .field("removed", removed);
-        Ok(text(t.into_string()))
+        Ok(text(t.into_string()).into())
     }
 
     #[tool(
@@ -721,7 +723,8 @@ impl SshServer {
     async fn tail(
         &self,
         Parameters(args): Parameters<TailArgs>,
-    ) -> Result<CallToolResult, McpError> {
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
         let host_name = self.resolve_host(args.host)?;
         // `tail` reads a remote file just as much as `dn` does, and it shipped
         // with no guard at all: `tail path=/etc/shadow lines=5000` walked
@@ -739,42 +742,60 @@ impl SshServer {
             );
             return Err(e.into_mcp());
         }
-        let session = self
-            .pool
-            .get_or_connect(&host_name, None)
-            .await
-            .map_err(|e| e.into_mcp())?;
-        self.guard_resolved(&host_name, "tail", &session, &args.path, false)
-            .await?;
         let lines = args.lines.unwrap_or(100);
         let follow = args.follow.unwrap_or(false);
         let secs = Duration::from_secs(args.seconds.unwrap_or(5).clamp(1, MAX_FOLLOW_SECS));
-        let max_capture = self.cfg().defaults.max_capture_bytes;
-        let chunk = tail::tail(&session, &args.path, lines, follow, secs, max_capture)
-            .await
-            .map_err(|e| e.into_mcp())?;
-        self.audit.write(
-            &host_name,
-            "tail",
-            AuditRecord {
-                cmd: Some(&args.path),
-                exit_code: Some(chunk.exit_code),
-                bytes_out: Some(chunk.bytes),
-                ..Default::default()
+
+        // Following holds the call open for the whole window by design, which
+        // is exactly what a task handle is for. A one-shot tail returns at
+        // once and stays a plain call. The resolved-path half of the guard
+        // needs the connection, so it runs inside, before the first read.
+        let server = self.clone();
+        let host = host_name.clone();
+        let path = args.path.clone();
+        self.task_or_inline(
+            &ctx,
+            follow,
+            format!("tail {path} on {host}"),
+            secs,
+            async move {
+                let session = server
+                    .pool
+                    .get_or_connect(&host, None)
+                    .await
+                    .map_err(|e| e.into_mcp())?;
+                server
+                    .guard_resolved(&host, "tail", &session, &path, false)
+                    .await?;
+                let max_capture = server.cfg().defaults.max_capture_bytes;
+                let chunk = tail::tail(&session, &path, lines, follow, secs, max_capture)
+                    .await
+                    .map_err(|e| e.into_mcp())?;
+                server.audit.write(
+                    &host,
+                    "tail",
+                    AuditRecord {
+                        cmd: Some(&path),
+                        exit_code: Some(chunk.exit_code),
+                        bytes_out: Some(chunk.bytes),
+                        ..Default::default()
+                    },
+                );
+                let mut t = Toon::new();
+                t.field("host", &host)
+                    .field("path", &path)
+                    .field("bytes", chunk.bytes)
+                    .field("follow", follow);
+                let (display, total) =
+                    truncate_with_hint(&chunk.content, server.cfg().defaults.truncate_bytes);
+                if let Some(n) = total {
+                    t.field("truncated_bytes", n);
+                }
+                t.block("content", &display);
+                Ok(text(t.into_string()))
             },
-        );
-        let mut t = Toon::new();
-        t.field("host", &host_name)
-            .field("path", &args.path)
-            .field("bytes", chunk.bytes)
-            .field("follow", follow);
-        let (display, total) =
-            truncate_with_hint(&chunk.content, self.cfg().defaults.truncate_bytes);
-        if let Some(n) = total {
-            t.field("truncated_bytes", n);
-        }
-        t.block("content", &display);
-        Ok(text(t.into_string()))
+        )
+        .await
     }
 }
 

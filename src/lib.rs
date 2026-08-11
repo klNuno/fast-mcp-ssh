@@ -12,6 +12,7 @@
 
 pub mod audit;
 pub mod config;
+pub mod confirm;
 pub mod errors;
 pub mod forward;
 pub mod guards;
