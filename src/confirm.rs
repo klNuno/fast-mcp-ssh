@@ -190,7 +190,10 @@ mod tests {
     #[test]
     fn an_unasked_key_has_no_answer_and_garbage_denies() {
         let mut answers = BTreeMap::new();
-        drop(answers.insert("k".to_string(), serde_json::json!({ "not": "an elicit result" })));
+        drop(answers.insert(
+            "k".to_string(),
+            serde_json::json!({ "not": "an elicit result" }),
+        ));
         assert_eq!(answer_for(&answers, "other"), None);
         assert_eq!(answer_for(&answers, "k"), Some(Answer::Denied));
     }

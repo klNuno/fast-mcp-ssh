@@ -161,7 +161,9 @@ impl ServerHandler for SshServer {
         request: GetTaskParams,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<GetTaskResult, McpError> {
-        self.tasks.get_task(&request.task_id).map(GetTaskResult::new)
+        self.tasks
+            .get_task(&request.task_id)
+            .map(GetTaskResult::new)
     }
 
     /// SEP-2663 `tasks/update`: answers to what a running task asked for.
