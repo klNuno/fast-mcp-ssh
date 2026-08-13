@@ -116,24 +116,25 @@ the blocking call it always got.
 
 Guards are a speed bump against accidents, not a boundary against an adversary
 who controls the model. Scope the remote account accordingly: full threat model
-in [SECURITY.md](./SECURITY.md).
+in [SECURITY.md](./SECURITY.md). What changed between versions:
+[CHANGELOG.md](./CHANGELOG.md).
 
 ## Benchmark
 
 50 iterations per scenario against the same Linux host over the same LAN, same
-SSH key, bench client on Windows 11. Medians, lower is better. Reproduce with
-[`benchmark/`](./benchmark); raw runs in
+SSH key, bench client on Windows 11. Medians, lower is better. Measured on
+`0.5.0`; reproduce with [`benchmark/`](./benchmark), raw runs in
 [`benchmark/results/`](./benchmark/results).
 
 | | `fast-mcp-ssh` | [`mcp-ssh-manager`][mgr] | [`ssh-mcp-server`][fj] |
 |---|---:|---:|---:|
-| Cold start | **41 ms** | 289 ms | 279 ms |
-| `exec echo ok` | **1.5 ms** | 89.9 ms | 45.1 ms |
-| `exec uname -a; whoami; pwd` | **2.4 ms** | 89.0 ms | 46.1 ms |
-| `exec seq 1 5000` (~29 KB) | **18.7 ms** | 90.5 ms [^1] | 46.3 ms |
-| Write a 1 KB file | **1.4 ms** | 90.9 ms | 45.7 ms |
-| Read a 1 KB file | **2.1 ms** | 90.8 ms | 45.8 ms |
-| Tool surface, sent every session | 26 tools, 20.6 KB | 37 tools, 39.9 KB | **4 tools, 1.7 KB** |
+| Cold start | **48 ms** | 280 ms | 260 ms |
+| `exec echo ok` | **2.2 ms** | 89.7 ms | 46.7 ms |
+| `exec uname -a; whoami; pwd` | **3.6 ms** | 90.9 ms | 50.6 ms |
+| `exec seq 1 5000` (~29 KB) | **19.6 ms** | 90.4 ms [^1] | 49.2 ms |
+| Write a 1 KB file | **1.1 ms** | 89.9 ms | 47.9 ms |
+| Read a 1 KB file | **1.7 ms** | 90.3 ms | 48.9 ms |
+| Tool surface, sent every session | 26 tools, 21.1 KB | 37 tools, 39.9 KB | **4 tools, 1.7 KB** |
 
 Both alternatives are Node processes, so ~250 ms of their cold start is the
 runtime booting. The steady-state gap is the connection: `fast-mcp-ssh` keeps
