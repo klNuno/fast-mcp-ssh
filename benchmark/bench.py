@@ -22,8 +22,10 @@ Usage:
     python bench.py --servers servers.json --iterations 30 --output results/
 
 Environment:
-    OPENROUTER_API_KEY  required for token counting; skipped when absent
-    OPENROUTER_MODEL    default 'deepseek/deepseek-chat'
+    BENCH_TOKEN_API_KEY   required for token counting; the section is skipped when absent
+    BENCH_TOKEN_BASE_URL  any OpenAI-shaped endpoint, default https://api.deepseek.com
+    BENCH_TOKEN_MODEL     default 'deepseek-v4-flash'
+    BENCH_HOST            free-text description of the machine running the bench
 """
 
 from __future__ import annotations
@@ -339,7 +341,7 @@ def write_summary(
     if extra.get("token_samples"):
         md.append("## Token counts on representative payloads")
         md.append("")
-        md.append(f"Counted via OpenRouter ({extra.get('token_model', '?')}).")
+        md.append(f"Counted via {extra.get('token_model', '?')}.")
         md.append("")
         md.append("| scenario | server | chars | tokens | chars/token |")
         md.append("|---|---|---:|---:|---:|")
@@ -377,6 +379,7 @@ def load_specs(path: Path) -> list[ServerSpec]:
 def sample_tokens(specs: list[ServerSpec], stats_by_pair, extra: dict):
     try:
         from token_count import count_tokens_for_payloads
+        from token_count import provider as token_provider
     except Exception as e:  # noqa: BLE001 - optional dependency path
         print(f"  token_count import failed: {e}")
         return
@@ -400,7 +403,7 @@ def sample_tokens(specs: list[ServerSpec], stats_by_pair, extra: dict):
         finally:
             mcp.close()
     extra["token_samples"] = count_tokens_for_payloads(sample_data)
-    extra["token_model"] = os.environ.get("OPENROUTER_MODEL", "deepseek/deepseek-chat")
+    extra["token_model"] = token_provider()
 
 
 def main():
@@ -470,7 +473,9 @@ def main():
     write_csv(args.output, all_runs)
 
     extra = {"target": args.label, "bench_host": os.environ.get("BENCH_HOST", "")}
-    if not args.skip_tokens and os.environ.get("OPENROUTER_API_KEY"):
+    if not args.skip_tokens and (
+        os.environ.get("BENCH_TOKEN_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
+    ):
         sample_tokens(specs, stats_by_pair, extra)
 
     write_summary(args.output, cold, surfaces, stats_by_pair, args.iterations, extra)
