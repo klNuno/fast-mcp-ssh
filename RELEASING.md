@@ -15,16 +15,15 @@ cannot download.
 
 ## One-time setup
 
-crates.io publishes through trusted publishing, so no registry token is stored
-in the repository secrets. This has to exist before the next release or the
-run fails with `No Trusted Publishing config found for repository
-klNuno/fast-mcp-ssh`, which reads like a workflow bug and is not:
+Done, and 0.5.0 shipped through it: crates.io publishes through trusted
+publishing, so no registry token is stored in the repository secrets, and
+`secrets.CARGO_REGISTRY_TOKEN` is unused.
 
-crates.io → the crate → Settings → Trusted Publishing → Add, naming the
-repository `klNuno/fast-mcp-ssh` and the workflow file name `publish.yml`.
-
-Once that is in place, `secrets.CARGO_REGISTRY_TOKEN` is unused and can be
-deleted from the repository secrets.
+If it is ever lost, the run fails with `No Trusted Publishing config found for
+repository klNuno/fast-mcp-ssh`, which reads like a workflow bug and is not.
+Restore it at crates.io → the crate → Settings → Trusted Publishing → Add,
+naming the repository `klNuno/fast-mcp-ssh` and the workflow file name
+`publish.yml`.
 
 ## Cutting a release
 
@@ -34,11 +33,18 @@ deleted from the repository secrets.
    `cargo publish --locked` refuses a lockfile that disagrees with the manifest.
 2. Commit, push, wait for CI to go green. The release workflow does not re-run
    the test suite.
-3. `git tag -a vX.Y.Z -m "vX.Y.Z"` and push the tag. The draft release appears
+3. Add the `CHANGELOG.md` entry. The generated notes are a commit list; the
+   published ones should be the changelog section, set with
+   `gh release edit vX.Y.Z --notes-file <file> --draft`.
+4. `git tag -a vX.Y.Z -m "vX.Y.Z"` and push the tag. The draft release appears
    with its assets.
-4. Read the draft. Every archive present, `SHA256SUMS.txt` there, notes say
+5. Read the draft. Every archive present, `SHA256SUMS.txt` there, notes say
    what changed.
-5. Press Publish. The crate and the registry entry go up on their own.
+6. Press Publish. The crate and the registry entry go up on their own.
+
+Nothing here is spent until step 6, so a draft that is wrong gets thrown away
+rather than patched: `gh release delete vX.Y.Z --cleanup-tag`, fix, tag again.
+After it, a crates.io version can be yanked and never replaced.
 
 ## Re-running a failed publish
 
