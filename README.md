@@ -116,7 +116,8 @@ the blocking call it always got.
 
 Guards are a speed bump against accidents, not a boundary against an adversary
 who controls the model. Scope the remote account accordingly: full threat model
-in [SECURITY.md](./SECURITY.md).
+in [SECURITY.md](./SECURITY.md). What changed between versions:
+[CHANGELOG.md](./CHANGELOG.md).
 
 ## Benchmark
 
