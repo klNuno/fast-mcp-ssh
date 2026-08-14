@@ -9,11 +9,16 @@
   <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-0078D6" alt="Platform" />
 </p>
 
-An MCP server that gives a model real SSH access: one connection per host kept
-alive across calls, a PTY shell that remembers `cd` and `export`, SFTP instead
-of `cat > file`, host-to-host copies that never touch your disk, a screenshot
-of the remote desktop, regex guards before anything leaves your machine, and an
-append-only audit log. Answers come back as TOON, roughly 40 percent fewer
+An MCP server that gives a model real SSH access:
+
+- One connection per host, held open across calls.
+- A PTY shell that remembers `cd` and `export`.
+- SFTP instead of `cat > file`, and host-to-host copies that skip your disk.
+- A screenshot of the remote desktop.
+- Regex guards before anything leaves your machine.
+- An append-only audit log of every call.
+
+Answers come back as TOON, roughly 40 percent fewer
 tokens than JSON on tabular data.
 
 ## Install
@@ -22,10 +27,10 @@ tokens than JSON on tabular data.
 cargo install fast-mcp-ssh
 ```
 
-Or take a prebuilt binary from the
-[latest release](https://github.com/klNuno/fast-mcp-ssh/releases/latest) and
-check it against `SHA256SUMS.txt`. Linux and macOS ship x86_64 and aarch64,
-Windows ships x86_64.
+Or a prebuilt binary from the
+[latest release](https://github.com/klNuno/fast-mcp-ssh/releases/latest),
+checked against `SHA256SUMS.txt`. Linux and macOS ship x86_64 and aarch64,
+Windows x86_64.
 
 Copy [`hosts.example.toml`](./hosts.example.toml) to `~/.fast-mcp-ssh/hosts.toml`
 and fill in your hosts. Keys go in `~/.fast-mcp-ssh/keys/<name>`; `auth` is
@@ -46,8 +51,8 @@ and fill in your hosts. Keys go in `~/.fast-mcp-ssh/keys/<name>`; `auth` is
 }
 ```
 
-The same block works in Claude Code, Claude Desktop, Cursor, Windsurf, Zed,
-VS Code Copilot and anything else that speaks MCP over stdio.
+Same block in Claude Code, Cursor, Windsurf, Zed, VS Code Copilot and anything
+else that speaks MCP over stdio.
 
 In the [MCP registry](https://registry.modelcontextprotocol.io) it is
 `mcp-name: io.github.klNuno/fast-mcp-ssh`.
@@ -70,60 +75,60 @@ Every tool carries MCP annotations (`readOnlyHint`, `destructiveHint`,
 
 ### Host-to-host copy
 
-`cp` moves a file straight from one configured host to another. The bytes never
-land on your disk and never reach the model, and the server compares a sha256 on
-both ends before reporting success. Guards apply to the destination as well, so
-a read-only target still refuses the write.
+`cp` moves a file from one configured host to another. The bytes never land on
+your disk and never reach the model, and a sha256 is compared on both ends
+before success. Guards cover the destination too, so a read-only target still
+refuses the write.
 
 ### Remote screenshots
 
-`shot` captures the remote desktop and hands the model an image instead of a
-wall of text. It probes the host for `grim`, `gnome-screenshot`, `spectacle`,
-ImageMagick `import` or `scrot` and uses whichever is installed, covering X11
-and wlroots Wayland. The capture is downscaled and re-encoded locally, so a 4K
-screen does not arrive as a multi-megabyte payload.
+`shot` hands the model an image instead of a wall of text. It uses whichever of
+`grim`, `gnome-screenshot`, `spectacle`, ImageMagick `import` or `scrot` the
+host has, covering X11 and wlroots Wayland, and downscales locally so a 4K
+screen is not a multi-megabyte payload.
 
 ## Protocol
 
-Speaks every revision from `2024-11-05` to `2026-07-28` and adapts per peer.
+Speaks stateless MCP (`2026-07-28`) and every revision back to `2024-11-05`,
+picked per peer. Stateless changes three things:
 
-On `2026-07-28` a server may no longer open a request of its own, so a
-confirmation comes back as an `input_required` result the client answers and
-retries (SEP-2322). Older clients keep getting a plain `elicitation/create`.
-Persistent sessions are unaffected: a PTY has always been addressed by the
-`host` and `session` arguments of the call, which is exactly the explicit
-handle the stateless core asks for.
+- Confirmations come back as an `input_required` result the client answers and
+  retries (SEP-2322), because a server may no longer open a request of its own.
+  Older peers keep `elicitation/create`.
+- Long calls hand back a task handle to poll (SEP-2663): `exec` past its 60s
+  timeout, `tail` with `follow=true`. Clients without the extension keep the
+  blocking call.
+- `tools/list` is sorted, so it is byte-identical between restarts, and carries
+  a one hour `ttlMs` (SEP-2549). A client's prompt cache keeps hitting.
 
-Long operations use the Tasks extension (SEP-2663) when the client declares
-it: `exec` past the default 60s timeout and `tail` with `follow=true` return a
-task handle to poll instead of holding the call open. Every other client gets
-the blocking call it always got.
+Shells are unaffected. A PTY has always been addressed by the `host` and
+`session` arguments of the call, which is the explicit handle stateless wants.
 
 ## Security
 
-- **Guards run before any SSH packet.** `deny_patterns` refuse outright,
-  `confirm_patterns` ask the user, and a client that cannot answer is denied.
-  `read_only = true` blocks anything that looks like a write.
-- **Paths are checked on both sides.** Remote reads of keys, shadow files and
-  cloud credentials are refused, and so are local writes that would land in
-  your `~/.bashrc` or an autostart folder. Every path-taking tool runs both
-  checks, `tail` included. Paths are re-checked after the server resolves them,
-  so a symlink cannot launder a blocked target, and a resolution that fails
-  outright refuses the call rather than skipping the check.
-- **Host keys are pinned** (TOFU by default, `strict` and per-host fingerprints
-  available). Every call is appended to `~/.fast-mcp-ssh/audit.log` as NDJSON,
-  with credentials scrubbed.
+Guards run before any SSH packet leaves. `deny_patterns` refuse outright,
+`confirm_patterns` ask the user, a client that cannot answer is denied, and
+`read_only = true` blocks anything that looks like a write.
 
-Guards are a speed bump against accidents, not a boundary against an adversary
-who controls the model. Scope the remote account accordingly: full threat model
-in [SECURITY.md](./SECURITY.md). What changed between versions:
-[CHANGELOG.md](./CHANGELOG.md).
+Paths are checked on both sides: remote reads of keys, shadow files and cloud
+credentials, local writes into your `~/.bashrc` or an autostart folder. Every
+path-taking tool runs both checks, `tail` included, and re-checks once the
+server has resolved the path, so a symlink cannot launder a blocked target. A
+path that will not resolve refuses the call.
+
+Host keys are pinned, TOFU by default, `strict` and per-host fingerprints
+available. Every call lands in `~/.fast-mcp-ssh/audit.log` as NDJSON, with
+credentials scrubbed.
+
+Guards stop accidents, not an adversary who controls the model. Scope the
+remote account accordingly. Threat model: [SECURITY.md](./SECURITY.md).
+Version history: [CHANGELOG.md](./CHANGELOG.md).
 
 ## Benchmark
 
-50 iterations per scenario against the same Linux host over the same LAN, same
-SSH key, bench client on Windows 11. Medians, lower is better. Measured on
-`0.5.0`; reproduce with [`benchmark/`](./benchmark), raw runs in
+50 iterations per scenario, same Linux host, same LAN, same SSH key, client on
+Windows 11. Medians, lower is better, measured on `0.5.0`. Reproduce with
+[`benchmark/`](./benchmark), raw runs in
 [`benchmark/results/`](./benchmark/results).
 
 | | `fast-mcp-ssh` | [`mcp-ssh-manager`][mgr] | [`ssh-mcp-server`][fj] |
@@ -136,10 +141,10 @@ SSH key, bench client on Windows 11. Medians, lower is better. Measured on
 | Read a 1 KB file | **1.7 ms** | 90.3 ms | 48.9 ms |
 | Tool surface, sent every session | 26 tools, 21.1 KB | 37 tools, 39.9 KB | **4 tools, 1.7 KB** |
 
-Both alternatives are Node processes, so ~250 ms of their cold start is the
-runtime booting. The steady-state gap is the connection: `fast-mcp-ssh` keeps
-one SSH session per host and spawns a channel per call, while the other two
-reconnect. Writes go over SFTP here and through a `cat > file` heredoc there.
+Both alternatives are Node, so ~250 ms of their cold start is the runtime
+booting. The steady-state gap is the connection: `fast-mcp-ssh` holds one SSH
+session per host and opens a channel per call, the other two reconnect. Writes
+go over SFTP here, through a `cat > file` heredoc there.
 
 [^1]: `mcp-ssh-manager` truncates that response to 12 KB, so it is not
 returning the same output. `ssh-mcp-server` returns raw stdout with no exit
