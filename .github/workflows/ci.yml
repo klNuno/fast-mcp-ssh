@@ -24,7 +24,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch, pinned 2026-07-29
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2.9.1
       - run: cargo fmt --all --check
       # `-D warnings` on the command rather than in RUSTFLAGS: an env var
       # applies to every job that reads it and every dependency, which
@@ -41,7 +41,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch, pinned 2026-07-29
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2.9.1
       - run: cargo test --all-features --locked
 
   # `rust-version` in Cargo.toml is a promise to anyone building from source and
@@ -56,7 +56,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch, pinned 2026-07-29
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2.9.1
       - run: cargo check --all-features --locked
 
   audit:
