@@ -223,6 +223,16 @@ pub struct Guards {
     pub confirm: Vec<NamedPattern>,
     #[serde(default)]
     pub read_only: bool,
+    /// Local paths `up` may read even though they match the sensitive-path
+    /// bank (`.key`, `.pem`, `.env`, cookie stores). An entry is an exact file
+    /// or a directory whose subtree is allowed; no globs. Only the operator
+    /// can write this, which is the whole point: the tool caller cannot grant
+    /// itself the exception at call time.
+    #[serde(default)]
+    pub local_read_allow: Vec<String>,
+    /// Same, for the local paths `dn` and `shot` may write.
+    #[serde(default)]
+    pub local_write_allow: Vec<String>,
 }
 
 impl Default for Guards {
@@ -233,6 +243,8 @@ impl Default for Guards {
             deny: Vec::new(),
             confirm: Vec::new(),
             read_only: false,
+            local_read_allow: Vec::new(),
+            local_write_allow: Vec::new(),
         }
     }
 }

@@ -104,7 +104,7 @@ impl SshServer {
         // rule as `dn`.
         let local_path = args.local.as_deref().map(guards::resolve_local_path);
         if let Some(p) = local_path.as_deref()
-            && let Err(e) = guards::check_local_write(p)
+            && let Err(e) = self.guards().for_host(&host_name).check_local_write(p)
         {
             let reason = e.to_string();
             self.audit.write(

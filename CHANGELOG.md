@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `local_read_allow` / `local_write_allow` in the guards block: the operator can
+  name one file, or one directory subtree, that `up` may read or `dn` and `shot`
+  may write despite the sensitive-path banks. Entries are resolved and validated
+  at config load; a glob, a filesystem root or the home directory is refused.
+  Until now a blocked local path had no way out at all, so a deploy that had to
+  ship a `.key` simply stopped.
+
+### Changed
+
+- `guard_blocked` errors hint `recovery: "edit_config"`, not `"ask_user"`. No
+  answer given back through a tool call can lift a guard, and callers were
+  spending a round trip collecting an approval they could not use.
+
 ## 0.5.1 - 2026-09-24
 
 ### Added
