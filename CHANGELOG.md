@@ -16,6 +16,10 @@
 - `guard_blocked` errors hint `recovery: "edit_config"`, not `"ask_user"`. No
   answer given back through a tool call can lift a guard, and callers were
   spending a round trip collecting an approval they could not use.
+- `fast-mcp-ssh check` compiles the guards instead of stopping at the parse, so
+  a bad guard regex or an invalid allowlist entry fails there rather than at the
+  next server start. It also logs `host_guard_overrides`, the number of hosts
+  whose own block replaces `[defaults.guards]`.
 
 ## 0.5.1 - 2026-09-24
 

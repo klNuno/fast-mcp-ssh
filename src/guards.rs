@@ -528,6 +528,13 @@ impl GuardCache {
             .cloned()
             .unwrap_or_else(|| Arc::clone(&self.default))
     }
+
+    /// How many hosts replace the default block. A host with its own
+    /// `[host.<name>.guards]` ignores `[defaults.guards]` entirely, so the
+    /// count is what `check` prints to make that substitution visible.
+    pub fn host_override_count(&self) -> usize {
+        self.by_host.len()
+    }
 }
 
 fn compile_one(p: &NamedPattern) -> Result<CompiledPattern> {
@@ -1228,6 +1235,20 @@ mod tests {
         let g = read_allow("/srv/deploy");
         let escaped = resolve_local_path("/srv/deploy/../secrets/admin.key");
         assert!(g.check_local_read(&escaped).is_err());
+    }
+
+    #[test]
+    fn guard_cache_build_rejects_a_bad_allowlist_entry() {
+        // The entry is valid TOML and only dies when the guards compile, which
+        // is why `check` builds the cache instead of stopping at the parse.
+        let cfg: Config = toml::from_str(
+            r#"
+            [defaults.guards]
+            local_read_allow = ["/srv/*.key"]
+            "#,
+        )
+        .expect("config parses");
+        assert!(GuardCache::build(&cfg).is_err());
     }
 
     #[test]
