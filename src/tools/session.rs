@@ -52,10 +52,7 @@ impl SshServer {
         let removed = self.pool.take_session(&host_name);
         if let Some(sess) = removed {
             tracing::info!(host = %host_name, "closing session");
-            let _ = sess
-                .handle
-                .disconnect(russh::Disconnect::ByApplication, "user requested", "")
-                .await;
+            sess.disconnect("user requested").await;
         }
         self.pool.forget_password(&host_name);
         self.audit
@@ -140,10 +137,7 @@ impl SshServer {
         let mut closed = 0u64;
         for name in &names {
             if let Some(sess) = self.pool.take_session(name) {
-                let _ = sess
-                    .handle
-                    .disconnect(russh::Disconnect::ByApplication, "user requested", "")
-                    .await;
+                sess.disconnect("user requested").await;
                 self.pool.forget_password(name);
                 closed += 1;
             }
