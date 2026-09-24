@@ -1,13 +1,13 @@
 """MCP stdio client used by both the provisioning helper and bench.py."""
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
 import threading
 import time
 from dataclasses import dataclass
-from queue import Queue, Empty
 from typing import Any
 
 
@@ -52,20 +52,29 @@ class McpStdio:
             env=child_env,
         )
         self._next_id = 0
-        self._queue: Queue[dict[str, Any]] = Queue()
+        # Responses keyed by id. A queue that `recv` drains and refills with
+        # the ids it is not waiting for spins while holding the GIL as soon as
+        # replies come back out of order, and starves the reader thread: a
+        # burst of parallel calls then measured seconds the server never took.
+        self._responses: dict[int, dict[str, Any]] = {}
+        self._arrived = threading.Condition()
         self._stderr: list[bytes] = []
         threading.Thread(target=self._reader, daemon=True).start()
         threading.Thread(target=self._stderr_reader, daemon=True).start()
 
     def _reader(self):
         assert self.proc.stdout is not None
-        for line in self.proc.stdout:
+        # `bufsize=0` makes stdout a raw pipe, whose line iteration reads one
+        # byte per syscall. Buffer the read side only; stdin stays unbuffered.
+        for line in io.BufferedReader(self.proc.stdout):
             try:
                 msg = json.loads(line)
             except Exception:
                 continue
             if "id" in msg:
-                self._queue.put(msg)
+                with self._arrived:
+                    self._responses[msg["id"]] = msg
+                    self._arrived.notify_all()
 
     def _stderr_reader(self):
         assert self.proc.stderr is not None
@@ -90,16 +99,10 @@ class McpStdio:
         return rid
 
     def recv(self, target_id: int, timeout_s: float = 60.0) -> dict[str, Any]:
-        deadline = time.perf_counter() + timeout_s
-        while time.perf_counter() < deadline:
-            try:
-                msg = self._queue.get(timeout=0.5)
-            except Empty:
-                continue
-            if msg.get("id") == target_id:
-                return msg
-            self._queue.put(msg)
-        raise TimeoutError(f"id={target_id} after {timeout_s}s")
+        with self._arrived:
+            if not self._arrived.wait_for(lambda: target_id in self._responses, timeout_s):
+                raise TimeoutError(f"id={target_id} after {timeout_s}s")
+            return self._responses.pop(target_id)
 
     def initialize(self, client_name: str = "bench") -> None:
         rid = self.send(

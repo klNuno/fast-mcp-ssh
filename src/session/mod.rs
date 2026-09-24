@@ -34,6 +34,17 @@ const CHANNEL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(15);
 /// when every slot is busy. Only a warm-up path, so losing a round to a real
 /// call costs one `CHANNEL_OPEN` round-trip, never a failed call.
 const REFILL_BACKOFF: Duration = Duration::from_millis(250);
+/// An overflow connection unused for this long is closed. A burst reopens
+/// one in a handshake, so keeping it for the rest of the session only holds
+/// a TCP connection and an sshd process on the host for nothing.
+const LANE_IDLE: Duration = Duration::from_secs(120);
+/// After an overflow connection fails to open, calls wait on the primary
+/// connection for this long before trying another. A host that caps
+/// connections per user would otherwise pay a failed handshake per burst.
+const LANE_RETRY_AFTER: Duration = Duration::from_secs(60);
+/// Retries of a refused channel open, backing off from 10 ms: 150 ms at most
+/// before the last attempt, whose error is returned.
+const OPEN_RETRIES: usize = 4;
 
 /// A pre-opened SSH session channel held in the pool. Owns the semaphore
 /// permit so concurrency accounting stays correct when the channel is
@@ -42,6 +53,32 @@ pub struct ParkedChannel {
     pub channel: russh::Channel<russh::client::Msg>,
     pub permit: OwnedSemaphorePermit,
 }
+
+/// A channel checked out for one command, with the slot it counts against.
+pub struct ChannelLease<'a> {
+    pub session: &'a Session,
+    pub channel: russh::Channel<russh::client::Msg>,
+    pub permit: OwnedSemaphorePermit,
+    /// True when the channel was parked in the pool, so it may have been
+    /// closed server-side while it waited.
+    pub from_pool: bool,
+}
+
+/// A `ChannelLease` that owns its session: what `SessionPool::exec_channel`
+/// hands back, since the connection it picked may be an overflow one the
+/// caller holds no reference to.
+pub struct ExecSlot {
+    pub session: Arc<Session>,
+    pub channel: russh::Channel<russh::client::Msg>,
+    pub permit: OwnedSemaphorePermit,
+    pub from_pool: bool,
+}
+
+type Leased = (
+    russh::Channel<russh::client::Msg>,
+    OwnedSemaphorePermit,
+    bool,
+);
 
 /// Cached SFTP subsystem plus the semaphore permit for its channel, so the
 /// long-lived SFTP channel counts against `max_channels_per_host`.
@@ -74,6 +111,9 @@ pub struct Session {
     pool_target: usize,
     /// Notified whenever the pool is drained or a refill should be considered.
     refill_notify: Arc<Notify>,
+    /// Notified when the refill task parks a channel, for calls queued in
+    /// `take_or_open_channel`.
+    parked: Notify,
     last_used_ms: AtomicU64,
     started: Instant,
     /// Keeps the bastion session alive for the lifetime of this session.
@@ -88,6 +128,14 @@ pub struct Session {
     /// disconnecting the whole session.
     exec_cancels: Mutex<HashMap<u64, Arc<Notify>>>,
     next_exec_id: AtomicU64,
+    /// Extra connections to the same host, opened when a burst of `exec`
+    /// finds every channel slot here taken. sshd caps channels per
+    /// connection (`MaxSessions`), not connections, so a second connection
+    /// is the only way past that cap. Only `exec` uses them; the PTYs, SFTP
+    /// and forwards stay on this one.
+    lanes: Mutex<Vec<Arc<Session>>>,
+    /// Singleflight for opening a lane, holding when the last attempt failed.
+    lane_open: Mutex<Option<Instant>>,
 }
 
 impl Session {
@@ -107,13 +155,93 @@ impl Session {
             channel_pool: Mutex::new(Vec::with_capacity(DEFAULT_POOL_TARGET)),
             pool_target: DEFAULT_POOL_TARGET.min(max_channels.saturating_sub(1)),
             refill_notify: Arc::new(Notify::new()),
+            parked: Notify::new(),
             last_used_ms: AtomicU64::new(0),
             started: Instant::now(),
             _proxy_parent: parent,
             _proxy_permit: proxy_permit,
             exec_cancels: Mutex::new(HashMap::new()),
             next_exec_id: AtomicU64::new(0),
+            lanes: Mutex::new(Vec::new()),
+            lane_open: Mutex::new(None),
         }
+    }
+
+    /// Send an SSH disconnect on this connection and on every lane.
+    pub async fn disconnect(&self, reason: &str) {
+        let lanes: Vec<Arc<Session>> = self.lanes.lock().await.drain(..).collect();
+        for lane in lanes {
+            let _ = lane
+                .handle
+                .disconnect(russh::Disconnect::ByApplication, reason, "")
+                .await;
+        }
+        let _ = self
+            .handle
+            .disconnect(russh::Disconnect::ByApplication, reason, "")
+            .await;
+    }
+
+    /// Close lanes that died or sat unused past `LANE_IDLE`. A lane with an
+    /// exec in flight holds a channel, so it counts as used.
+    async fn drop_idle_lanes(&self, now: Instant) {
+        let gone: Vec<Arc<Session>> = {
+            let mut lanes = self.lanes.lock().await;
+            let (keep, gone) = lanes.drain(..).partition(|l| {
+                !l.handle.is_closed()
+                    && (l.idle_for(now) < LANE_IDLE
+                        || l.channel_limit.available_permits() < l.max_channels)
+            });
+            *lanes = keep;
+            gone
+        };
+        for lane in gone {
+            tracing::debug!("closing idle overflow connection");
+            let _ = lane
+                .handle
+                .disconnect(russh::Disconnect::ByApplication, "idle", "")
+                .await;
+        }
+    }
+
+    /// Open a session channel, retrying when the server refuses it.
+    ///
+    /// sshd frees a closed channel's `MaxSessions` slot on its next
+    /// garbage-collection pass, not when our `Close` arrives, so an open sent
+    /// right behind a close can be refused ("no more sessions") on a
+    /// connection that is under the cap. A burst hit that on one call in five.
+    pub(crate) async fn open_session_channel(&self) -> Result<russh::Channel<russh::client::Msg>> {
+        let mut delay = Duration::from_millis(10);
+        for _ in 0..OPEN_RETRIES {
+            match self.handle.channel_open_session().await {
+                Err(russh::Error::ChannelOpenFailure(reason)) => {
+                    tracing::debug!(?reason, "channel open refused, retrying");
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                }
+                r => return r.map_err(SshError::from),
+            }
+        }
+        self.handle
+            .channel_open_session()
+            .await
+            .map_err(SshError::from)
+    }
+
+    /// A channel on this connection if a slot is free right now, without
+    /// queueing. `None` means every slot is taken.
+    async fn try_take_channel(&self) -> Result<Option<Leased>> {
+        let parked = self.channel_pool.lock().await.pop();
+        if let Some(p) = parked {
+            self.refill_notify.notify_one();
+            return Ok(Some((p.channel, p.permit, true)));
+        }
+        let Ok(permit) = Arc::clone(&self.channel_limit).try_acquire_owned() else {
+            return Ok(None);
+        };
+        let channel = self.open_session_channel().await?;
+        self.refill_notify.notify_one();
+        Ok(Some((channel, permit, false)))
     }
 
     /// Register a cancellation token for an in-flight exec call. Returns a
@@ -138,6 +266,14 @@ impl Session {
     /// while the tool still reported it fired. `notify_one` stores a permit,
     /// which the next poll consumes.
     pub async fn cancel_all_execs(&self) -> usize {
+        let mut n = self.cancel_own_execs().await;
+        for lane in self.lanes.lock().await.iter() {
+            n += lane.cancel_own_execs().await;
+        }
+        n
+    }
+
+    async fn cancel_own_execs(&self) -> usize {
         let map = self.exec_cancels.lock().await;
         let n = map.len();
         for notify in map.values() {
@@ -218,19 +354,35 @@ impl Session {
         OwnedSemaphorePermit,
         bool,
     )> {
-        let parked = self.channel_pool.lock().await.pop();
-        if let Some(p) = parked {
+        let start = Instant::now();
+        let deadline = tokio::time::Instant::now() + CHANNEL_ACQUIRE_TIMEOUT;
+        loop {
+            let parked = self.channel_pool.lock().await.pop();
+            if let Some(p) = parked {
+                self.refill_notify.notify_one();
+                return Ok((p.channel, p.permit, true));
+            }
+            // Wait for a slot or for a parked channel, whichever comes first.
+            // The refill task can take the last free slot to park a channel;
+            // a call waiting on the semaphore alone would then sit out a
+            // whole command on another channel while that one idles.
+            let sem = Arc::clone(&self.channel_limit);
+            let permit = tokio::select! {
+                p = sem.acquire_owned() => {
+                    p.map_err(|_| SshError::Other("channel semaphore closed".into()))?
+                }
+                _ = self.parked.notified() => continue,
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err(SshError::ChannelLimit {
+                        limit: self.max_channels,
+                        waited_ms: start.elapsed().as_millis() as u64,
+                    });
+                }
+            };
+            let channel = self.open_session_channel().await?;
             self.refill_notify.notify_one();
-            return Ok((p.channel, p.permit, true));
+            return Ok((channel, permit, false));
         }
-        let permit = self.acquire_channel().await?;
-        let channel = self
-            .handle
-            .channel_open_session()
-            .await
-            .map_err(SshError::from)?;
-        self.refill_notify.notify_one();
-        Ok((channel, permit, false))
     }
 
     /// Lazily open and cache an SFTP subsystem on this session. Subsequent calls
@@ -339,10 +491,7 @@ impl SessionPool {
             };
             if !keep {
                 if let Some(sess) = self.take_session(&name) {
-                    let _ = sess
-                        .handle
-                        .disconnect(russh::Disconnect::ByApplication, "reload", "")
-                        .await;
+                    sess.disconnect("reload").await;
                 }
                 self.forget_password(&name);
                 dropped.push(name);
@@ -414,6 +563,120 @@ impl SessionPool {
             return Ok(s);
         }
 
+        let session = self
+            .open_session(host_name, password_override, true)
+            .await?;
+        self.sessions.insert(host_name.to_string(), session.clone());
+        Ok(session)
+    }
+
+    /// A channel for one `exec` on `host_name`, on whichever of its
+    /// connections has a slot free: the primary, then each open lane, then a
+    /// new lane while `max_connections_per_host` allows one. Only when all of
+    /// that is full does the call queue, on the primary, as it always did.
+    ///
+    /// Picking and reserving happen together. Checking for a free slot first
+    /// and taking it later would let a burst of calls all see the same free
+    /// slots and pile onto one connection.
+    pub async fn exec_channel(&self, host_name: &str, primary: &Arc<Session>) -> Result<ExecSlot> {
+        primary.touch();
+        if let Some(slot) = Self::try_slot(primary).await? {
+            return Ok(slot);
+        }
+        if let Some(slot) = Self::try_lanes(primary).await? {
+            return Ok(slot);
+        }
+        if let Some(slot) = self.open_lane(host_name, primary).await? {
+            return Ok(slot);
+        }
+        let (channel, permit, from_pool) = primary.take_or_open_channel().await?;
+        Ok(ExecSlot {
+            session: Arc::clone(primary),
+            channel,
+            permit,
+            from_pool,
+        })
+    }
+
+    async fn try_slot(session: &Arc<Session>) -> Result<Option<ExecSlot>> {
+        Ok(session
+            .try_take_channel()
+            .await?
+            .map(|(channel, permit, from_pool)| ExecSlot {
+                session: Arc::clone(session),
+                channel,
+                permit,
+                from_pool,
+            }))
+    }
+
+    async fn try_lanes(primary: &Session) -> Result<Option<ExecSlot>> {
+        let lanes: Vec<Arc<Session>> = primary
+            .lanes
+            .lock()
+            .await
+            .iter()
+            .filter(|l| !l.handle.is_closed())
+            .cloned()
+            .collect();
+        for lane in &lanes {
+            if let Some(slot) = Self::try_slot(lane).await? {
+                lane.touch();
+                return Ok(Some(slot));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Open one more connection to the host and take a channel on it, or
+    /// `None` when the cap is reached or the last attempt failed recently.
+    /// A failure here never fails the call: it falls back to queueing.
+    async fn open_lane(&self, host_name: &str, primary: &Arc<Session>) -> Result<Option<ExecSlot>> {
+        let cap = self.config.load().defaults.max_connections_per_host.max(1);
+        let mut last_failure = primary.lane_open.lock().await;
+        // A sibling may have opened a lane while this call waited on the lock.
+        if let Some(slot) = Self::try_lanes(primary).await? {
+            return Ok(Some(slot));
+        }
+        {
+            let mut lanes = primary.lanes.lock().await;
+            lanes.retain(|l| !l.handle.is_closed());
+            if lanes.len() + 1 >= cap {
+                return Ok(None);
+            }
+        }
+        if last_failure.is_some_and(|t| t.elapsed() < LANE_RETRY_AFTER) {
+            return Ok(None);
+        }
+        let lane = match self.open_session(host_name, None, false).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(host = %host_name, error = %e, "overflow connection failed, queueing on the primary");
+                *last_failure = Some(Instant::now());
+                return Ok(None);
+            }
+        };
+        *last_failure = None;
+        tracing::debug!(host = %host_name, "opened overflow connection");
+        let (channel, permit, from_pool) = lane.take_or_open_channel().await?;
+        primary.lanes.lock().await.push(Arc::clone(&lane));
+        Ok(Some(ExecSlot {
+            session: lane,
+            channel,
+            permit,
+            from_pool,
+        }))
+    }
+
+    /// Run the handshake for `host_name` and build its `Session`, without
+    /// caching it. `warm_pool` starts the task that keeps spare channels
+    /// open; lanes skip it, since they only exist for the length of a burst.
+    async fn open_session(
+        &self,
+        host_name: &str,
+        password_override: Option<Zeroizing<String>>,
+        warm_pool: bool,
+    ) -> Result<Arc<Session>> {
         let cfg = self.config.load_full();
         let host = cfg.host(host_name)?.clone();
 
@@ -465,8 +728,7 @@ impl SessionPool {
             proxy_permit,
         ));
         session.touch();
-        self.sessions.insert(host_name.to_string(), session.clone());
-        if session.pool_target > 0 {
+        if warm_pool && session.pool_target > 0 {
             spawn_pool_refill(Arc::downgrade(&session));
         }
         Ok(session)
@@ -500,7 +762,12 @@ impl SessionPool {
             .collect();
         for k in to_evict {
             tracing::info!(host = %k, "evicting idle session");
+            // Lanes are owned by the session and go when its last `Arc` does.
             self.sessions.remove(&k);
+        }
+        let live: Vec<Arc<Session>> = self.sessions.iter().map(|e| e.value().clone()).collect();
+        for sess in live {
+            sess.drop_idle_lanes(now).await;
         }
     }
 }
@@ -565,6 +832,7 @@ fn spawn_pool_refill(weak: std::sync::Weak<Session>) {
                         .lock()
                         .await
                         .push(ParkedChannel { channel, permit });
+                    session.parked.notify_one();
                 }
                 Err(e) => {
                     drop(permit);

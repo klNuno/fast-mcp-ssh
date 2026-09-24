@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `max_connections_per_host` (default 2). A burst of `exec` that fills every
+  channel slot on a host opens a second SSH connection instead of queueing,
+  since sshd caps channels per connection. 16 parallel `exec` of a 0.5 s
+  command: 1.5 s before, 0.51 s now. The extra connection closes after two idle
+  minutes.
+
+### Changed
+
+- Truncated output keeps its end as well as its start, and the marker counts
+  every byte the command printed. Past `max_capture_bytes` it used to report
+  only what had been captured: 254 KB cut on a 1.1 MB output.
+
+### Fixed
+
+- Bursts of `exec` failed now and then with `Failed to open channel
+  (ConnectFailed)`: sshd frees a channel slot after the client has already
+  reused it ("no more sessions"). A call now keeps its slot until the server's
+  `Close`, and a refused open is retried.
+- A call queued for a channel slot waited on the semaphore alone and missed a
+  channel parked by the pre-warm task in the meantime, costing a whole command
+  length.
+- `sh` output no longer carries `\e[?2004h`/`\e[?2004l` from bash 5.1+ readline.
+
 ## 0.5.0 — 2026-08-13
 
 ### Added

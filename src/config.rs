@@ -92,6 +92,12 @@ pub struct Defaults {
     pub max_capture_bytes: usize,
     #[serde(default = "default_max_channels")]
     pub max_channels_per_host: usize,
+    /// SSH connections one host may get at once. The first carries everything;
+    /// the others open only when a burst of `exec` has taken every one of its
+    /// `max_channels_per_host` slots, and close after two idle minutes. `1`
+    /// keeps a single connection and makes the burst queue instead.
+    #[serde(default = "default_max_connections")]
+    pub max_connections_per_host: usize,
     #[serde(default)]
     pub strict_host_key_checking: StrictHostKey,
     /// How long an approved `confirm_patterns` command stays approved, keyed
@@ -121,6 +127,7 @@ impl Default for Defaults {
             truncate_bytes: default_truncate(),
             max_capture_bytes: default_max_capture(),
             max_channels_per_host: default_max_channels(),
+            max_connections_per_host: default_max_connections(),
             strict_host_key_checking: StrictHostKey::default(),
             confirm_ttl: default_confirm_ttl(),
             default_host: None,
@@ -309,6 +316,9 @@ fn default_max_capture() -> usize {
 }
 fn default_max_channels() -> usize {
     8
+}
+fn default_max_connections() -> usize {
+    2
 }
 fn default_confirm_ttl() -> HumanDuration {
     HumanDuration(Duration::from_secs(900))

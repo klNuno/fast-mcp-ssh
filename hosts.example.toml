@@ -30,6 +30,11 @@ max_capture_bytes = 262144
 # Per-host concurrent SSH channel limit (matches sshd MaxSessions, default 10).
 max_channels_per_host = 8
 
+# SSH connections per host. sshd caps channels per connection, so a burst of
+# exec past max_channels_per_host opens a second connection instead of queueing.
+# Extra connections close after 2 idle minutes. 1 = never open one.
+max_connections_per_host = 2
+
 # Optional: tools accept omitted `host=` and fall back to this alias.
 # default_host = "box1"
 

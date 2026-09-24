@@ -14,7 +14,7 @@ use crate::audit::AuditRecord;
 use crate::confirm::{self, Answer, Confirm};
 use crate::errors::SshError;
 use crate::guards::{CompiledGuards, GuardCheck};
-use crate::output::{Toon, truncate_with_hint};
+use crate::output::{Toon, head_tail, truncate_with_hint};
 use crate::server::{Guarded, SshServer};
 use crate::session::{exec, pty};
 use crate::tools::{
@@ -146,14 +146,17 @@ impl SshServer {
                 }
 
                 let max_capture = server.cfg().defaults.max_capture_bytes;
-                let result = exec::exec(&session, &cmd, timeout, max_capture)
-                    .await
-                    .map_err(|e| {
-                        server
-                            .audit
-                            .write(&host, "exec", AuditRecord::failed(&cmd, e.to_string()));
-                        e.into_mcp()
-                    })?;
+                let result = async {
+                    let slot = server.pool.exec_channel(&host, &session).await?;
+                    exec::exec_on_slot(slot, &cmd, timeout, max_capture).await
+                }
+                .await
+                .map_err(|e| {
+                    server
+                        .audit
+                        .write(&host, "exec", AuditRecord::failed(&cmd, e.to_string()));
+                    e.into_mcp()
+                })?;
 
                 server.audit.write(
                     &host,
@@ -293,9 +296,12 @@ impl SshServer {
         // allowed commands against a default `max_channels_per_host = 8` meant
         // the overflow sat in `acquire_channel` and died at its 15s timeout
         // with `ChannelLimit` — a queue reported as a failure. One slot is
-        // left for the session's SFTP subsystem and PTY.
+        // left for the session's SFTP subsystem and PTY, which only ever live
+        // on the primary connection; the overflow ones are all exec.
+        let per_conn = session.max_channels();
+        let extra_conns = self.cfg().defaults.max_connections_per_host.max(1) - 1;
         let fanout = Arc::new(tokio::sync::Semaphore::new(
-            session.max_channels().saturating_sub(1).max(1),
+            per_conn.saturating_sub(1).max(1) + per_conn * extra_conns,
         ));
         // JoinSet aborts in-flight tasks when dropped, so a request cancelled
         // by the client doesn't leave commands running on the remote host.
@@ -306,14 +312,17 @@ impl SshServer {
             std::collections::HashMap::with_capacity(args.cmds.len());
         for cmd in args.cmds.into_iter() {
             let s = Arc::clone(&session);
+            let pool = self.pool.clone();
+            let host = host_name.clone();
             let cmd_for_task = cmd.clone();
             let gate = Arc::clone(&fanout);
             let abort = set.spawn(async move {
-                let _slot = gate
+                let _gate = gate
                     .acquire_owned()
                     .await
                     .map_err(|_| SshError::Other("batch fan-out semaphore closed".into()))?;
-                exec::exec(&s, &cmd_for_task, timeout, max_capture).await
+                let slot = pool.exec_channel(&host, &s).await?;
+                exec::exec_on_slot(slot, &cmd_for_task, timeout, max_capture).await
             });
             by_id.insert(abort.id(), cmd);
         }
@@ -576,15 +585,18 @@ fn format_exec(r: &exec::ExecResult, truncate: usize) -> String {
     if r.connection_lost {
         t.field("connection_lost", true);
     }
-    let (stdout_disp, stdout_full) = truncate_with_hint(&r.stdout, truncate);
-    let (stderr_disp, stderr_full) = truncate_with_hint(&r.stderr, truncate.min(2048));
-    if let Some(n) = stdout_full {
-        t.field("stdout_bytes", r.stdout_bytes)
-            .field("stdout_total_bytes", n);
+    let (stdout_disp, stdout_cut) = head_tail(&r.stdout, &r.stdout_tail, r.stdout_bytes, truncate);
+    let (stderr_disp, stderr_cut) = head_tail(
+        &r.stderr,
+        &r.stderr_tail,
+        r.stderr_bytes,
+        truncate.min(2048),
+    );
+    if stdout_cut.is_some() {
+        t.field("stdout_bytes", r.stdout_bytes);
     }
-    if let Some(n) = stderr_full {
-        t.field("stderr_bytes", r.stderr_bytes)
-            .field("stderr_total_bytes", n);
+    if stderr_cut.is_some() {
+        t.field("stderr_bytes", r.stderr_bytes);
     }
     t.block("stdout", &stdout_disp);
     if !r.stderr.is_empty() {
