@@ -55,6 +55,11 @@ pub struct Config {
     pub defaults: Defaults,
     #[serde(default, rename = "host")]
     pub hosts: HashMap<String, Host>,
+    /// The file this config was loaded from, set by `load`. The guards keep
+    /// it out of reach of `up` and `dn`, or a `dn` over it plus a `reload`
+    /// would rewrite the guards themselves.
+    #[serde(skip)]
+    pub source: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -377,6 +382,7 @@ impl Config {
         // literal `~`) get normalized too.
         cfg.expand_paths();
         cfg.validate()?;
+        cfg.source = Some(path.to_path_buf());
         Ok(cfg)
     }
 
