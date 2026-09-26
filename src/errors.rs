@@ -87,7 +87,11 @@ fn recovery_for(err: &SshError) -> &'static str {
         SshError::UnknownHost(_) | SshError::Config(_) | SshError::PasswordRequired(_) => {
             "check_input"
         }
-        SshError::BlockedByGuard { .. } | SshError::ConfirmationDenied => "ask_user",
+        // Not `ask_user`: no answer given back through the call can lift a
+        // guard. The operator edits hosts.toml, or the path stays blocked.
+        // Told to ask, a caller burns a turn collecting a yes it cannot spend.
+        SshError::BlockedByGuard { .. } => "edit_config",
+        SshError::ConfirmationDenied => "ask_user",
         SshError::AuthFailed { .. } => "ask_user",
         SshError::FingerprintMismatch { .. } => "unrecoverable",
         SshError::ChannelLimit { .. } => "retry_later",

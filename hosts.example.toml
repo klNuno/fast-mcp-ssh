@@ -67,6 +67,22 @@ confirm = [
     # { name = "git-push-main", pattern = "git\\s+push.*\\bmain\\b" },
 ]
 
+# Local paths that `up` may read and `dn` / `shot` may write even though they
+# look sensitive (`.key`, `.pem`, `.env`, cookie stores, shell startup files).
+# An entry is one file, or one directory whose whole subtree is allowed. No
+# globs, no filesystem root, not your home directory.
+#
+# This is the only way to lift a local-path guard, and it is deliberately not
+# reachable from a tool call: an agent that hits `local-read` cannot ask its
+# way past it, you decide here, once, in advance.
+local_read_allow = [
+    # "~/deploy/tokens/service.key",
+    # "~/deploy/tokens",
+]
+local_write_allow = [
+    # "~/captures",
+]
+
 
 # === Hosts ===
 

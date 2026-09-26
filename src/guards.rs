@@ -52,6 +52,10 @@ pub struct CompiledGuards {
     pub deny: PatternBank,
     pub confirm: PatternBank,
     pub read_only: bool,
+    /// Normalized local paths exempt from the sensitive-path banks. Slashed,
+    /// trailing slash stripped, case-folded on Windows only.
+    local_read_allow: Vec<String>,
+    local_write_allow: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +94,8 @@ impl CompiledGuards {
             deny: PatternBank::new(deny)?,
             confirm: PatternBank::new(confirm)?,
             read_only: g.read_only,
+            local_read_allow: compile_local_allow(&g.local_read_allow, "local_read_allow")?,
+            local_write_allow: compile_local_allow(&g.local_write_allow, "local_write_allow")?,
         })
     }
 
@@ -143,6 +149,47 @@ impl CompiledGuards {
             return Err(SshError::BlockedByGuard {
                 name: "sensitive-read".into(),
                 pattern: "read of sensitive system path blocked".into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Refuse a local read of private keys, credential files, browser cookie
+    /// stores or `.env` files. Without it `up` is an exfiltration primitive.
+    /// `local_read_allow` exempts a path the operator wrote down in advance.
+    pub fn check_local_read(&self, resolved: &Path) -> Result<()> {
+        if path_allowed(&self.local_read_allow, resolved) {
+            return Ok(());
+        }
+        if local_read_path_re().is_match(&slashed(resolved)) {
+            return Err(SshError::BlockedByGuard {
+                name: "local-read".into(),
+                pattern: "read of sensitive local path blocked; only the operator can allow it, \
+                          by listing this path under local_read_allow in \
+                          ~/.fast-mcp-ssh/hosts.toml"
+                    .into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Refuse a local write that would land on shell startup files, SSH
+    /// material, credential stores or an autostart directory. A `dn` of
+    /// attacker-chosen remote content into `~/.bashrc` is code execution on
+    /// the operator's box. `local_write_allow` exempts a path the operator
+    /// wrote down in advance.
+    pub fn check_local_write(&self, resolved: &Path) -> Result<()> {
+        if path_allowed(&self.local_write_allow, resolved) {
+            return Ok(());
+        }
+        let s = slashed(resolved);
+        if local_write_path_re().is_match(&s) || is_home_dotrc(resolved) {
+            return Err(SshError::BlockedByGuard {
+                name: "local-write".into(),
+                pattern: "write to sensitive local path blocked; only the operator can allow it, \
+                          by listing this path under local_write_allow in \
+                          ~/.fast-mcp-ssh/hosts.toml"
+                    .into(),
             });
         }
         Ok(())
@@ -232,8 +279,11 @@ fn sensitive_write_path_re() -> &'static Regex {
 //
 // `dn local=<path>` writes remote-controlled bytes onto the operator's own
 // machine and `up local=<path>` ships the operator's own bytes to a remote
-// host. Neither is host-scoped, so these are free functions rather than
-// `CompiledGuards` methods — a per-host config can't loosen them.
+// host. Both checks hang off `CompiledGuards` so `local_read_allow` /
+// `local_write_allow` can name an exception, and both fall back to the
+// pattern bank when the path is not on that list. The exception is deliberately
+// config-only: nothing a tool call carries can widen it, which is what a
+// caller asking the operator for permission mid-call cannot achieve.
 // ---------------------------------------------------------------------------
 
 /// Expand `~`, make absolute, then resolve the parent through the real
@@ -256,30 +306,80 @@ pub fn resolve_local_path(raw: &str) -> PathBuf {
     lexical_normalize(&p)
 }
 
-/// Refuse a local write that would land on shell startup files, SSH material,
-/// credential stores or an autostart directory. A `dn` of attacker-chosen
-/// remote content into `~/.bashrc` is code execution on the operator's box.
-pub fn check_local_write(resolved: &Path) -> Result<()> {
-    let s = slashed(resolved);
-    if local_write_path_re().is_match(&s) || is_home_dotrc(resolved) {
-        return Err(SshError::BlockedByGuard {
-            name: "local-write".into(),
-            pattern: "write to sensitive local path blocked".into(),
-        });
+/// Normalize one allowlist entry at config-load time, so a typo is a startup
+/// error rather than a guard that silently never fires. Rejects the entries
+/// that would hand back the whole filesystem.
+fn compile_local_allow(entries: &[String], field: &str) -> Result<Vec<String>> {
+    let mut out = Vec::with_capacity(entries.len());
+    for raw in entries {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Err(SshError::Config(format!("{field}: empty path")));
+        }
+        if raw.contains('*') || raw.contains('?') {
+            return Err(SshError::Config(format!(
+                "{field}: globs are not supported, name the file or its directory: {raw}"
+            )));
+        }
+        let resolved = resolve_local_path(raw);
+        if resolved.parent().is_none() {
+            return Err(SshError::Config(format!(
+                "{field}: a filesystem root allows everything: {raw}"
+            )));
+        }
+        if is_operator_home(&resolved) {
+            return Err(SshError::Config(format!(
+                "{field}: the home directory allows everything under it: {raw}"
+            )));
+        }
+        let norm = fold_path(resolved.as_path());
+        if norm.is_empty() {
+            return Err(SshError::Config(format!("{field}: empty path: {raw}")));
+        }
+        out.push(norm);
     }
-    Ok(())
+    Ok(out)
 }
 
-/// Refuse a local read of private keys, credential files, browser cookie
-/// stores or `.env` files. Without it `up` is an exfiltration primitive.
-pub fn check_local_read(resolved: &Path) -> Result<()> {
-    if local_read_path_re().is_match(&slashed(resolved)) {
-        return Err(SshError::BlockedByGuard {
-            name: "local-read".into(),
-            pattern: "read of sensitive local path blocked".into(),
-        });
+/// True when `path` is an allowlisted entry itself or sits under one. A
+/// directory entry covers its whole subtree; matching is textual on the
+/// already-resolved path, so `..` and symlinked parents cannot smuggle a
+/// protected file in under an allowed prefix.
+fn path_allowed(allow: &[String], path: &Path) -> bool {
+    if allow.is_empty() {
+        return false;
     }
-    Ok(())
+    let p = fold_path(path);
+    allow.iter().any(|e| {
+        p == *e
+            || (p.len() > e.len()
+                && p.starts_with(e.as_str())
+                && p.as_bytes().get(e.len()) == Some(&b'/'))
+    })
+}
+
+/// Comparison form of a path: forward slashes, no trailing slash, case-folded
+/// on Windows only. Folding on Linux would let an entry match a sibling
+/// directory that differs by case, and an allowlist must never be looser than
+/// what the operator wrote.
+fn fold_path(p: &Path) -> String {
+    let s = slashed(p);
+    let s = s.trim_end_matches('/');
+    if cfg!(windows) {
+        s.to_ascii_lowercase()
+    } else {
+        s.to_string()
+    }
+}
+
+/// The operator's home directory itself, not a path under it.
+fn is_operator_home(path: &Path) -> bool {
+    let home = shellexpand::tilde("~");
+    if home.as_ref() == "~" {
+        return false;
+    }
+    let h = fold_path(Path::new(home.as_ref()));
+    !h.is_empty() && fold_path(path) == h
 }
 
 fn local_write_path_re() -> &'static Regex {
@@ -427,6 +527,13 @@ impl GuardCache {
             .get(host)
             .cloned()
             .unwrap_or_else(|| Arc::clone(&self.default))
+    }
+
+    /// How many hosts replace the default block. A host with its own
+    /// `[host.<name>.guards]` ignores `[defaults.guards]` entirely, so the
+    /// count is what `check` prints to make that substitution visible.
+    pub fn host_override_count(&self) -> usize {
+        self.by_host.len()
     }
 }
 
@@ -921,8 +1028,15 @@ mod tests {
         }
     }
 
+    /// Guards with no allowlist: what every host gets until the operator
+    /// writes one down.
+    fn local_guards() -> CompiledGuards {
+        CompiledGuards::compile(&Guards::default()).expect("default guards compile")
+    }
+
     #[test]
     fn local_write_blocks_startup_and_credential_paths() {
+        let g = local_guards();
         for path in [
             "/home/alice/.bashrc",
             "/home/alice/.bash_profile",
@@ -946,7 +1060,7 @@ mod tests {
             "C:/Users/alice/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup/x.bat",
         ] {
             assert!(
-                check_local_write(Path::new(path)).is_err(),
+                g.check_local_write(Path::new(path)).is_err(),
                 "should block: {path}"
             );
         }
@@ -954,6 +1068,7 @@ mod tests {
 
     #[test]
     fn local_write_allows_ordinary_paths() {
+        let g = local_guards();
         for path in [
             "/home/alice/downloads/report.pdf",
             "/tmp/out.log",
@@ -961,7 +1076,7 @@ mod tests {
             "C:/Users/alice/Downloads/build.zip",
         ] {
             assert!(
-                check_local_write(Path::new(path)).is_ok(),
+                g.check_local_write(Path::new(path)).is_ok(),
                 "should allow: {path}"
             );
         }
@@ -975,7 +1090,7 @@ mod tests {
         let raw = "~/fast-mcp-ssh-no-such-dir/../.bashrc";
         let resolved = resolve_local_path(raw);
         assert!(
-            check_local_write(&resolved).is_err(),
+            local_guards().check_local_write(&resolved).is_err(),
             "traversal should still hit the guard: {}",
             resolved.display()
         );
@@ -983,17 +1098,22 @@ mod tests {
 
     #[test]
     fn local_write_blocks_home_dotrc_catchall() {
+        let g = local_guards();
         let home = PathBuf::from(shellexpand::tilde("~").into_owned());
-        assert!(check_local_write(&home.join(".vimrc")).is_err());
-        assert!(check_local_write(&home.join(".inputrc")).is_err());
+        assert!(g.check_local_write(&home.join(".vimrc")).is_err());
+        assert!(g.check_local_write(&home.join(".inputrc")).is_err());
         // Same name outside home is nobody's startup file.
-        assert!(check_local_write(Path::new("/tmp/scratch/.vimrc")).is_ok());
+        assert!(
+            g.check_local_write(Path::new("/tmp/scratch/.vimrc"))
+                .is_ok()
+        );
         // Not an rc file.
-        assert!(check_local_write(&home.join(".vimrc.bak")).is_ok());
+        assert!(g.check_local_write(&home.join(".vimrc.bak")).is_ok());
     }
 
     #[test]
     fn local_read_blocks_secrets() {
+        let g = local_guards();
         for path in [
             "/home/alice/.ssh/id_rsa",
             "/home/alice/.ssh/id_ed25519",
@@ -1013,7 +1133,7 @@ mod tests {
             "/home/alice/app/.env.production",
         ] {
             assert!(
-                check_local_read(Path::new(path)).is_err(),
+                g.check_local_read(Path::new(path)).is_err(),
                 "should block: {path}"
             );
         }
@@ -1021,6 +1141,7 @@ mod tests {
 
     #[test]
     fn local_read_allows_ordinary_paths() {
+        let g = local_guards();
         for path in [
             "/home/alice/.ssh/id_rsa.pub",
             "/home/alice/.ssh/known_hosts",
@@ -1029,10 +1150,105 @@ mod tests {
             "/tmp/build.tar.gz",
         ] {
             assert!(
-                check_local_read(Path::new(path)).is_ok(),
+                g.check_local_read(Path::new(path)).is_ok(),
                 "should allow: {path}"
             );
         }
+    }
+
+    /// Guards holding one read exception, plus the resolver the call sites
+    /// run before the guard. Both sides go through `resolve_local_path` so the
+    /// test says the same thing on Windows, where a rootless `/srv/...` picks
+    /// up the current drive.
+    fn read_allow(entry: &str) -> CompiledGuards {
+        let gc = Guards {
+            local_read_allow: vec![entry.into()],
+            ..Default::default()
+        };
+        CompiledGuards::compile(&gc).expect("allowlist compiles")
+    }
+
+    #[test]
+    fn local_read_allow_exempts_the_listed_file_only() {
+        let g = read_allow("/srv/deploy/admin.key");
+        assert!(
+            g.check_local_read(&resolve_local_path("/srv/deploy/admin.key"))
+                .is_ok()
+        );
+        // Sibling secret in the same directory is still blocked.
+        assert!(
+            g.check_local_read(&resolve_local_path("/srv/deploy/other.key"))
+                .is_err()
+        );
+        // A path that only shares a textual prefix is not "under" the entry.
+        assert!(
+            g.check_local_read(&resolve_local_path("/srv/deploy/admin.keyring.pem"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn local_read_allow_covers_a_directory_subtree() {
+        let g = read_allow("/srv/deploy/");
+        assert!(
+            g.check_local_read(&resolve_local_path("/srv/deploy/admin.key"))
+                .is_ok()
+        );
+        assert!(
+            g.check_local_read(&resolve_local_path("/srv/deploy/sub/github.key"))
+                .is_ok()
+        );
+        assert!(
+            g.check_local_read(&resolve_local_path("/srv/other/admin.key"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn local_write_allow_is_separate_from_read() {
+        // Allowing a read never grants the write side.
+        let g = read_allow("/srv/deploy");
+        assert!(
+            g.check_local_write(&resolve_local_path("/srv/deploy/.bashrc"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn local_allow_refuses_entries_that_open_everything() {
+        for entry in ["/", "~", "  ", "/srv/*.key"] {
+            let gc = Guards {
+                local_read_allow: vec![entry.into()],
+                ..Default::default()
+            };
+            assert!(
+                CompiledGuards::compile(&gc).is_err(),
+                "should refuse entry: {entry:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_allow_entry_survives_traversal_in_the_call() {
+        // The call site resolves before the guard, so `..` cannot walk out of
+        // the allowed subtree and back into a protected one.
+        let g = read_allow("/srv/deploy");
+        let escaped = resolve_local_path("/srv/deploy/../secrets/admin.key");
+        assert!(g.check_local_read(&escaped).is_err());
+    }
+
+    #[test]
+    fn guard_cache_build_rejects_a_bad_allowlist_entry() {
+        // The entry is valid TOML and only dies when the guards compile, which
+        // is why `check` builds the cache instead of stopping at the parse.
+        let cfg: Config = toml::from_str(
+            r#"
+            [defaults.guards]
+            local_read_allow = ["/srv/*.key"]
+            "#,
+        )
+        .expect("config parses");
+        assert!(GuardCache::build(&cfg).is_err());
     }
 
     #[test]

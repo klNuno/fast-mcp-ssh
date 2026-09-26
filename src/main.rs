@@ -78,8 +78,14 @@ async fn async_main() -> anyhow::Result<()> {
 
     if matches!(cli.command, Some(Command::Check)) {
         let cfg = cfg_swap.load();
+        // Guards compile when the server starts, not when the config loads, so
+        // a bad guard regex or an allowlist entry that opens everything is
+        // fatal down there and invisible here. `check` exists to catch exactly
+        // what would refuse to start.
+        let guards = GuardCache::build(&cfg)?;
         tracing::info!(
             hosts = cfg.hosts.len(),
+            host_guard_overrides = guards.host_override_count(),
             config = %cfg_path.display(),
             "config OK"
         );

@@ -182,7 +182,7 @@ impl SshServer {
         // The local side is the operator's own box: without this, `up` is an
         // exfiltration primitive pointed at ~/.ssh or a browser cookie store.
         let local = guards::resolve_local_path(&args.local);
-        if let Err(e) = guards::check_local_read(&local) {
+        if let Err(e) = self.guards().for_host(&host_name).check_local_read(&local) {
             self.audit.write(
                 &host_name,
                 "up",
@@ -250,7 +250,7 @@ impl SshServer {
         // a `dn` into ~/.bashrc or an autostart folder is code execution here.
         let local_path = args.local.as_deref().map(guards::resolve_local_path);
         if let Some(p) = local_path.as_deref()
-            && let Err(e) = guards::check_local_write(p)
+            && let Err(e) = self.guards().for_host(&host_name).check_local_write(p)
         {
             let reason = e.to_string();
             self.audit.write(
