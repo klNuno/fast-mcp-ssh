@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 use regex::{Regex, RegexSet};
 
 use crate::config::{
-    Config, Guards, NamedPattern, default_confirm_patterns, default_deny_patterns,
+    Config, Guards, NamedPattern, config_dir, default_confirm_patterns, default_deny_patterns,
 };
 use crate::errors::{Result, SshError};
 
@@ -56,6 +56,10 @@ pub struct CompiledGuards {
     /// trailing slash stripped, case-folded on Windows only.
     local_read_allow: Vec<String>,
     local_write_allow: Vec<String>,
+    /// The server's own files in the same comparison form: its config
+    /// directory, the config file, every key and the audit log. Filled by
+    /// `GuardCache::build`, which has the config; no allowlist entry opens them.
+    owned: Arc<[String]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +100,7 @@ impl CompiledGuards {
             read_only: g.read_only,
             local_read_allow: compile_local_allow(&g.local_read_allow, "local_read_allow")?,
             local_write_allow: compile_local_allow(&g.local_write_allow, "local_write_allow")?,
+            owned: Arc::from(Vec::new()),
         })
     }
 
@@ -156,12 +161,15 @@ impl CompiledGuards {
 
     /// Refuse a local read of private keys, credential files, browser cookie
     /// stores or `.env` files. Without it `up` is an exfiltration primitive.
-    /// `local_read_allow` exempts a path the operator wrote down in advance.
+    /// A key is recognised by its first bytes too, since `keys/prod` matches
+    /// no path pattern. `local_read_allow` exempts a path the operator wrote
+    /// down in advance, except the server's own files.
     pub fn check_local_read(&self, resolved: &Path) -> Result<()> {
-        if path_allowed(&self.local_read_allow, resolved) {
+        self.check_owned(resolved)?;
+        if path_within(&self.local_read_allow, resolved) {
             return Ok(());
         }
-        if local_read_path_re().is_match(&slashed(resolved)) {
+        if local_read_path_re().is_match(&slashed(resolved)) || holds_private_key(resolved) {
             return Err(SshError::BlockedByGuard {
                 name: "local-read".into(),
                 pattern: "read of sensitive local path blocked; only the operator can allow it, \
@@ -177,9 +185,10 @@ impl CompiledGuards {
     /// material, credential stores or an autostart directory. A `dn` of
     /// attacker-chosen remote content into `~/.bashrc` is code execution on
     /// the operator's box. `local_write_allow` exempts a path the operator
-    /// wrote down in advance.
+    /// wrote down in advance, except the server's own files.
     pub fn check_local_write(&self, resolved: &Path) -> Result<()> {
-        if path_allowed(&self.local_write_allow, resolved) {
+        self.check_owned(resolved)?;
+        if path_within(&self.local_write_allow, resolved) {
             return Ok(());
         }
         let s = slashed(resolved);
@@ -189,6 +198,21 @@ impl CompiledGuards {
                 pattern: "write to sensitive local path blocked; only the operator can allow it, \
                           by listing this path under local_write_allow in \
                           ~/.fast-mcp-ssh/hosts.toml"
+                    .into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// The server's keys reach every configured host, and a `dn` over its
+    /// config followed by `reload` would rewrite the guards. Neither
+    /// direction is ever open to a tool call.
+    fn check_owned(&self, resolved: &Path) -> Result<()> {
+        if path_within(&self.owned, resolved) {
+            return Err(SshError::BlockedByGuard {
+                name: "local-own".into(),
+                pattern: "fast-mcp-ssh's own config, keys, host pins and audit log are out of \
+                          reach of every tool call; no allowlist entry lifts this"
                     .into(),
             });
         }
@@ -286,9 +310,16 @@ fn sensitive_write_path_re() -> &'static Regex {
 // caller asking the operator for permission mid-call cannot achieve.
 // ---------------------------------------------------------------------------
 
-/// Expand `~`, make absolute, then resolve the parent through the real
-/// filesystem. Matching the raw string would let `~/x/../.bashrc` or a
-/// symlinked directory land on a protected file the argument never named.
+/// Symlink hops `resolve_local_path` follows by hand before giving up, the
+/// same bound Linux puts on path resolution.
+const MAX_LINK_HOPS: usize = 40;
+
+/// Expand `~`, make absolute, then resolve through the real filesystem.
+/// Matching the raw string would let `~/x/../.bashrc` or a symlinked
+/// directory land on a protected file the argument never named. The last
+/// component is followed too, since `open` and `create` both follow it: a
+/// link named `notes` that points at the config is judged as the config. A
+/// dangling link still leads `create` to its target, hence the manual hops.
 /// The parent may not exist yet (`dn` creates it), so fall back to a lexical
 /// resolve rather than skipping the guard.
 pub fn resolve_local_path(raw: &str) -> PathBuf {
@@ -297,6 +328,20 @@ pub fn resolve_local_path(raw: &str) -> PathBuf {
         && let Ok(cwd) = std::env::current_dir()
     {
         p = cwd.join(p);
+    }
+    for _ in 0..MAX_LINK_HOPS {
+        if let Ok(real) = p.canonicalize() {
+            return real;
+        }
+        let Ok(target) = std::fs::read_link(&p) else {
+            break;
+        };
+        // `join` keeps an absolute target as is and anchors a relative one
+        // on the link's own directory, as the kernel does.
+        p = match p.parent() {
+            Some(dir) => dir.join(target),
+            None => target,
+        };
     }
     if let (Some(parent), Some(name)) = (p.parent(), p.file_name())
         && let Ok(real) = parent.canonicalize()
@@ -341,21 +386,67 @@ fn compile_local_allow(entries: &[String], field: &str) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// True when `path` is an allowlisted entry itself or sits under one. A
+/// True when `path` is one of `entries` itself or sits under one. A
 /// directory entry covers its whole subtree; matching is textual on the
 /// already-resolved path, so `..` and symlinked parents cannot smuggle a
 /// protected file in under an allowed prefix.
-fn path_allowed(allow: &[String], path: &Path) -> bool {
-    if allow.is_empty() {
+fn path_within(entries: &[String], path: &Path) -> bool {
+    if entries.is_empty() {
         return false;
     }
     let p = fold_path(path);
-    allow.iter().any(|e| {
+    entries.iter().any(|e| {
         p == *e
             || (p.len() > e.len()
                 && p.starts_with(e.as_str())
                 && p.as_bytes().get(e.len()) == Some(&b'/'))
     })
+}
+
+/// How much of a local file `holds_private_key` reads. Every key format it
+/// knows opens with its marker, so the window only has to cover a comment or
+/// a stray header before it.
+const KEY_SNIFF_BYTES: u64 = 8 * 1024;
+
+/// A private key named like any other file (`keys/prod`, `deploy_backup`)
+/// slips past every path pattern, so `up` also reads the file's first bytes.
+/// Only a regular file is opened: a FIFO would block the runtime on `open`.
+fn holds_private_key(path: &Path) -> bool {
+    use std::io::Read;
+    if !std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
+        return false;
+    }
+    let Ok(f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = Vec::new();
+    if f.take(KEY_SNIFF_BYTES).read_to_end(&mut head).is_err() {
+        return false;
+    }
+    looks_like_private_key(&head)
+}
+
+/// PEM and OpenSSH keys open with a `-----BEGIN ... PRIVATE KEY-----` line
+/// (RSA, EC, DSA, OPENSSH, ENCRYPTED, PGP's `PRIVATE KEY BLOCK`); PuTTY keys
+/// with `PuTTY-User-Key-File-`. A certificate or a public key has neither.
+fn looks_like_private_key(head: &[u8]) -> bool {
+    if find_bytes(head, b"PuTTY-User-Key-File-").is_some() {
+        return true;
+    }
+    let mut rest = head;
+    while let Some(i) = find_bytes(rest, b"-----BEGIN ") {
+        let label = &rest[i + b"-----BEGIN ".len()..];
+        let end = find_bytes(label, b"-----").unwrap_or(label.len());
+        if find_bytes(&label[..end], b"PRIVATE KEY").is_some() {
+            return true;
+        }
+        rest = &label[end..];
+    }
+    false
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Comparison form of a path: forward slashes, no trailing slash, case-folded
@@ -512,11 +603,27 @@ pub struct GuardCache {
 
 impl GuardCache {
     pub fn build(cfg: &Config) -> Result<Self> {
-        let default = Arc::new(CompiledGuards::compile(&cfg.defaults.guards)?);
+        let owned = owned_paths(cfg);
+        let compile = |g: &Guards| -> Result<Arc<CompiledGuards>> {
+            let mut c = CompiledGuards::compile(g)?;
+            for (field, entries) in [
+                ("local_read_allow", &c.local_read_allow),
+                ("local_write_allow", &c.local_write_allow),
+            ] {
+                if let Some(e) = entries.iter().find(|e| path_within(&owned, Path::new(e))) {
+                    return Err(SshError::Config(format!(
+                        "{field}: {e} is one of fast-mcp-ssh's own files, which stay blocked"
+                    )));
+                }
+            }
+            c.owned = Arc::clone(&owned);
+            Ok(Arc::new(c))
+        };
+        let default = compile(&cfg.defaults.guards)?;
         let mut by_host = HashMap::with_capacity(cfg.hosts.len());
         for (name, host) in &cfg.hosts {
             if let Some(g) = &host.guards {
-                by_host.insert(name.clone(), Arc::new(CompiledGuards::compile(g)?));
+                by_host.insert(name.clone(), compile(g)?);
             }
         }
         Ok(Self { default, by_host })
@@ -535,6 +642,31 @@ impl GuardCache {
     pub fn host_override_count(&self) -> usize {
         self.by_host.len()
     }
+}
+
+/// Everything the server itself trusts, wherever the config put it: the
+/// config directory (keys, host pins, default audit log), the config file,
+/// each host key, and the audit log with its rotated generations.
+fn owned_paths(cfg: &Config) -> Arc<[String]> {
+    let audit = &cfg.defaults.audit_log_path;
+    let mut paths = vec![config_dir(), audit.clone()];
+    for n in 1..=cfg.defaults.audit_keep_files {
+        let mut rotated = audit.clone().into_os_string();
+        rotated.push(format!(".{n}"));
+        paths.push(PathBuf::from(rotated));
+    }
+    paths.extend(cfg.source.clone());
+    for host in cfg.hosts.values() {
+        paths.extend(host.all_keys());
+    }
+    let mut out: Vec<String> = paths
+        .iter()
+        .map(|p| fold_path(&resolve_local_path(&p.to_string_lossy())))
+        .filter(|s| !s.is_empty())
+        .collect();
+    out.sort();
+    out.dedup();
+    Arc::from(out)
 }
 
 fn compile_one(p: &NamedPattern) -> Result<CompiledPattern> {
@@ -1249,6 +1381,144 @@ mod tests {
         )
         .expect("config parses");
         assert!(GuardCache::build(&cfg).is_err());
+    }
+
+    /// A config whose one host authenticates with `key`, parsed without
+    /// `load` so the key does not have to pass `validate`.
+    fn cfg_naming_key(key: &Path, guards: &str) -> Config {
+        toml::from_str(&format!(
+            r#"
+            [defaults.guards]
+            {guards}
+
+            [host.k]
+            addr = "1.2.3.4"
+            user = "root"
+            key = "{}"
+            "#,
+            slashed(key)
+        ))
+        .expect("config parses")
+    }
+
+    fn resolved(p: &Path) -> PathBuf {
+        resolve_local_path(&slashed(p))
+    }
+
+    #[test]
+    fn own_files_are_out_of_reach_both_ways() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("prod");
+        let notes = dir.path().join("notes.txt");
+        std::fs::write(&key, "k").unwrap();
+        std::fs::write(&notes, "n").unwrap();
+        let g = GuardCache::build(&cfg_naming_key(&key, ""))
+            .unwrap()
+            .for_host("k");
+        // A key with no extension matches no path pattern; the config names it.
+        assert!(g.check_local_read(&resolved(&key)).is_err());
+        assert!(g.check_local_write(&resolved(&key)).is_err());
+        // A `dn` over the config and a `reload` would rewrite the guards.
+        let hosts_toml = resolved(&config_dir().join("hosts.toml"));
+        assert!(g.check_local_write(&hosts_toml).is_err());
+        assert!(g.check_local_read(&hosts_toml).is_err());
+        assert!(g.check_local_read(&resolved(&notes)).is_ok());
+    }
+
+    #[test]
+    fn allowlist_cannot_open_own_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("prod");
+        let notes = dir.path().join("notes.txt");
+        std::fs::write(&key, "k").unwrap();
+        std::fs::write(&notes, "n").unwrap();
+        let naming_key = format!(r#"local_read_allow = ["{}"]"#, slashed(&key));
+        let err = GuardCache::build(&cfg_naming_key(&key, &naming_key)).unwrap_err();
+        assert!(err.to_string().contains("own files"), "got: {err}");
+        // Allowing the directory is fine, the key inside it stays blocked.
+        let naming_dir = format!(r#"local_read_allow = ["{}"]"#, slashed(dir.path()));
+        let g = GuardCache::build(&cfg_naming_key(&key, &naming_dir))
+            .unwrap()
+            .for_host("k");
+        assert!(g.check_local_read(&resolved(&key)).is_err());
+        assert!(g.check_local_read(&resolved(&notes)).is_ok());
+    }
+
+    #[test]
+    fn local_read_blocks_a_key_by_its_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("backup");
+        let cert = dir.path().join("site.crt");
+        std::fs::write(
+            &key,
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nb3Blbg==\n-----END OPENSSH PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &cert,
+            "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        let g = local_guards();
+        assert!(g.check_local_read(&resolved(&key)).is_err());
+        assert!(g.check_local_read(&resolved(&cert)).is_ok());
+        // The operator can still ship one on purpose.
+        let g = read_allow(&slashed(&key));
+        assert!(g.check_local_read(&resolved(&key)).is_ok());
+    }
+
+    /// Windows needs Developer Mode for symlinks, so this runs on the unix CI
+    /// legs only.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_is_judged_by_its_target() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = dir.path().join(".ssh");
+        std::fs::create_dir(&ssh).unwrap();
+        std::fs::write(ssh.join("id_rsa"), "k").unwrap();
+        std::fs::write(dir.path().join(".bashrc"), "x").unwrap();
+        let notes = dir.path().join("notes");
+        let out = dir.path().join("out.txt");
+        let later = dir.path().join("later.txt");
+        symlink(ssh.join("id_rsa"), &notes).unwrap();
+        symlink(dir.path().join(".bashrc"), &out).unwrap();
+        // Dangling: `create` through it would make the target.
+        symlink(dir.path().join(".zshrc"), &later).unwrap();
+        let g = local_guards();
+        assert!(g.check_local_read(&resolved(&notes)).is_err());
+        assert!(g.check_local_write(&resolved(&out)).is_err());
+        assert!(g.check_local_write(&resolved(&later)).is_err());
+    }
+
+    #[test]
+    fn private_key_markers() {
+        for head in [
+            "-----BEGIN RSA PRIVATE KEY-----",
+            "-----BEGIN EC PRIVATE KEY-----",
+            "-----BEGIN PRIVATE KEY-----",
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----",
+            "-----BEGIN PGP PRIVATE KEY BLOCK-----",
+            "PuTTY-User-Key-File-3: ssh-ed25519",
+            "# deploy key\n-----BEGIN OPENSSH PRIVATE KEY-----",
+        ] {
+            assert!(
+                looks_like_private_key(head.as_bytes()),
+                "should flag: {head}"
+            );
+        }
+        for head in [
+            "",
+            "-----BEGIN CERTIFICATE-----",
+            "-----BEGIN PUBLIC KEY-----",
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 user@host",
+            "-----BEGIN CERTIFICATE-----\nPRIVATE KEY named in the body",
+        ] {
+            assert!(
+                !looks_like_private_key(head.as_bytes()),
+                "should pass: {head}"
+            );
+        }
     }
 
     #[test]

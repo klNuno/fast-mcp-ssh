@@ -68,9 +68,12 @@ confirm = [
 ]
 
 # Local paths that `up` may read and `dn` / `shot` may write even though they
-# look sensitive (`.key`, `.pem`, `.env`, cookie stores, shell startup files).
+# look sensitive (`.key`, `.pem`, `.env`, cookie stores, shell startup files,
+# any file that opens with a private key header).
 # An entry is one file, or one directory whose whole subtree is allowed. No
-# globs, no filesystem root, not your home directory.
+# globs, no filesystem root, not your home directory. The server's own files
+# (this directory, the config, every `key` below, the audit log) stay blocked
+# whatever you list here.
 #
 # This is the only way to lift a local-path guard, and it is deliberately not
 # reachable from a tool call: an agent that hits `local-read` cannot ask its
