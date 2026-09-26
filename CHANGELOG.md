@@ -31,6 +31,9 @@
   directory, the loaded config file, every configured key and the audit log.
   A `dn` over `hosts.toml` followed by `reload` could rewrite the guards. No
   allowlist entry opens these, and `check` refuses one that tries.
+- A symlink given as the local path of `up` or `dn` is judged by the file it
+  points at, dangling links included. Only its directory used to be resolved,
+  so a link named `notes` could stand in for any protected file.
 
 ## 0.5.1 - 2026-09-24
 

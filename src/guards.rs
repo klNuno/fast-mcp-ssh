@@ -310,9 +310,16 @@ fn sensitive_write_path_re() -> &'static Regex {
 // caller asking the operator for permission mid-call cannot achieve.
 // ---------------------------------------------------------------------------
 
-/// Expand `~`, make absolute, then resolve the parent through the real
-/// filesystem. Matching the raw string would let `~/x/../.bashrc` or a
-/// symlinked directory land on a protected file the argument never named.
+/// Symlink hops `resolve_local_path` follows by hand before giving up, the
+/// same bound Linux puts on path resolution.
+const MAX_LINK_HOPS: usize = 40;
+
+/// Expand `~`, make absolute, then resolve through the real filesystem.
+/// Matching the raw string would let `~/x/../.bashrc` or a symlinked
+/// directory land on a protected file the argument never named. The last
+/// component is followed too, since `open` and `create` both follow it: a
+/// link named `notes` that points at the config is judged as the config. A
+/// dangling link still leads `create` to its target, hence the manual hops.
 /// The parent may not exist yet (`dn` creates it), so fall back to a lexical
 /// resolve rather than skipping the guard.
 pub fn resolve_local_path(raw: &str) -> PathBuf {
@@ -321,6 +328,20 @@ pub fn resolve_local_path(raw: &str) -> PathBuf {
         && let Ok(cwd) = std::env::current_dir()
     {
         p = cwd.join(p);
+    }
+    for _ in 0..MAX_LINK_HOPS {
+        if let Ok(real) = p.canonicalize() {
+            return real;
+        }
+        let Ok(target) = std::fs::read_link(&p) else {
+            break;
+        };
+        // `join` keeps an absolute target as is and anchors a relative one
+        // on the link's own directory, as the kernel does.
+        p = match p.parent() {
+            Some(dir) => dir.join(target),
+            None => target,
+        };
     }
     if let (Some(parent), Some(name)) = (p.parent(), p.file_name())
         && let Ok(real) = parent.canonicalize()
@@ -1444,6 +1465,30 @@ mod tests {
         // The operator can still ship one on purpose.
         let g = read_allow(&slashed(&key));
         assert!(g.check_local_read(&resolved(&key)).is_ok());
+    }
+
+    /// Windows needs Developer Mode for symlinks, so this runs on the unix CI
+    /// legs only.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_is_judged_by_its_target() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = dir.path().join(".ssh");
+        std::fs::create_dir(&ssh).unwrap();
+        std::fs::write(ssh.join("id_rsa"), "k").unwrap();
+        std::fs::write(dir.path().join(".bashrc"), "x").unwrap();
+        let notes = dir.path().join("notes");
+        let out = dir.path().join("out.txt");
+        let later = dir.path().join("later.txt");
+        symlink(ssh.join("id_rsa"), &notes).unwrap();
+        symlink(dir.path().join(".bashrc"), &out).unwrap();
+        // Dangling: `create` through it would make the target.
+        symlink(dir.path().join(".zshrc"), &later).unwrap();
+        let g = local_guards();
+        assert!(g.check_local_read(&resolved(&notes)).is_err());
+        assert!(g.check_local_write(&resolved(&out)).is_err());
+        assert!(g.check_local_write(&resolved(&later)).is_err());
     }
 
     #[test]
