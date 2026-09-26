@@ -21,6 +21,17 @@
   next server start. It also logs `host_guard_overrides`, the number of hosts
   whose own block replaces `[defaults.guards]`.
 
+### Security
+
+- `up` sent a private key named without a known extension, such as the
+  server's own `~/.fast-mcp-ssh/keys/<host>`, to any host. The local read guard
+  now also refuses a file whose first 8 KiB hold a `-----BEGIN ... PRIVATE
+  KEY-----` or PuTTY key header, whatever its name.
+- `up` and `dn` can no longer read or write the server's own files: its config
+  directory, the loaded config file, every configured key and the audit log.
+  A `dn` over `hosts.toml` followed by `reload` could rewrite the guards. No
+  allowlist entry opens these, and `check` refuses one that tries.
+
 ## 0.5.1 - 2026-09-24
 
 ### Added
