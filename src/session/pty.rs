@@ -65,9 +65,11 @@ impl PtyState {
         chan.request_shell(true).await.map_err(SshError::from)?;
 
         let session_id = random_token("rdy")?;
-        // `bind 'set enable-bracketed-paste off'` was a bashism that errored
-        // under zsh/dash/fish. The portable `printf '\e[?2004l'` reset below
-        // covers the same case across shells.
+        // `printf '\e[?2004l'` resets the terminal once, but bash 5.1+ readline
+        // turns bracketed paste back on around every line it reads, so each
+        // `sh` result carried `\e[?2004h\e[?2004l` noise. Only `bind` stops
+        // readline itself; it is a bashism, hence the `$BASH_VERSION` test,
+        // which zsh, dash and fish evaluate to false without an error.
         //
         // The readiness marker is emitted via `printf '__%s__' <id>` so the
         // assembled `__<id>__` string never appears in the PTY echo of the
@@ -78,6 +80,7 @@ impl PtyState {
         let init = format!(
             "stty -echo -onlcr 2>/dev/null\n\
              printf '\\e[?2004l'\n\
+             [ -n \"$BASH_VERSION\" ] && bind 'set enable-bracketed-paste off'\n\
              export PS1='' PS2='' PROMPT_COMMAND=''\n\
              printf '__%s__\\n' {session_id}\n"
         );

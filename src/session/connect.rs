@@ -75,9 +75,12 @@ impl client::Handler for ClientHandler {
 
     async fn check_server_key(
         &mut self,
-        server_public_key: &russh::keys::ssh_key::PublicKey,
+        server_key: &russh::keys::PublicKeyOrCertificate,
     ) -> std::result::Result<bool, Self::Error> {
-        let actual = server_public_key
+        // A host certificate is pinned by the key it certifies, the same
+        // fingerprint known_hosts and the config already hold.
+        let actual = server_key
+            .public_key()
             .fingerprint(russh::keys::HashAlg::Sha256)
             .to_string();
 
