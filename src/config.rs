@@ -55,6 +55,11 @@ pub struct Config {
     pub defaults: Defaults,
     #[serde(default, rename = "host")]
     pub hosts: HashMap<String, Host>,
+    /// The file this config was loaded from, set by `load`. The guards keep
+    /// it out of reach of `up` and `dn`, or a `dn` over it plus a `reload`
+    /// would rewrite the guards themselves.
+    #[serde(skip)]
+    pub source: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -92,6 +97,12 @@ pub struct Defaults {
     pub max_capture_bytes: usize,
     #[serde(default = "default_max_channels")]
     pub max_channels_per_host: usize,
+    /// SSH connections one host may get at once. The first carries everything;
+    /// the others open only when a burst of `exec` has taken every one of its
+    /// `max_channels_per_host` slots, and close after two idle minutes. `1`
+    /// keeps a single connection and makes the burst queue instead.
+    #[serde(default = "default_max_connections")]
+    pub max_connections_per_host: usize,
     #[serde(default)]
     pub strict_host_key_checking: StrictHostKey,
     /// How long an approved `confirm_patterns` command stays approved, keyed
@@ -121,6 +132,7 @@ impl Default for Defaults {
             truncate_bytes: default_truncate(),
             max_capture_bytes: default_max_capture(),
             max_channels_per_host: default_max_channels(),
+            max_connections_per_host: default_max_connections(),
             strict_host_key_checking: StrictHostKey::default(),
             confirm_ttl: default_confirm_ttl(),
             default_host: None,
@@ -216,6 +228,16 @@ pub struct Guards {
     pub confirm: Vec<NamedPattern>,
     #[serde(default)]
     pub read_only: bool,
+    /// Local paths `up` may read even though they match the sensitive-path
+    /// bank (`.key`, `.pem`, `.env`, cookie stores). An entry is an exact file
+    /// or a directory whose subtree is allowed; no globs. Only the operator
+    /// can write this, which is the whole point: the tool caller cannot grant
+    /// itself the exception at call time.
+    #[serde(default)]
+    pub local_read_allow: Vec<String>,
+    /// Same, for the local paths `dn` and `shot` may write.
+    #[serde(default)]
+    pub local_write_allow: Vec<String>,
 }
 
 impl Default for Guards {
@@ -226,6 +248,8 @@ impl Default for Guards {
             deny: Vec::new(),
             confirm: Vec::new(),
             read_only: false,
+            local_read_allow: Vec::new(),
+            local_write_allow: Vec::new(),
         }
     }
 }
@@ -310,6 +334,9 @@ fn default_max_capture() -> usize {
 fn default_max_channels() -> usize {
     8
 }
+fn default_max_connections() -> usize {
+    2
+}
 fn default_confirm_ttl() -> HumanDuration {
     HumanDuration(Duration::from_secs(900))
 }
@@ -355,6 +382,7 @@ impl Config {
         // literal `~`) get normalized too.
         cfg.expand_paths();
         cfg.validate()?;
+        cfg.source = Some(path.to_path_buf());
         Ok(cfg)
     }
 

@@ -1,6 +1,6 @@
 [package]
 name = "fast-mcp-ssh"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 rust-version = "1.89"
 description = "MCP server giving AI agents SSH, SFTP, persistent PTY shells, host-to-host copies and remote desktop screenshots. One Rust binary, no runtime."
@@ -30,7 +30,7 @@ path = "src/main.rs"
 
 [dependencies]
 rmcp = { version = "3.0", features = ["server", "macros", "transport-io", "elicitation", "schemars"] }
-russh = { version = "0.62", default-features = false, features = ["ring", "rsa"] }
+russh = { version = "0.64", default-features = false, features = ["ring", "rsa"] }
 russh-sftp = "2.3"
 tokio = { version = "1", features = ["rt", "macros", "io-util", "net", "fs", "time", "sync"] }
 mimalloc = { version = "0.1", default-features = false }
@@ -46,7 +46,7 @@ thiserror = "2"
 regex = "1"
 dashmap = "6"
 arc-swap = "1"
-dirs = "6"
+dirs = "7"
 shellexpand = "3"
 clap = { version = "4", features = ["derive"] }
 zeroize = { version = "1", features = ["derive"] }
