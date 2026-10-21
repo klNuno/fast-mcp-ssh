@@ -21,6 +21,15 @@
   next server start. It also logs `host_guard_overrides`, the number of hosts
   whose own block replaces `[defaults.guards]`.
 
+### Fixed
+
+- `up` and `cp` onto a path that already exists failed with `sftp: Failure:
+  Failure` against OpenSSH and left `<path>.partial` behind: SFTP v3 rename
+  never overwrites. The final move now uses `posix-rename@openssh.com`, an
+  atomic replace, when the server advertises it, and otherwise removes the old
+  file before renaming, which is not atomic. A failed move removes the
+  `.partial`. A new path still costs one plain rename.
+
 ### Security
 
 - `up` sent a private key named without a known extension, such as the

@@ -1,7 +1,9 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use russh_sftp::protocol::{FileAttributes, OpenFlags};
+use russh_sftp::client::error::Error as SftpError;
+use russh_sftp::client::{RawSftpSession, SftpSession};
+use russh_sftp::protocol::{FileAttributes, OpenFlags, Packet, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::time::timeout;
 
@@ -131,13 +133,118 @@ fn join_remote(base: &str, leaf: &str) -> String {
     }
 }
 
+/// The destination side of the `.partial` commit that ends `up` and `cp`,
+/// behind a trait so the overwrite rules run in tests without a server.
+trait CommitTarget {
+    /// Plain SFTPv3 rename. OpenSSH refuses it when `to` already exists.
+    async fn rename(&self, from: &str, to: &str) -> Result<()>;
+    /// `posix-rename@openssh.com`. `Ok(false)` when the server does not
+    /// advertise it.
+    async fn posix_rename(&self, from: &str, to: &str) -> Result<bool>;
+    /// True when `path` exists and is not a directory (lstat).
+    async fn is_file(&self, path: &str) -> Result<bool>;
+    async fn remove(&self, path: &str) -> Result<()>;
+}
+
+/// Move a finished `.partial` onto `dst`, replacing a file already there.
+async fn commit_partial<T: CommitTarget>(target: &T, partial: &str, dst: &str) -> Result<()> {
+    // Onto a new path the plain rename is atomic and costs one round-trip.
+    let Err(refused) = target.rename(partial, dst).await else {
+        return Ok(());
+    };
+    // SFTPv3 rename never overwrites: OpenSSH answers a bare `Failure` when
+    // `dst` exists. posix-rename replaces it atomically.
+    if target.posix_rename(partial, dst).await? {
+        return Ok(());
+    }
+    // No extension: remove the target, then rename. Not atomic: between the
+    // two calls `dst` does not exist, and a failed second rename leaves no
+    // file there at all. Only a file is removed, so a rename refused for
+    // another reason (a directory in the way) keeps what is at `dst`.
+    if !target.is_file(dst).await? {
+        return Err(refused);
+    }
+    target.remove(dst).await?;
+    target.rename(partial, dst).await
+}
+
+struct SftpCommit<'a> {
+    session: &'a Session,
+    sftp: &'a SftpSession,
+}
+
+impl CommitTarget for SftpCommit<'_> {
+    async fn rename(&self, from: &str, to: &str) -> Result<()> {
+        self.sftp.rename(from, to).await.map_err(SshError::from)
+    }
+
+    async fn posix_rename(&self, from: &str, to: &str) -> Result<bool> {
+        with_timeout("posix-rename", 30, posix_rename(self.session, from, to)).await
+    }
+
+    async fn is_file(&self, path: &str) -> Result<bool> {
+        match self.sftp.symlink_metadata(path).await {
+            Ok(meta) => Ok(!meta.is_dir()),
+            Err(SftpError::Status(s)) if s.status_code == StatusCode::NoSuchFile => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn remove(&self, path: &str) -> Result<()> {
+        self.sftp.remove_file(path).await.map_err(SshError::from)
+    }
+}
+
+const POSIX_RENAME: &str = "posix-rename@openssh.com";
+
+/// russh-sftp's `SftpSession` neither exposes the extensions the server
+/// advertised nor sends `posix-rename@openssh.com`, so this runs on a
+/// short-lived raw SFTP channel of its own. Only an overwrite pays for it:
+/// `commit_partial` tries the plain rename first.
+///
+/// The cached SFTP subsystem holds a channel slot for good, so with
+/// `max_channels_per_host = 1` or every other slot taken by shells there is
+/// no second channel. Queueing for one would time out and throw away the
+/// finished `.partial`; `Ok(false)` sends `commit_partial` to its
+/// remove-then-rename fallback instead.
+async fn posix_rename(session: &Session, from: &str, to: &str) -> Result<bool> {
+    let Some((channel, _permit, _)) = session.try_take_channel().await? else {
+        return Ok(false);
+    };
+    channel
+        .request_subsystem(false, "sftp")
+        .await
+        .map_err(SshError::from)?;
+    let raw = RawSftpSession::new(channel.into_stream());
+    let renamed = async {
+        let version = raw.init().await?;
+        if version.extensions.get(POSIX_RENAME).map(String::as_str) != Some("1") {
+            return Ok(false);
+        }
+        let mut data = Vec::with_capacity(8 + from.len() + to.len());
+        for path in [from, to] {
+            data.extend_from_slice(&(path.len() as u32).to_be_bytes());
+            data.extend_from_slice(path.as_bytes());
+        }
+        match raw.extended(POSIX_RENAME, data).await? {
+            Packet::Status(s) if s.status_code == StatusCode::Ok => Ok(true),
+            Packet::Status(s) => Err(SftpError::Status(s)),
+            _ => Err(SftpError::UnexpectedPacket),
+        }
+    }
+    .await;
+    let _ = raw.close_session();
+    renamed.map_err(SshError::from)
+}
+
 pub async fn upload(session: &Session, local: &Path, remote: &str) -> Result<SftpResult> {
     let start = Instant::now();
     let sftp = session.sftp().await?;
     let mut local_file = tokio::fs::File::open(local).await?;
-    // Stream into `<remote>.partial` then atomically rename on success so a
-    // network blip mid-transfer can't leave a half-written file at the final
-    // path. Caller-visible failure preserves the previous file (if any).
+    // Stream into `<remote>.partial`, then move it into place on success
+    // (`commit_partial`) so a network blip mid-transfer can't leave a
+    // half-written file at the final path. A failed transfer preserves the
+    // previous file (if any).
     let partial = format!("{remote}.partial");
     let mut remote_file = sftp
         .open_with_flags(
@@ -167,9 +274,14 @@ pub async fn upload(session: &Session, local: &Path, remote: &str) -> Result<Sft
         let _ = sftp.remove_file(&partial).await;
         return Err(e);
     }
-    sftp.rename(&partial, remote)
-        .await
-        .map_err(SshError::from)?;
+    let target = SftpCommit {
+        session,
+        sftp: &sftp,
+    };
+    if let Err(e) = commit_partial(&target, &partial, remote).await {
+        let _ = sftp.remove_file(&partial).await;
+        return Err(e);
+    }
     session.touch();
     Ok(SftpResult {
         bytes: total,
@@ -435,10 +547,14 @@ pub async fn copy_between(
             return Err(e);
         }
     };
-    dst_sftp
-        .rename(&partial, dst_path)
-        .await
-        .map_err(SshError::from)?;
+    let target = SftpCommit {
+        session: dst,
+        sftp: &dst_sftp,
+    };
+    if let Err(e) = commit_partial(&target, &partial, dst_path).await {
+        let _ = dst_sftp.remove_file(&partial).await;
+        return Err(e);
+    }
     src.touch();
     dst.touch();
     Ok(SftpResult {
@@ -833,5 +949,118 @@ mod tests {
         );
         assert_eq!(rejoin("/", &["etc"]), "/etc");
         assert_eq!(rejoin("/tmp", &[]), "/tmp");
+    }
+
+    /// An in-memory destination with OpenSSH's sftp-server semantics: a plain
+    /// rename onto an existing path fails with a bare `Failure`.
+    struct FakeHost {
+        files: std::sync::Mutex<std::collections::HashMap<String, &'static str>>,
+        dirs: Vec<&'static str>,
+        posix_rename: bool,
+        posix_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeHost {
+        fn new(posix_rename: bool, files: &[(&str, &'static str)]) -> Self {
+            Self {
+                files: std::sync::Mutex::new(
+                    files.iter().map(|(p, c)| (p.to_string(), *c)).collect(),
+                ),
+                dirs: Vec::new(),
+                posix_rename,
+                posix_calls: Default::default(),
+            }
+        }
+
+        fn get(&self, path: &str) -> Option<&'static str> {
+            self.files.lock().unwrap().get(path).copied()
+        }
+
+        fn failure() -> SshError {
+            SshError::Other("sftp: Failure: Failure".into())
+        }
+
+        fn move_file(&self, from: &str, to: &str, overwrite: bool) -> Result<()> {
+            let mut files = self.files.lock().unwrap();
+            if self.dirs.contains(&to) || (!overwrite && files.contains_key(to)) {
+                return Err(Self::failure());
+            }
+            let content = files.remove(from).ok_or_else(Self::failure)?;
+            files.insert(to.to_string(), content);
+            Ok(())
+        }
+    }
+
+    impl CommitTarget for FakeHost {
+        async fn rename(&self, from: &str, to: &str) -> Result<()> {
+            self.move_file(from, to, false)
+        }
+
+        async fn posix_rename(&self, from: &str, to: &str) -> Result<bool> {
+            self.posix_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if !self.posix_rename {
+                return Ok(false);
+            }
+            self.move_file(from, to, true).map(|()| true)
+        }
+
+        async fn is_file(&self, path: &str) -> Result<bool> {
+            Ok(self.files.lock().unwrap().contains_key(path))
+        }
+
+        async fn remove(&self, path: &str) -> Result<()> {
+            self.files
+                .lock()
+                .unwrap()
+                .remove(path)
+                .map(|_| ())
+                .ok_or_else(Self::failure)
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_overwrites_an_existing_file_with_posix_rename() {
+        let host = FakeHost::new(true, &[("/tmp/f", "old"), ("/tmp/f.partial", "new")]);
+        commit_partial(&host, "/tmp/f.partial", "/tmp/f")
+            .await
+            .unwrap();
+        assert_eq!(host.get("/tmp/f"), Some("new"));
+        assert_eq!(host.get("/tmp/f.partial"), None);
+    }
+
+    #[tokio::test]
+    async fn commit_overwrites_without_posix_rename_by_removing_first() {
+        let host = FakeHost::new(false, &[("/tmp/f", "old"), ("/tmp/f.partial", "new")]);
+        commit_partial(&host, "/tmp/f.partial", "/tmp/f")
+            .await
+            .unwrap();
+        assert_eq!(host.get("/tmp/f"), Some("new"));
+        assert_eq!(host.get("/tmp/f.partial"), None);
+    }
+
+    #[tokio::test]
+    async fn commit_onto_a_new_path_needs_no_extension_channel() {
+        let host = FakeHost::new(true, &[("/tmp/f.partial", "new")]);
+        commit_partial(&host, "/tmp/f.partial", "/tmp/f")
+            .await
+            .unwrap();
+        assert_eq!(host.get("/tmp/f"), Some("new"));
+        assert_eq!(
+            host.posix_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_never_replaces_a_directory() {
+        let mut host = FakeHost::new(false, &[("/tmp/f.partial", "new")]);
+        host.dirs.push("/tmp/f");
+        assert!(
+            commit_partial(&host, "/tmp/f.partial", "/tmp/f")
+                .await
+                .is_err()
+        );
+        assert_eq!(host.get("/tmp/f.partial"), Some("new"));
     }
 }
