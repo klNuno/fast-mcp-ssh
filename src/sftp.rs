@@ -201,8 +201,16 @@ const POSIX_RENAME: &str = "posix-rename@openssh.com";
 /// advertised nor sends `posix-rename@openssh.com`, so this runs on a
 /// short-lived raw SFTP channel of its own. Only an overwrite pays for it:
 /// `commit_partial` tries the plain rename first.
+///
+/// The cached SFTP subsystem holds a channel slot for good, so with
+/// `max_channels_per_host = 1` or every other slot taken by shells there is
+/// no second channel. Queueing for one would time out and throw away the
+/// finished `.partial`; `Ok(false)` sends `commit_partial` to its
+/// remove-then-rename fallback instead.
 async fn posix_rename(session: &Session, from: &str, to: &str) -> Result<bool> {
-    let (channel, _permit, _) = session.take_or_open_channel().await?;
+    let Some((channel, _permit, _)) = session.try_take_channel().await? else {
+        return Ok(false);
+    };
     channel
         .request_subsystem(false, "sftp")
         .await

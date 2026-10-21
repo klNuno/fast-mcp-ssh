@@ -230,7 +230,7 @@ impl Session {
 
     /// A channel on this connection if a slot is free right now, without
     /// queueing. `None` means every slot is taken.
-    async fn try_take_channel(&self) -> Result<Option<Leased>> {
+    pub(crate) async fn try_take_channel(&self) -> Result<Option<Leased>> {
         let parked = self.channel_pool.lock().await.pop();
         if let Some(p) = parked {
             self.refill_notify.notify_one();
